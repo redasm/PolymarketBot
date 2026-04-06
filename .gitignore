@@ -1,0 +1,14 @@
+.env
+*.pyc
+__pycache__/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.pytest_cache/
+custom_pricing_rules.json
+arb_state.json
+positions_snapshot.json
+*.log
