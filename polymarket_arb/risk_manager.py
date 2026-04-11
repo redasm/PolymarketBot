@@ -36,6 +36,8 @@ class RiskManager:
         self._market_exposure: dict[str, float] = {}  # condition_id -> 敞口
         self._recent_arb_markets: dict[str, float] = {}  # event_id -> 最后执行时间
         self._daily_reset_ts: float = _start_of_day()
+        self._effective_max_total_exposure = config.max_total_exposure
+        self._effective_max_daily_loss = config.max_daily_loss
 
     @property
     def state(self) -> RiskState:
@@ -51,8 +53,8 @@ class RiskManager:
 
         can, reason = self._state.check_can_trade(
             max_positions=self._config.max_open_positions,
-            max_total_exposure=self._config.max_total_exposure,
-            max_daily_loss=self._config.max_daily_loss,
+            max_total_exposure=self._effective_max_total_exposure,
+            max_daily_loss=self._effective_max_daily_loss,
             max_failures=self._config.max_consecutive_failures,
         )
         if not can:
@@ -70,7 +72,7 @@ class RiskManager:
             if current_exposure >= self._config.max_exposure_per_market:
                 return False, f"市场 {cid[:12]} 敞口已达上限", 0.0
 
-        remaining_total = self._config.max_total_exposure - self._state.total_exposure
+        remaining_total = self._effective_max_total_exposure - self._state.total_exposure
         if remaining_total <= 0:
             return False, "全局敞口已满", 0.0
 
@@ -133,6 +135,33 @@ class RiskManager:
         exposure = self._market_exposure.pop(condition_id, 0.0)
         self._state.total_exposure = max(0, self._state.total_exposure - exposure)
         self._state.open_positions = max(0, self._state.open_positions - 1)
+
+    def apply_ai_adjustment(self, adjustments: dict) -> None:
+        """应用 AI 建议的风控参数调整（受硬上限约束）.
+
+        调整因子范围 [0.5, 1.5]，乘以 .env 中的原始值。
+        AI 永远无法将参数提高到原始配置值的 150% 以上。
+
+        Args:
+            adjustments: {"max_exposure_factor": float, "daily_loss_factor": float}
+        """
+        if not adjustments:
+            return
+
+        base_exposure = self._config.max_total_exposure
+        base_daily_loss = self._config.max_daily_loss
+
+        if "max_exposure_factor" in adjustments:
+            factor = max(0.5, min(1.5, float(adjustments["max_exposure_factor"])))
+            new_val = base_exposure * factor
+            LOG.info("AI 风控调整: max_total_exposure %.2f -> %.2f (factor=%.2f)", base_exposure, new_val, factor)
+            self._effective_max_total_exposure = new_val
+
+        if "daily_loss_factor" in adjustments:
+            factor = max(0.5, min(1.5, float(adjustments["daily_loss_factor"])))
+            new_val = base_daily_loss * factor
+            LOG.info("AI 风控调整: max_daily_loss %.2f -> %.2f (factor=%.2f)", base_daily_loss, new_val, factor)
+            self._effective_max_daily_loss = new_val
 
     def reset_halt(self) -> None:
         """手动解除熔断."""

@@ -13,11 +13,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import signal
 import time
 from typing import Any, Optional
 
+from polymarket_arb.ai_advisor import AIAdvisor, create_ai_advisor
+from polymarket_arb.ai_context import MarketContextBuilder
 from polymarket_arb.arbitrage_detector import (
     ArbitrageDetector,
     format_arb_opportunity_zh,
@@ -30,12 +33,18 @@ from polymarket_arb.edge_engine import EdgeEngine
 from polymarket_arb.execution_engine import ExecutionEngine
 from polymarket_arb.logger_setup import setup_logging
 from polymarket_arb.market_scanner import MarketScanner
-from polymarket_arb.models import ArbOpportunity, ArbType
+from polymarket_arb.models import ArbOpportunity, ArbType, MarketInfo
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
 from polymarket_arb.risk_manager import RiskManager
+from polymarket_arb.strategies.strategy_orchestrator import (
+    StrategyOrchestrator,
+    StrategySignal,
+    StrategyTier,
+)
 from polymarket_arb.telegram_notifier import TelegramNotifier
 from polymarket_arb.tick_recorder import TickRecorder
 from polymarket_arb.volatility_estimator import VolEstimator
+from polymarket_arb.websocket_feed import OrderBookMirror, WebSocketFeed
 
 LOG = logging.getLogger("main_loop")
 
@@ -46,6 +55,53 @@ def _signal_handler(sig: int, frame: Any) -> None:
     global _SHUTDOWN
     LOG.info("收到信号 %d，准备优雅退出…", sig)
     _SHUTDOWN = True
+
+
+def _select_ws_targets(
+    markets: list[MarketInfo],
+    max_count: int,
+) -> list[MarketInfo]:
+    """从扫描结果中选出最适合 WebSocket 追踪的二元市场.
+
+    排序策略: volume_24h * liquidity 联合打分，取 top-N。
+    """
+    binary = [m for m in markets if len(m.tokens) == 2 and not m.closed]
+    binary.sort(key=lambda m: m.volume_24h * m.liquidity, reverse=True)
+    return binary[:max_count]
+
+
+def _start_ws_feed(
+    targets: list[MarketInfo],
+    enhanced_store: EnhancedBookStore,
+) -> tuple[WebSocketFeed, OrderBookMirror]:
+    """为选中的目标市场创建并启动 WebSocket feed.
+
+    将第一个市场绑定到 EnhancedBookStore（用于 EdgeEngine），
+    所有市场的 token 都订阅到 OrderBookMirror。
+    """
+    mirror = OrderBookMirror()
+
+    primary = targets[0]
+    yes_token = next((t for t in primary.tokens if t.outcome.lower() == "yes"), primary.tokens[0])
+    no_token = next((t for t in primary.tokens if t.outcome.lower() == "no"), primary.tokens[-1])
+    enhanced_store.set_market(primary.condition_id, yes_token.token_id, no_token.token_id)
+
+    all_token_ids: list[str] = []
+    for m in targets:
+        for t in m.tokens:
+            all_token_ids.append(t.token_id)
+
+    feed = WebSocketFeed(mirror=mirror, enhanced_store=enhanced_store)
+    feed.subscribe(all_token_ids)
+    feed.start()
+
+    LOG.info(
+        "WebSocket 已启动: 主市场=%s (%s), 共订阅 %d 个 token",
+        primary.condition_id[:12],
+        primary.question[:40],
+        len(all_token_ids),
+    )
+    return feed, mirror
 
 
 def main(dotenv_path: str | None = None) -> None:
@@ -93,6 +149,23 @@ def main(dotenv_path: str | None = None) -> None:
     if config.tick_record_enabled:
         LOG.info("Tick 录制已开启: %s", config.tick_record_dir)
 
+    orchestrator = StrategyOrchestrator(total_bankroll=config.max_total_exposure)
+    ctx_builder = MarketContextBuilder()
+
+    ai_advisor: Optional[AIAdvisor] = None
+    if config.ai_enabled:
+        ai_advisor = create_ai_advisor(config)
+        if ai_advisor:
+            LOG.info(
+                "AI 决策引擎已启用: provider=%s, model=%s, interval=%.0fs",
+                config.ai_provider, config.ai_model, config.ai_eval_interval_sec,
+            )
+
+    ws_feed: Optional[WebSocketFeed] = None
+    ws_mirror: Optional[OrderBookMirror] = None
+    ws_target_ids: list[str] = []
+    last_vol_feed_ts = 0.0
+
     dash_state = DashboardState()
     dash_state.update(
         is_dry_run=config.dry_run,
@@ -106,7 +179,8 @@ def main(dotenv_path: str | None = None) -> None:
         f"🤖 套利机器人已启动\n"
         f"模式: {'DRY RUN' if config.dry_run else 'LIVE'}\n"
         f"最小利润: ${config.min_edge_usd} / {config.min_edge_pct}%\n"
-        f"扫描间隔: {config.scan_interval_sec}s",
+        f"扫描间隔: {config.scan_interval_sec}s\n"
+        f"WebSocket: {'启用' if config.ws_enabled else '禁用'}",
         category="startup",
         force=True,
     )
@@ -121,7 +195,7 @@ def main(dotenv_path: str | None = None) -> None:
         cycle_start = time.time()
 
         try:
-            opportunities = _scan_cycle(
+            opportunities, scanned_markets = _scan_cycle(
                 scanner=scanner,
                 detector=detector,
                 config=config,
@@ -138,6 +212,35 @@ def main(dotenv_path: str | None = None) -> None:
             else:
                 time.sleep(config.scan_interval_sec)
             continue
+
+        # --- WebSocket 启动 / 刷新 ---
+        if config.ws_enabled and scanned_markets:
+            need_refresh = (
+                ws_feed is None
+                or cycle % config.ws_refresh_cycles == 0
+            )
+            if need_refresh:
+                targets = _select_ws_targets(scanned_markets, config.ws_max_markets)
+                if targets:
+                    new_ids = sorted(t.token_id for m in targets for t in m.tokens)
+                    if new_ids != ws_target_ids:
+                        if ws_feed is not None:
+                            ws_feed.stop()
+                            LOG.info("旧 WebSocket feed 已停止，切换到新目标市场")
+                        ws_feed, ws_mirror = _start_ws_feed(targets, enhanced_store)
+                        ws_target_ids = new_ids
+
+        # --- VolEstimator 喂入 mid price ---
+        now = time.time()
+        if (
+            config.ws_enabled
+            and enhanced_store.is_ready()
+            and now - last_vol_feed_ts >= config.ws_vol_feed_interval_sec
+        ):
+            mid = enhanced_store.get_yes_mid()
+            if mid is not None and mid > 0:
+                vol_estimator.update_1m_close(mid, int(now * 1000))
+                last_vol_feed_ts = now
 
         if opportunities:
             total_arbs_found += len(opportunities)
@@ -223,8 +326,27 @@ def main(dotenv_path: str | None = None) -> None:
                 "timestamp": time.time(),
             })
 
+        if ai_advisor and ai_advisor.should_evaluate():
+            _run_ai_cycle(
+                ai_advisor=ai_advisor,
+                ctx_builder=ctx_builder,
+                book_store=enhanced_store,
+                vol_estimator=vol_estimator,
+                edge_decision=edge_decision,
+                risk_mgr=risk_mgr,
+                orchestrator=orchestrator,
+                dash_state=dash_state,
+                config=config,
+            )
+
         risk_s = risk_mgr.state
         vol_snap = vol_estimator.snapshot()
+        ws_status = {
+            "enabled": config.ws_enabled,
+            "connected": enhanced_store._connected,
+            "market_id": enhanced_store._market_id,
+            "subscribed_tokens": len(ws_target_ids),
+        }
         dash_state.update(
             cycle_count=cycle,
             arbs_found=total_arbs_found,
@@ -241,6 +363,7 @@ def main(dotenv_path: str | None = None) -> None:
             volatility=vol_snap,
             edge_decision=edge_decision.to_dict() if edge_decision else None,
             book_summary=enhanced_store.get_summary(),
+            ws_status=ws_status,
         )
         dash_state.append_pnl_point({
             "timestamp": time.time(),
@@ -250,10 +373,11 @@ def main(dotenv_path: str | None = None) -> None:
         elapsed = time.time() - cycle_start
         if cycle % 100 == 0:
             LOG.info(
-                "状态: 已扫描 %d 周期, 发现 %d 机会, 执行 %d 次, 本周期 %.1fs",
+                "状态: 已扫描 %d 周期, 发现 %d 机会, 执行 %d 次, WS=%s, 本周期 %.1fs",
                 cycle,
                 total_arbs_found,
                 total_arbs_executed,
+                "连接" if enhanced_store._connected else "未连接",
                 elapsed,
             )
             notifier.notify_status(risk_mgr.format_status_zh())
@@ -262,6 +386,9 @@ def main(dotenv_path: str | None = None) -> None:
         if sleep_time > 0 and not _SHUTDOWN:
             time.sleep(sleep_time)
 
+    if ws_feed is not None:
+        ws_feed.stop()
+        LOG.info("WebSocket feed 已停止")
     tick_recorder.close()
     dash_state.update(is_running=False)
     LOG.info("机器人已停止。总计: %d 周期, %d 机会, %d 执行", cycle, total_arbs_found, total_arbs_executed)
@@ -272,8 +399,12 @@ def _scan_cycle(
     scanner: MarketScanner,
     detector: ArbitrageDetector,
     config: ArbConfig,
-) -> list[ArbOpportunity]:
-    """单次扫描周期：拉取市场 → 检测套利."""
+) -> tuple[list[ArbOpportunity], list[MarketInfo]]:
+    """单次扫描周期：拉取市场 → 检测套利.
+
+    Returns:
+        (套利机会列表, 扫描到的全部市场列表)
+    """
     opportunities: list[ArbOpportunity] = []
 
     markets = scanner.fetch_active_markets(
@@ -295,4 +426,70 @@ def _scan_cycle(
                 opportunities.append(opp)
 
     opportunities.sort(key=lambda o: o.net_edge, reverse=True)
-    return opportunities
+    return opportunities, markets
+
+
+def _run_ai_cycle(
+    *,
+    ai_advisor: AIAdvisor,
+    ctx_builder: MarketContextBuilder,
+    book_store: EnhancedBookStore,
+    vol_estimator: VolEstimator,
+    edge_decision: Any,
+    risk_mgr: RiskManager,
+    orchestrator: StrategyOrchestrator,
+    dash_state: DashboardState,
+    config: ArbConfig,
+) -> None:
+    """在主循环中执行一次 AI 评估（同步包装 async 调用）."""
+    context = ctx_builder.build(
+        book_store=book_store,
+        vol_estimator=vol_estimator,
+        edge_signals=[edge_decision.to_dict()] if edge_decision else [],
+        risk_state=risk_mgr.state,
+    )
+
+    loop = _get_or_create_event_loop()
+    try:
+        decisions = loop.run_until_complete(ai_advisor.evaluate_markets(context))
+    except Exception as e:
+        LOG.error("AI 评估异常: %s", e, exc_info=True)
+        dash_state.append_error({"message": f"AI error: {e}", "timestamp": time.time()})
+        return
+
+    for dec in decisions:
+        if dec.action == "HOLD":
+            continue
+        signal = StrategySignal(
+            tier=StrategyTier.STATISTICAL_ARB,
+            signal_type=f"ai_{dec.action.lower()}",
+            market_id=dec.market_id,
+            description=dec.reasoning[:120],
+            expected_edge=dec.confidence * 100,
+            confidence=dec.confidence,
+            recommended_size_usdc=dec.recommended_size_pct * config.max_total_exposure,
+            urgency=dec.urgency,
+        )
+        orchestrator.submit_signal(signal)
+
+    if config.ai_override_risk:
+        try:
+            adjustments = loop.run_until_complete(ai_advisor.adjust_risk_params(context))
+            if adjustments:
+                risk_mgr.apply_ai_adjustment(adjustments)
+        except Exception as e:
+            LOG.error("AI 风控调整异常: %s", e, exc_info=True)
+
+    dash_state.update(ai_status=ai_advisor.get_status())
+
+
+def _get_or_create_event_loop() -> asyncio.AbstractEventLoop:
+    """获取或创建事件循环，兼容在非 async 上下文中调用."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop
