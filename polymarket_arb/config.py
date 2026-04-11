@@ -96,6 +96,10 @@ class ArbConfig:
     edge_max_spread_bps: float
     edge_min_confidence: float
 
+    # Tick 录制
+    tick_record_enabled: bool
+    tick_record_dir: str
+
     # Dashboard
     dashboard_enabled: bool
     dashboard_port: int
@@ -152,6 +156,8 @@ class ArbConfig:
             edge_min_bps=_env_float("EDGE_MIN_BPS", 100.0),
             edge_max_spread_bps=_env_float("EDGE_MAX_SPREAD_BPS", 500.0),
             edge_min_confidence=_env_float("EDGE_MIN_CONFIDENCE", 0.4),
+            tick_record_enabled=_env_bool("TICK_RECORD_ENABLED", False),
+            tick_record_dir=_env("TICK_RECORD_DIR", "data/ticks"),
             dashboard_enabled=_env_bool("DASHBOARD_ENABLED", True),
             dashboard_port=_env_int("DASHBOARD_PORT", 8077),
             log_level=_env("LOG_LEVEL", "INFO"),

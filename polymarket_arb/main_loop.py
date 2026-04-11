@@ -34,6 +34,7 @@ from polymarket_arb.models import ArbOpportunity, ArbType
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
 from polymarket_arb.risk_manager import RiskManager
 from polymarket_arb.telegram_notifier import TelegramNotifier
+from polymarket_arb.tick_recorder import TickRecorder
 from polymarket_arb.volatility_estimator import VolEstimator
 
 LOG = logging.getLogger("main_loop")
@@ -85,6 +86,12 @@ def main(dotenv_path: str | None = None) -> None:
         max_spread_bps=config.edge_max_spread_bps,
         min_confidence=config.edge_min_confidence,
     )
+    tick_recorder = TickRecorder(
+        output_dir=config.tick_record_dir,
+        enabled=config.tick_record_enabled,
+    )
+    if config.tick_record_enabled:
+        LOG.info("Tick 录制已开启: %s", config.tick_record_dir)
 
     dash_state = DashboardState()
     dash_state.update(
@@ -255,6 +262,7 @@ def main(dotenv_path: str | None = None) -> None:
         if sleep_time > 0 and not _SHUTDOWN:
             time.sleep(sleep_time)
 
+    tick_recorder.close()
     dash_state.update(is_running=False)
     LOG.info("机器人已停止。总计: %d 周期, %d 机会, %d 执行", cycle, total_arbs_found, total_arbs_executed)
     notifier.send("🛑 套利机器人已停止", category="shutdown", force=True)

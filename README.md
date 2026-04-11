@@ -248,6 +248,83 @@ python -m polymarket_arb.main_loop
 
 **强烈建议**先用 `ARB_DRY_RUN=true` 观察一段时间，确认策略逻辑和信号质量符合预期后再切换为实盘。
 
+## 测试
+
+```bash
+# 运行全部单元测试
+pytest
+
+# 运行单个模块
+pytest tests/test_fair_value_model.py -v
+
+# 只跑某个类
+pytest tests/test_arbitrage_detector.py::TestBinaryArbDetection -v
+```
+
+测试覆盖的模块：
+
+| 测试文件 | 被测模块 | 验证内容 |
+|----------|----------|----------|
+| `test_fair_value_model.py` | `fair_value_model` | GBM 定价 z-score 与手算一致、边界处理、多信号融合 |
+| `test_volatility_estimator.py` | `volatility_estimator` | warmup 行为、恒定价 σ≈0、GBM 模拟 σ 合理、√15 缩放 |
+| `test_arbitrage_detector.py` | `arbitrage_detector` | 二元/多结果套利检出、已关闭市场过滤、微利过滤 |
+| `test_edge_engine.py` | `edge_engine` | 方向判定、spread/depth/disconnect veto、波动率对置信度影响 |
+
+## 数据录制与回测
+
+### 录制
+
+设置 `TICK_RECORD_ENABLED=true`，WS 推送的每次订单簿更新会被写入 NDJSON 文件：
+
+```
+data/ticks/
+├── 2026-04-11.ndjson      # 按 UTC 日期滚动
+├── 2026-04-12.ndjson
+└── 2026-04-12.1.ndjson    # 单文件超过 200MB 时自动滚动
+```
+
+每行格式：
+
+```json
+{
+  "ts_ms": 1712345678000,
+  "token_id": "0xabc...def",
+  "event_type": "book",
+  "best_bid": 0.52,
+  "best_ask": 0.54,
+  "bid_depth_5": 12500.0,
+  "ask_depth_5": 8700.0,
+  "imbalance_5": 0.18,
+  "microprice": 0.5285,
+  "spread_bps": 377.4,
+  "bids_top3": [[0.52, 5000], [0.51, 4500], [0.50, 3000]],
+  "asks_top3": [[0.54, 3200], [0.55, 2800], [0.56, 2700]]
+}
+```
+
+### 回测
+
+录制数据后，可以编写回放脚本按时间顺序重放：
+
+```python
+import json
+from polymarket_arb.book_store import EnhancedBookStore
+from polymarket_arb.edge_engine import EdgeEngine
+
+store = EnhancedBookStore()
+engine = EdgeEngine(min_edge_bps=100)
+
+with open("data/ticks/2026-04-11.ndjson") as f:
+    for line in f:
+        tick = json.loads(line)
+        bids = [(p, s) for p, s in tick["bids_top3"]]
+        asks = [(p, s) for p, s in tick["asks_top3"]]
+        store.update_by_token_id(tick["token_id"], bids, asks, tick["ts_ms"])
+        decision = engine.evaluate(store)
+        if decision.direction != "NONE":
+            print(f"[{tick['ts_ms']}] {decision.direction} edge={decision.edge_bps:.0f}bps")
+```
+
 ### 使用 tmux（远程服务器）
 
 ```bash
