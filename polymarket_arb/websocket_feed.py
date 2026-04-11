@@ -22,7 +22,9 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
+from polymarket_arb.book_store import EnhancedBookStore
 from polymarket_arb.models import OrderBookLevel, OrderBookSnapshot
+from polymarket_arb.utils_time import now_ms
 
 LOG = logging.getLogger(__name__)
 
@@ -142,13 +144,20 @@ class WebSocketFeed:
     负责:
     - 建立连接并订阅指定 token 的订单簿
     - 解析推送消息并更新 OrderBookMirror
+    - 可选同步更新 EnhancedBookStore（提供 microprice / imbalance 等衍生指标）
     - 自动重连（指数退避）
     - 心跳维持
     """
 
-    def __init__(self, mirror: OrderBookMirror, ws_url: str = POLYMARKET_WS_URL):
+    def __init__(
+        self,
+        mirror: OrderBookMirror,
+        ws_url: str = POLYMARKET_WS_URL,
+        enhanced_store: Optional[EnhancedBookStore] = None,
+    ):
         self._mirror = mirror
         self._ws_url = ws_url
+        self._enhanced_store = enhanced_store
         self._subscribed_tokens: set[str] = set()
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -209,7 +218,7 @@ class WebSocketFeed:
                 self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
 
     def _handle_message(self, raw: str | bytes) -> None:
-        """解析 WebSocket 消息并更新镜像."""
+        """解析 WebSocket 消息并更新镜像 + EnhancedBookStore."""
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
@@ -224,6 +233,7 @@ class WebSocketFeed:
             bids = msg.get("bids") or []
             asks = msg.get("asks") or []
             self._mirror.apply_snapshot(token_id, bids, asks)
+            self._sync_to_enhanced_store(token_id, bids, asks)
 
         elif msg_type == "price_change":
             changes = msg.get("changes") or [msg]
@@ -239,3 +249,32 @@ class WebSocketFeed:
 
         elif msg_type in ("pong", "subscribed", "heartbeat"):
             pass
+
+    def _sync_to_enhanced_store(self, token_id: str, bids_raw: list, asks_raw: list) -> None:
+        """将 WS 推送的订单簿数据同步写入 EnhancedBookStore."""
+        if self._enhanced_store is None:
+            return
+        parsed_bids = _parse_orders(bids_raw)
+        parsed_asks = _parse_orders(asks_raw)
+        ts = now_ms()
+        matched = self._enhanced_store.update_by_token_id(token_id, parsed_bids, parsed_asks, ts)
+        if matched and not self._enhanced_store._connected:
+            self._enhanced_store.set_connected(True)
+
+
+def _parse_orders(orders_raw: list) -> list[tuple[float, float]]:
+    """将 WS 原始订单数据解析为 (price, size) 元组列表."""
+    result: list[tuple[float, float]] = []
+    for order in orders_raw or []:
+        try:
+            if isinstance(order, dict):
+                price = float(order.get("price", 0))
+                size = float(order.get("size", 0))
+            else:
+                price = float(order[0])
+                size = float(order[1]) if len(order) > 1 else 0.0
+            if price > 0 and size > 0:
+                result.append((price, size))
+        except (ValueError, IndexError, TypeError):
+            continue
+    return result

@@ -40,6 +40,8 @@ import math
 from dataclasses import dataclass
 from typing import Optional
 
+from polymarket_arb.volatility_estimator import VolEstimator
+
 LOG = logging.getLogger(__name__)
 
 
@@ -64,27 +66,22 @@ class DynamicSpreadCalculator:
     Spread = base_spread + volatility_spread + inventory_spread
 
     - base_spread: 最小利润要求（至少覆盖 tick）
-    - volatility_spread: 根据最近价格波动调整
+    - volatility_spread: 由 VolEstimator 提供多尺度波动率
     - inventory_spread: 持仓偏斜时倾斜
     """
 
     def __init__(
         self,
         base_spread_ticks: float = 2.0,
-        volatility_lookback: int = 50,
         inventory_skew_factor: float = 0.5,
+        vol_estimator: Optional[VolEstimator] = None,
     ):
         self._base_ticks = base_spread_ticks
-        self._vol_lookback = volatility_lookback
         self._inv_skew = inventory_skew_factor
-        self._price_history: dict[str, list[float]] = {}
+        self._vol_estimator = vol_estimator
 
-    def record_price(self, token_id: str, mid: float) -> None:
-        if token_id not in self._price_history:
-            self._price_history[token_id] = []
-        self._price_history[token_id].append(mid)
-        if len(self._price_history[token_id]) > self._vol_lookback * 2:
-            self._price_history[token_id] = self._price_history[token_id][-self._vol_lookback:]
+    def set_vol_estimator(self, vol_estimator: VolEstimator) -> None:
+        self._vol_estimator = vol_estimator
 
     def compute_spread(
         self,
@@ -102,7 +99,7 @@ class DynamicSpreadCalculator:
         """
         base = self._base_ticks * tick_size
 
-        vol = self._estimate_volatility(token_id)
+        vol = self._get_volatility()
         vol_spread = vol * 2.0
 
         half = (base + vol_spread) / 2.0
@@ -120,24 +117,16 @@ class DynamicSpreadCalculator:
 
         return (bid_offset, ask_offset)
 
-    def _estimate_volatility(self, token_id: str) -> float:
-        """估算最近的价格波动率."""
-        history = self._price_history.get(token_id, [])
-        if len(history) < 5:
+    def _get_volatility(self) -> float:
+        """从 VolEstimator 获取波动率，如果不可用则返回保守默认值."""
+        if self._vol_estimator is None:
             return 0.01
 
-        returns = []
-        for i in range(1, len(history)):
-            if history[i - 1] > 0:
-                r = (history[i] - history[i - 1]) / history[i - 1]
-                returns.append(r)
-
-        if not returns:
-            return 0.01
-
-        mean_r = sum(returns) / len(returns)
-        var = sum((r - mean_r) ** 2 for r in returns) / len(returns)
-        return math.sqrt(var)
+        snap = self._vol_estimator.snapshot()
+        sigma = snap.get("sigma_blend_15m") or snap.get("sigma_fast_15m")
+        if sigma is not None and sigma > 0:
+            return sigma
+        return 0.01
 
 
 class MakerStrategy:

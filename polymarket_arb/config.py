@@ -86,6 +86,16 @@ class ArbConfig:
     notify_on_error: bool
     telegram_cooldown_sec: float
 
+    # 波动率
+    vol_fast_minutes: int
+    vol_slow_minutes: int
+    vol_min_bars: int
+
+    # Edge 引擎
+    edge_min_bps: float
+    edge_max_spread_bps: float
+    edge_min_confidence: float
+
     # Dashboard
     dashboard_enabled: bool
     dashboard_port: int
@@ -136,6 +146,12 @@ class ArbConfig:
             notify_on_trade=_env_bool("TELEGRAM_NOTIFY_ON_TRADE", True),
             notify_on_error=_env_bool("TELEGRAM_NOTIFY_ON_ERROR", True),
             telegram_cooldown_sec=_env_float("TELEGRAM_NOTIFY_COOLDOWN_SEC", 30.0),
+            vol_fast_minutes=_env_int("VOL_FAST_MINUTES", 60),
+            vol_slow_minutes=_env_int("VOL_SLOW_MINUTES", 360),
+            vol_min_bars=_env_int("VOL_MIN_BARS", 20),
+            edge_min_bps=_env_float("EDGE_MIN_BPS", 100.0),
+            edge_max_spread_bps=_env_float("EDGE_MAX_SPREAD_BPS", 500.0),
+            edge_min_confidence=_env_float("EDGE_MIN_CONFIDENCE", 0.4),
             dashboard_enabled=_env_bool("DASHBOARD_ENABLED", True),
             dashboard_port=_env_int("DASHBOARD_PORT", 8077),
             log_level=_env("LOG_LEVEL", "INFO"),

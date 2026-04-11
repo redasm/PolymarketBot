@@ -22,9 +22,11 @@ from polymarket_arb.arbitrage_detector import (
     ArbitrageDetector,
     format_arb_opportunity_zh,
 )
+from polymarket_arb.book_store import EnhancedBookStore
 from polymarket_arb.client_factory import build_readonly_client, build_trading_client
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.dashboard_api import DashboardState, start_dashboard_server
+from polymarket_arb.edge_engine import EdgeEngine
 from polymarket_arb.execution_engine import ExecutionEngine
 from polymarket_arb.logger_setup import setup_logging
 from polymarket_arb.market_scanner import MarketScanner
@@ -32,6 +34,7 @@ from polymarket_arb.models import ArbOpportunity, ArbType
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
 from polymarket_arb.risk_manager import RiskManager
 from polymarket_arb.telegram_notifier import TelegramNotifier
+from polymarket_arb.volatility_estimator import VolEstimator
 
 LOG = logging.getLogger("main_loop")
 
@@ -69,6 +72,19 @@ def main(dotenv_path: str | None = None) -> None:
     executor = ExecutionEngine(config, trading_client or ro_client)
     risk_mgr = RiskManager(config)
     notifier = TelegramNotifier(config)
+
+    enhanced_store = EnhancedBookStore()
+    vol_estimator = VolEstimator(
+        fast_minutes=config.vol_fast_minutes,
+        slow_minutes=config.vol_slow_minutes,
+        min_bars=config.vol_min_bars,
+    )
+    edge_engine = EdgeEngine(
+        min_edge_bps=config.edge_min_bps,
+        min_depth=config.min_liquidity * 0.05,
+        max_spread_bps=config.edge_max_spread_bps,
+        min_confidence=config.edge_min_confidence,
+    )
 
     dash_state = DashboardState()
     dash_state.update(
@@ -186,7 +202,22 @@ def main(dotenv_path: str | None = None) -> None:
                 )
                 notifier.notify_trade(trade_msg)
 
+        edge_decision = edge_engine.evaluate(enhanced_store, vol_estimator)
+        if edge_decision.direction != "NONE":
+            dash_state.append_opportunity({
+                "arb_type": "edge_engine",
+                "event_title": f"[Edge] {edge_decision.market_id or 'active_market'}",
+                "total_cost": edge_decision.market_price,
+                "net_edge": edge_decision.edge_bps / 10000.0,
+                "edge_pct": edge_decision.edge_bps / 100.0,
+                "confidence": edge_decision.confidence,
+                "direction": edge_decision.direction,
+                "fair_value": edge_decision.fair_value,
+                "timestamp": time.time(),
+            })
+
         risk_s = risk_mgr.state
+        vol_snap = vol_estimator.snapshot()
         dash_state.update(
             cycle_count=cycle,
             arbs_found=total_arbs_found,
@@ -200,6 +231,9 @@ def main(dotenv_path: str | None = None) -> None:
                 "daily_pnl": risk_s.daily_pnl,
                 "consecutive_failures": risk_s.consecutive_failures,
             },
+            volatility=vol_snap,
+            edge_decision=edge_decision.to_dict() if edge_decision else None,
+            book_summary=enhanced_store.get_summary(),
         )
         dash_state.append_pnl_point({
             "timestamp": time.time(),

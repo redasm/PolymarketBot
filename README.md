@@ -47,25 +47,37 @@ total = 0.95           # < 1.0 → 5% 毛利
 
 ### T2 — 统计套利（概率模型驱动）
 
-不等结构性机会出现，而是用贝叶斯模型**主动发现 mispricing**:
+不等结构性机会出现，而是用**多信号融合模型**主动发现 mispricing:
 
 ```
-model_prob = 0.72     # 模型估计真实概率
-market_price = 0.60   # 市场隐含概率
-→ 偏差 +12% → 买入 Yes → Kelly 公式决定仓位
+FairValueModel (log-normal GBM)  ──┐
+                                    ├→ compute_general_fair_value() → model_prob
+订单簿 microprice + imbalance    ──┤
+价格动量 + 跨市场约束            ──┘
+    model_prob = 0.72   vs  market_price = 0.60
+    → Edge = +1200 bps → 买入 Yes → Kelly 决定仓位
 ```
+
+**核心升级**（集成自 [mlmodelpoly](https://github.com/txbabaxyz/mlmodelpoly)）:
+- **FairValueModel**: 对有现货锚定的 UPDOWN 市场（如 "BTC 15min 高于 X?"），用 GBM 精确定价
+- **VolEstimator**: 多尺度波动率（fast 1h / slow 6h / adaptive blend），替代简单滚动窗口
+- **EnhancedBookStore**: 提供 microprice（成交量加权中间价）、多层 imbalance、spread_bps 等衍生指标
+- **EdgeEngine**: 统一决策接口，融合所有信号源并做 veto check（spread/depth/confidence）
 
 信号源:
-- **订单簿不平衡 (OBI)**: bid 深度 / ask 深度的偏离 → 预测短期方向
+- **订单簿不平衡 (OBI)**: 5 档 bid/ask depth 偏离 → 预测短期方向
+- **Microprice**: 比 mid 更精确的短期方向指标
 - **价格动量**: 短期趋势延续信号
 - **跨市场逻辑约束**: P(Trump wins) > P(Republican wins) 是逻辑矛盾
+- **现货锚定**: UPDOWN 市场中 BTC 现货价 vs 参考价的 z-score
 
 ### T3 — 做市策略
 
 在模型 fair value 两侧挂 **maker 限价单**:
 - **Maker 费率 = 0%**（对比 Taker 2%），每笔交易的 edge 直接提升 2 个百分点
 - 在激励带 `[mid - δ, mid + δ]` 内挂单可获得 Polymarket **流动性奖励积分**
-- 动态 spread = `base + volatility_adj + inventory_skew`，根据波动率和持仓偏斜实时调整
+- 动态 spread 由 **VolEstimator** 驱动: `base + sigma_blend×2 + inventory_skew`
+- 波动率飙升时 spread 自动拉宽（保护逆向选择），平稳期自动收窄（提高成交率）
 
 ## 架构
 
@@ -75,21 +87,28 @@ polymarket_arb/
 ├── config.py                          # 环境变量配置（ArbConfig frozen dataclass）
 ├── client_factory.py                  # CLOB 只读/交易客户端工厂
 ├── models.py                          # 数据模型（ArbOpportunity, OrderBookSnapshot 等）
+├── utils_time.py                      # 时间工具（毫秒时间戳、区间对齐）
+├── book_store.py                      # 增强订单簿存储（microprice/imbalance/depth 衍生指标）
+├── fair_value_model.py                # Fair Value 定价（log-normal GBM + 通用多信号融合）
+├── volatility_estimator.py            # 多尺度波动率（fast 1h / slow 6h / adaptive blend）
+├── edge_engine.py                     # Edge 决策引擎（融合 BookStore + Vol + FairValue）
 ├── market_scanner.py                  # Gamma API 批量拉取活跃市场/事件
 ├── orderbook_analyzer.py              # 订单簿分析、VWAP 加权成交价计算
 ├── arbitrage_detector.py              # T0 结构性套利检测（二元 + 多结果 + neg_risk）
-├── websocket_feed.py                  # WebSocket 实时订单簿镜像 + 事件驱动触发
+├── websocket_feed.py                  # WebSocket 实时订单簿镜像 + 同步 EnhancedBookStore
 ├── execution_engine.py                # 交易执行（多腿原子提交 + 失败回滚）
 ├── risk_manager.py                    # 风控（敞口/止损/熔断/市场冷却）
 ├── telegram_notifier.py               # Telegram 推送（套利发现/执行/错误）
 ├── logger_setup.py                    # 日志（控制台 + 文件双输出）
+├── dashboard_api.py                   # FastAPI 监控后端 + 波动率/Edge/BookStore 端点
+├── dashboard.html                     # 前端仪表盘
 ├── main_loop.py                       # 主循环入口
 └── strategies/
     ├── __init__.py
     ├── kelly.py                       # Kelly Criterion 最优仓位（二元/结构性/统计）
     ├── cross_platform.py              # T1 跨平台套利（Polymarket vs Kalshi）
-    ├── statistical_model.py           # T2 贝叶斯定价模型 + OBI/动量/跨市场信号
-    ├── maker_strategy.py              # T3 做市策略（动态 spread + 库存倾斜）
+    ├── statistical_model.py           # T2 贝叶斯定价 + FairValueModel 现货锚定
+    ├── maker_strategy.py              # T3 做市策略（VolEstimator 驱动 spread）
     └── strategy_orchestrator.py       # 策略编排器（优先级调度 + 资金分配）
 ```
 
@@ -139,7 +158,10 @@ f* = (p·b - q) / b    (经典 Kelly)
 WebSocket 订单簿变动推送
          │
          ▼
-OrderBookMirror 更新 → best bid/ask 变动?
+OrderBookMirror 更新 ──→ EnhancedBookStore 同步更新
+         │                    │
+         ▼                    ▼
+best bid/ask 变动?      microprice / imbalance / depth 计算
          │ Yes                        │ No
          ▼                            └→ 忽略
 T0 结构性套利检测 (毫秒级)
@@ -149,15 +171,16 @@ T0 结构性套利检测 (毫秒级)
          ├─ 命中 → VWAP 深度验证 → Kelly 计算仓位 → 风控预检 → 执行
          │
 定时扫描 (5s 周期)
+  ├─ EdgeEngine: BookStore + VolEstimator + FairValue → edge_bps → veto check
   ├─ T1 跨平台: Poly vs Kalshi 价差
   ├─ T2 统计模型: 贝叶斯偏差 > threshold?
-  └─ T3 做市: 更新 bid/ask 报价
+  └─ T3 做市: VolEstimator 驱动 spread → 更新 bid/ask 报价
          │
          ▼
 StrategyOrchestrator 优先级排序 → 资金分配 → 逐个执行
          │
          ▼
-Telegram 通知 + 风控状态更新
+Dashboard 更新（volatility / edge / book_summary）+ Telegram 通知
 ```
 
 ## 风控机制
@@ -206,6 +229,10 @@ cp .env.example .env
 | `ARB_MAX_ORDER_SIZE_USDC` | 单笔最大下单量 | 50 USDC |
 | `RISK_MAX_TOTAL_EXPOSURE` | 全局最大敞口 | 500 USDC |
 | `RISK_MAX_DAILY_LOSS` | 日亏损止损线 | 50 USDC |
+| `VOL_FAST_MINUTES` | 快速波动率窗口 | 60 分钟 |
+| `VOL_SLOW_MINUTES` | 慢速波动率窗口 | 360 分钟 |
+| `EDGE_MIN_BPS` | Edge 引擎最小触发阈值 | 100 bps |
+| `EDGE_MAX_SPREAD_BPS` | 最大可接受 spread | 500 bps |
 
 完整配置见 `.env.example`。
 

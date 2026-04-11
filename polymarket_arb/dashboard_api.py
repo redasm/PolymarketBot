@@ -51,6 +51,10 @@ class DashboardState:
 
         self.orderbook_stats: dict[str, dict] = {}
 
+        self.volatility: dict = {}
+        self.edge_decision: Optional[dict] = None
+        self.book_summary: dict = {}
+
     def update(self, **kwargs: Any) -> None:
         with self._lock:
             for k, v in kwargs.items():
@@ -101,6 +105,9 @@ class DashboardState:
                 "recent_errors": list(self.recent_errors[-10:]),
                 "pnl_history": list(self.pnl_history[-200:]),
                 "current_positions": list(self.current_positions),
+                "volatility": dict(self.volatility) if self.volatility else None,
+                "edge_decision": dict(self.edge_decision) if self.edge_decision else None,
+                "book_summary": dict(self.book_summary) if self.book_summary else None,
                 "ts": time.time(),
             }
 
@@ -177,6 +184,30 @@ async def api_positions() -> JSONResponse:
     with state._lock:
         data = list(state.current_positions)
     return JSONResponse({"positions": data})
+
+
+@app.get("/api/volatility")
+async def api_volatility() -> JSONResponse:
+    state = _get_state()
+    with state._lock:
+        data = dict(state.volatility) if state.volatility else {}
+    return JSONResponse(data)
+
+
+@app.get("/api/edge")
+async def api_edge() -> JSONResponse:
+    state = _get_state()
+    with state._lock:
+        data = dict(state.edge_decision) if state.edge_decision else {}
+    return JSONResponse(data)
+
+
+@app.get("/api/book")
+async def api_book() -> JSONResponse:
+    state = _get_state()
+    with state._lock:
+        data = dict(state.book_summary) if state.book_summary else {}
+    return JSONResponse(data)
 
 
 def _format_duration(seconds: float) -> str:

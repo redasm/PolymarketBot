@@ -35,6 +35,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from polymarket_arb.fair_value_model import compute_general_fair_value
+
 LOG = logging.getLogger(__name__)
 
 
@@ -139,19 +141,22 @@ class BayesianPriceModel:
     其中 P(event) = market_price（先验）
     P(signals | event) 由各信号的条件似然估计。
 
-    信号权重通过信号的历史预测准确度自适应调整。
+    当有来自 FairValueModel 的现货锚定（spot_fair）时，
+    委托给 compute_general_fair_value 做更精确的融合。
     """
 
     def __init__(
         self,
-        obi_weight: float = 0.15,
-        momentum_weight: float = 0.10,
-        cross_market_weight: float = 0.20,
+        obi_weight: float = 0.10,
+        momentum_weight: float = 0.08,
+        cross_market_weight: float = 0.15,
+        spot_weight: float = 0.40,
         min_deviation_threshold: float = 0.03,
     ):
         self._obi_weight = obi_weight
         self._momentum_weight = momentum_weight
         self._cross_weight = cross_market_weight
+        self._spot_weight = spot_weight
         self._min_threshold = min_deviation_threshold
         self._momentum = MomentumSignal()
 
@@ -162,6 +167,7 @@ class BayesianPriceModel:
         obi_score: float = 0.0,
         momentum_score: float = 0.0,
         cross_market_deviation: float = 0.0,
+        spot_fair: Optional[float] = None,
     ) -> float:
         """综合信号估算后验概率.
 
@@ -170,23 +176,22 @@ class BayesianPriceModel:
             obi_score: 订单簿不平衡 (-1 to 1)
             momentum_score: 动量信号
             cross_market_deviation: 相关市场的价格偏差
+            spot_fair: 来自 FairValueModel 的现货锚定概率（如果可用）
 
         Returns:
             模型估计的概率 (0-1)
         """
-        if market_price <= 0 or market_price >= 1:
-            return market_price
-
-        log_odds = math.log(market_price / (1 - market_price))
-
-        log_odds += self._obi_weight * obi_score
-        log_odds += self._momentum_weight * momentum_score
-        log_odds += self._cross_weight * cross_market_deviation
-
-        posterior = 1.0 / (1.0 + math.exp(-log_odds))
-        posterior = max(0.001, min(0.999, posterior))
-
-        return posterior
+        return compute_general_fair_value(
+            market_price,
+            obi_score=obi_score,
+            momentum_score=momentum_score,
+            cross_market_deviation=cross_market_deviation,
+            spot_fair=spot_fair,
+            obi_weight=self._obi_weight,
+            momentum_weight=self._momentum_weight,
+            cross_weight=self._cross_weight,
+            spot_weight=self._spot_weight,
+        )
 
 
 class StatisticalMispricingDetector:
