@@ -108,6 +108,12 @@ class ArbConfig:
     log_level: str
     log_file: str
 
+    # WebSocket 实时数据
+    ws_enabled: bool
+    ws_max_markets: int
+    ws_refresh_cycles: int
+    ws_vol_feed_interval_sec: float
+
     # AI 决策引擎
     ai_enabled: bool
     ai_provider: str
@@ -173,6 +179,10 @@ class ArbConfig:
             dashboard_port=_env_int("DASHBOARD_PORT", 8077),
             log_level=_env("LOG_LEVEL", "INFO"),
             log_file=_env("LOG_FILE", "arb_bot.log"),
+            ws_enabled=_env_bool("WS_ENABLED", True),
+            ws_max_markets=_env_int("WS_MAX_MARKETS", 3),
+            ws_refresh_cycles=_env_int("WS_REFRESH_CYCLES", 200),
+            ws_vol_feed_interval_sec=_env_float("WS_VOL_FEED_INTERVAL_SEC", 60.0),
             ai_enabled=_env_bool("AI_ENABLED", False),
             ai_provider=_env("AI_PROVIDER", "openai"),
             ai_api_key=_env("AI_API_KEY") or _env("OPENAI_API_KEY"),

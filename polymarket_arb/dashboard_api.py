@@ -54,6 +54,7 @@ class DashboardState:
         self.volatility: dict = {}
         self.edge_decision: Optional[dict] = None
         self.book_summary: dict = {}
+        self.ws_status: dict = {}
         self.ai_status: dict = {}
         self.ai_decisions: list[dict] = []
 
@@ -116,6 +117,7 @@ class DashboardState:
                 "volatility": dict(self.volatility) if self.volatility else None,
                 "edge_decision": dict(self.edge_decision) if self.edge_decision else None,
                 "book_summary": dict(self.book_summary) if self.book_summary else None,
+                "ws_status": dict(self.ws_status) if self.ws_status else None,
                 "ai_status": dict(self.ai_status) if self.ai_status else None,
                 "ts": time.time(),
             }
@@ -216,6 +218,14 @@ async def api_book() -> JSONResponse:
     state = _get_state()
     with state._lock:
         data = dict(state.book_summary) if state.book_summary else {}
+    return JSONResponse(data)
+
+
+@app.get("/api/ws")
+async def api_ws() -> JSONResponse:
+    state = _get_state()
+    with state._lock:
+        data = dict(state.ws_status) if state.ws_status else {}
     return JSONResponse(data)
 
 
