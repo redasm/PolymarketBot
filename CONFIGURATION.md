@@ -16,6 +16,7 @@
   - [Tick 录制](#tick-录制)
   - [监控仪表盘](#监控仪表盘)
   - [日志](#日志)
+  - [AI 决策引擎](#ai-决策引擎)
 - [认证流程详解](#认证流程详解)
 - [WebSocket 连接](#websocket-连接)
 - [运行模式](#运行模式)
@@ -262,6 +263,62 @@ FastAPI 后端 + HTML 前端，只读访问，绑定 `127.0.0.1`。
 |----------|------|--------|------|
 | `LOG_LEVEL` | str | `INFO` | 日志级别：`DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `LOG_FILE` | str | `arb_bot.log` | 日志文件路径。控制台和文件双输出 |
+
+### AI 决策引擎
+
+| 环境变量 | 类型 | 默认值 | 说明 |
+|----------|------|--------|------|
+| `AI_ENABLED` | bool | `false` | AI 决策引擎总开关。关闭时零开销 |
+| `AI_PROVIDER` | str | `openai` | LLM 提供商：`openai` / `anthropic` / `ollama` / `deepseek` / `gemini` |
+| `AI_API_KEY` | str | *(空)* | LLM API Key（Ollama 不需要） |
+| `AI_API_BASE` | str | *(空)* | 自定义 API 端点。留空使用 provider 默认值 |
+| `AI_MODEL` | str | `gpt-4o` | 模型名称 |
+| `AI_TEMPERATURE` | float | `0.1` | 采样温度，越低越确定性 |
+| `AI_EVAL_INTERVAL_SEC` | float | `30` | AI 评估周期（秒），越小越灵敏但成本越高 |
+| `AI_MAX_COST_PER_DAY` | float | `5.0` | 日 API 成本上限（USD），超限后自动降级为只读 |
+| `AI_OVERRIDE_RISK` | bool | `false` | AI 是否可以动态调整风控参数（受 150% 硬上限约束） |
+
+**Provider 切换示例：**
+
+```env
+# --- OpenAI GPT-4o ---
+AI_PROVIDER=openai
+AI_API_KEY=sk-xxx
+AI_MODEL=gpt-4o
+
+# --- DeepSeek（约便宜 10 倍）---
+AI_PROVIDER=deepseek
+AI_API_KEY=sk-xxx
+AI_API_BASE=https://api.deepseek.com
+AI_MODEL=deepseek-chat
+
+# --- Anthropic Claude ---
+AI_PROVIDER=anthropic
+AI_API_KEY=sk-ant-xxx
+AI_MODEL=claude-sonnet-4-20250514
+
+# --- Google Gemini ---
+AI_PROVIDER=gemini
+AI_API_KEY=AIzaXxx
+AI_API_BASE=https://generativelanguage.googleapis.com/v1beta/openai
+AI_MODEL=gemini-2.0-flash
+
+# --- 本地 Ollama（免费）---
+AI_PROVIDER=ollama
+AI_API_BASE=http://localhost:11434
+AI_MODEL=qwen2.5:7b
+```
+
+**成本参考（默认 30s 间隔）：**
+
+| Provider | 模型 | 预估月成本 | 延迟 |
+|----------|------|-----------|------|
+| OpenAI | gpt-4o | ~$40-60 | 1-3s |
+| OpenAI | gpt-4o-mini | ~$5-10 | 0.5-1s |
+| DeepSeek | deepseek-chat | ~$2-5 | 1-2s |
+| Gemini | gemini-2.0-flash | ~$3-8 | 0.5-1.5s |
+| Anthropic | claude-sonnet-4-20250514 | ~$30-50 | 1-3s |
+| Ollama | qwen2.5:7b | $0（仅电费） | 0.5-2s |
 
 ---
 

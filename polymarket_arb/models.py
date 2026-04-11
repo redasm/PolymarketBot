@@ -218,6 +218,46 @@ class RiskState:
 
 
 @dataclass
+class AIDecision:
+    """AI 决策引擎的输出."""
+
+    action: str  # "BUY_YES" | "BUY_NO" | "SELL_YES" | "SELL_NO" | "HOLD" | "CLOSE"
+    market_id: str
+    confidence: float  # 0-1
+    recommended_size_pct: float  # 占可用资金的比例 0-1
+    reasoning: str
+    risk_adjustment: dict = field(default_factory=dict)
+    urgency: float = 0.5  # 0-1
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return {
+            "action": self.action,
+            "market_id": self.market_id,
+            "confidence": round(self.confidence, 3),
+            "recommended_size_pct": round(self.recommended_size_pct, 3),
+            "reasoning": self.reasoning,
+            "risk_adjustment": self.risk_adjustment,
+            "urgency": round(self.urgency, 3),
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass
+class MarketContext:
+    """传递给 AI 决策引擎的市场上下文快照."""
+
+    timestamp: float
+    active_markets: list[dict] = field(default_factory=list)
+    orderbook_summary: dict = field(default_factory=dict)
+    volatility: dict = field(default_factory=dict)
+    edge_signals: list[dict] = field(default_factory=list)
+    recent_trades: list[dict] = field(default_factory=list)
+    risk_state: dict = field(default_factory=dict)
+    portfolio: dict = field(default_factory=dict)
+
+
+@dataclass
 class FeeStructure:
     """Polymarket 手续费结构."""
 

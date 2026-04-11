@@ -108,6 +108,17 @@ class ArbConfig:
     log_level: str
     log_file: str
 
+    # AI 决策引擎
+    ai_enabled: bool
+    ai_provider: str
+    ai_api_key: str
+    ai_api_base: str
+    ai_model: str
+    ai_temperature: float
+    ai_eval_interval_sec: float
+    ai_max_cost_per_day: float
+    ai_override_risk: bool
+
     @classmethod
     def from_env(cls, dotenv_path: str | Path | None = None) -> ArbConfig:
         """从 .env 文件和环境变量构建配置."""
@@ -162,6 +173,15 @@ class ArbConfig:
             dashboard_port=_env_int("DASHBOARD_PORT", 8077),
             log_level=_env("LOG_LEVEL", "INFO"),
             log_file=_env("LOG_FILE", "arb_bot.log"),
+            ai_enabled=_env_bool("AI_ENABLED", False),
+            ai_provider=_env("AI_PROVIDER", "openai"),
+            ai_api_key=_env("AI_API_KEY") or _env("OPENAI_API_KEY"),
+            ai_api_base=_env("AI_API_BASE"),
+            ai_model=_env("AI_MODEL", "gpt-4o"),
+            ai_temperature=_env_float("AI_TEMPERATURE", 0.1),
+            ai_eval_interval_sec=_env_float("AI_EVAL_INTERVAL_SEC", 30.0),
+            ai_max_cost_per_day=_env_float("AI_MAX_COST_PER_DAY", 5.0),
+            ai_override_risk=_env_bool("AI_OVERRIDE_RISK", False),
         )
 
         LOG.info(

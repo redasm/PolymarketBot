@@ -54,6 +54,8 @@ class DashboardState:
         self.volatility: dict = {}
         self.edge_decision: Optional[dict] = None
         self.book_summary: dict = {}
+        self.ai_status: dict = {}
+        self.ai_decisions: list[dict] = []
 
     def update(self, **kwargs: Any) -> None:
         with self._lock:
@@ -85,6 +87,12 @@ class DashboardState:
             if len(self.pnl_history) > 2880:
                 self.pnl_history = self.pnl_history[-2880:]
 
+    def append_ai_decision(self, decision: dict) -> None:
+        with self._lock:
+            self.ai_decisions.append(decision)
+            if len(self.ai_decisions) > 100:
+                self.ai_decisions = self.ai_decisions[-100:]
+
     def snapshot(self) -> dict:
         with self._lock:
             uptime = time.time() - self.bot_start_ts
@@ -108,6 +116,7 @@ class DashboardState:
                 "volatility": dict(self.volatility) if self.volatility else None,
                 "edge_decision": dict(self.edge_decision) if self.edge_decision else None,
                 "book_summary": dict(self.book_summary) if self.book_summary else None,
+                "ai_status": dict(self.ai_status) if self.ai_status else None,
                 "ts": time.time(),
             }
 
@@ -208,6 +217,16 @@ async def api_book() -> JSONResponse:
     with state._lock:
         data = dict(state.book_summary) if state.book_summary else {}
     return JSONResponse(data)
+
+
+@app.get("/api/ai")
+async def api_ai() -> JSONResponse:
+    state = _get_state()
+    with state._lock:
+        return JSONResponse({
+            "status": dict(state.ai_status) if state.ai_status else None,
+            "decisions": list(state.ai_decisions[-30:]),
+        })
 
 
 def _format_duration(seconds: float) -> str:

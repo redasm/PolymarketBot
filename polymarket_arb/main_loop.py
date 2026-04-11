@@ -18,6 +18,8 @@ import signal
 import time
 from typing import Any, Optional
 
+from polymarket_arb.ai_advisor import AIAdvisor, create_ai_advisor
+from polymarket_arb.ai_context import MarketContextBuilder
 from polymarket_arb.arbitrage_detector import (
     ArbitrageDetector,
     format_arb_opportunity_zh,
@@ -33,6 +35,11 @@ from polymarket_arb.market_scanner import MarketScanner
 from polymarket_arb.models import ArbOpportunity, ArbType
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
 from polymarket_arb.risk_manager import RiskManager
+from polymarket_arb.strategies.strategy_orchestrator import (
+    StrategyOrchestrator,
+    StrategySignal,
+    StrategyTier,
+)
 from polymarket_arb.telegram_notifier import TelegramNotifier
 from polymarket_arb.tick_recorder import TickRecorder
 from polymarket_arb.volatility_estimator import VolEstimator
@@ -92,6 +99,18 @@ def main(dotenv_path: str | None = None) -> None:
     )
     if config.tick_record_enabled:
         LOG.info("Tick 录制已开启: %s", config.tick_record_dir)
+
+    orchestrator = StrategyOrchestrator(total_bankroll=config.max_total_exposure)
+    ctx_builder = MarketContextBuilder()
+
+    ai_advisor: Optional[AIAdvisor] = None
+    if config.ai_enabled:
+        ai_advisor = create_ai_advisor(config)
+        if ai_advisor:
+            LOG.info(
+                "AI 决策引擎已启用: provider=%s, model=%s, interval=%.0fs",
+                config.ai_provider, config.ai_model, config.ai_eval_interval_sec,
+            )
 
     dash_state = DashboardState()
     dash_state.update(
@@ -223,6 +242,19 @@ def main(dotenv_path: str | None = None) -> None:
                 "timestamp": time.time(),
             })
 
+        if ai_advisor and ai_advisor.should_evaluate():
+            _run_ai_cycle(
+                ai_advisor=ai_advisor,
+                ctx_builder=ctx_builder,
+                book_store=enhanced_store,
+                vol_estimator=vol_estimator,
+                edge_decision=edge_decision,
+                risk_mgr=risk_mgr,
+                orchestrator=orchestrator,
+                dash_state=dash_state,
+                config=config,
+            )
+
         risk_s = risk_mgr.state
         vol_snap = vol_estimator.snapshot()
         dash_state.update(
@@ -296,3 +328,69 @@ def _scan_cycle(
 
     opportunities.sort(key=lambda o: o.net_edge, reverse=True)
     return opportunities
+
+
+def _run_ai_cycle(
+    *,
+    ai_advisor: AIAdvisor,
+    ctx_builder: MarketContextBuilder,
+    book_store: EnhancedBookStore,
+    vol_estimator: VolEstimator,
+    edge_decision: Any,
+    risk_mgr: RiskManager,
+    orchestrator: StrategyOrchestrator,
+    dash_state: DashboardState,
+    config: ArbConfig,
+) -> None:
+    """在主循环中执行一次 AI 评估（同步包装 async 调用）."""
+    context = ctx_builder.build(
+        book_store=book_store,
+        vol_estimator=vol_estimator,
+        edge_signals=[edge_decision.to_dict()] if edge_decision else [],
+        risk_state=risk_mgr.state,
+    )
+
+    loop = _get_or_create_event_loop()
+    try:
+        decisions = loop.run_until_complete(ai_advisor.evaluate_markets(context))
+    except Exception as e:
+        LOG.error("AI 评估异常: %s", e, exc_info=True)
+        dash_state.append_error({"message": f"AI error: {e}", "timestamp": time.time()})
+        return
+
+    for dec in decisions:
+        if dec.action == "HOLD":
+            continue
+        signal = StrategySignal(
+            tier=StrategyTier.STATISTICAL_ARB,
+            signal_type=f"ai_{dec.action.lower()}",
+            market_id=dec.market_id,
+            description=dec.reasoning[:120],
+            expected_edge=dec.confidence * 100,
+            confidence=dec.confidence,
+            recommended_size_usdc=dec.recommended_size_pct * config.max_total_exposure,
+            urgency=dec.urgency,
+        )
+        orchestrator.submit_signal(signal)
+
+    if config.ai_override_risk:
+        try:
+            adjustments = loop.run_until_complete(ai_advisor.adjust_risk_params(context))
+            if adjustments:
+                risk_mgr.apply_ai_adjustment(adjustments)
+        except Exception as e:
+            LOG.error("AI 风控调整异常: %s", e, exc_info=True)
+
+    dash_state.update(ai_status=ai_advisor.get_status())
+
+
+def _get_or_create_event_loop() -> asyncio.AbstractEventLoop:
+    """获取或创建事件循环，兼容在非 async 上下文中调用."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop
