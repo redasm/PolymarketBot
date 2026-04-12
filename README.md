@@ -448,12 +448,74 @@ with open("data/ticks/2026-04-11.ndjson") as f:
 ### 使用 tmux（远程服务器）
 
 ```bash
-tmux new -s arb
+cd ~/PolymarketBot
 source .venv/bin/activate
+tmux new -s arb
 python run_arb_bot.py
-# Ctrl+b d 断开
-# tmux attach -t arb 接回
 ```
+
+后台保活与回连：
+
+```bash
+# 在 tmux 中启动后，按 Ctrl+b 再按 d，可断开但保持机器人继续运行
+
+# 查看当前会话
+tmux ls
+
+# 重新接回运行中的机器人
+tmux attach -t arb
+
+# 如需停止并重建会话
+tmux kill-session -t arb
+tmux new -s arb
+```
+
+### 远程访问 Dashboard（SSH 端口转发）
+
+机器人默认只在服务器本机监听 dashboard：
+
+```bash
+http://127.0.0.1:8077
+```
+
+推荐在**本地电脑**执行 SSH 端口转发，而不是把 dashboard 暴露到公网：
+
+```bash
+ssh -N -L 18077:127.0.0.1:8077 -i /path/to/your_key.pem root@your_server_ip
+```
+
+Windows PowerShell 示例：
+
+```powershell
+ssh -N -L 18077:127.0.0.1:8077 -i C:\path\to\your_key.pem root@your_server_ip
+```
+
+然后在本地浏览器打开：
+
+```bash
+http://127.0.0.1:18077
+```
+
+如果出现：
+
+```bash
+channel ... open failed: connect failed: Connection refused
+```
+
+通常表示 SSH 登录已经成功，但**服务器上的 dashboard 没有监听 8077**。请先在服务器里确认：
+
+```bash
+grep DASHBOARD_ENABLED .env
+grep DASHBOARD_PORT .env
+ss -lntp | grep 8077
+tail -n 50 arb_bot.log
+```
+
+推荐的运维方式：
+
+1. 用 `tmux` 在服务器后台运行 `python run_arb_bot.py`
+2. 用另一条本地 SSH 隧道访问 dashboard
+3. 不要直接把 dashboard 监听改成 `0.0.0.0`
 
 ## 免责声明
 
