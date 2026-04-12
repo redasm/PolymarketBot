@@ -21,8 +21,7 @@
 from __future__ import annotations
 
 import logging
-import time
-import uuid
+import re
 from typing import Optional
 
 from polymarket_arb.config import ArbConfig
@@ -33,7 +32,6 @@ from polymarket_arb.models import (
     EventInfo,
     FeeStructure,
     MarketInfo,
-    OrderBookSnapshot,
     OrderSide,
 )
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
@@ -49,14 +47,10 @@ class ArbitrageDetector:
     def __init__(self, config: ArbConfig, ob_analyzer: OrderBookAnalyzer):
         self._config = config
         self._ob = ob_analyzer
-        self._fees = FeeStructure()
+        self._fees = FeeStructure(taker_fee_rate=config.polymarket_taker_fee_rate)
 
     def scan_binary_market(self, market: MarketInfo) -> Optional[ArbOpportunity]:
-        """检查二元市场（Yes/No）是否存在套利.
-
-        Polymarket 二元市场有且仅有 2 个 token。
-        如果两个 token 的 best ask 之和 < 1.0 - fee，则存在套利。
-        """
+        """检查二元市场（Yes/No）是否存在套利."""
         if len(market.tokens) != 2:
             return None
         if market.closed or not market.active:
@@ -85,7 +79,6 @@ class ArbitrageDetector:
             return None
 
         edge_pct = (net_edge / total_cost) * 100 if total_cost > 0 else 0
-
         if net_edge < self._config.min_edge_usd:
             return None
         if edge_pct < self._config.min_edge_pct:
@@ -106,6 +99,8 @@ class ArbitrageDetector:
                 price=ask_yes,
                 size=max_size,
                 available_size=snap_yes.best_ask_size,
+                execution_price=ask_yes,
+                economic_cost=ask_yes,
             ),
             ArbLeg(
                 token_id=token_no.token_id,
@@ -115,11 +110,12 @@ class ArbitrageDetector:
                 price=ask_no,
                 size=max_size,
                 available_size=snap_no.best_ask_size,
+                execution_price=ask_no,
+                economic_cost=ask_no,
             ),
         ]
 
         confidence = self._estimate_confidence(net_edge, edge_pct, max_size, total_cost)
-
         return ArbOpportunity(
             arb_type=ArbType.BINARY,
             event_id=market.event_id,
@@ -136,49 +132,43 @@ class ArbitrageDetector:
         )
 
     def scan_multi_outcome_event(self, event: EventInfo) -> Optional[ArbOpportunity]:
-        """检查多结果事件是否存在套利.
-
-        一个事件下有多个互斥市场，每个市场代表一个结果。
-        如果所有结果的 best ask 之和 < 1.0 - fee，则买入所有结果锁定利润。
-
-        neg_risk 市场的特殊处理:
-        - neg_risk=True 时，Polymarket 使用补集定价
-        - 买入 outcome_i 实际等价于卖出 (1 - outcome_i)
-        - 需要用 No token 的 best_bid 来计算等效 ask
-        """
+        """检查多结果事件是否存在套利."""
         if len(event.markets) < 2:
             return None
 
         active_markets = [m for m in event.markets if m.active and not m.closed]
         if len(active_markets) < 2:
             return None
+        if self._is_monotonic_time_ladder(active_markets):
+            LOG.debug("跳过非互斥时间梯事件: %s", event.title)
+            return None
+        if len(active_markets) > self._config.max_multi_outcome_legs:
+            LOG.info(
+                "跳过超多腿多结果事件: %s, markets=%d > limit=%d",
+                event.title,
+                len(active_markets),
+                self._config.max_multi_outcome_legs,
+            )
+            return None
 
         is_neg_risk = any(m.neg_risk for m in active_markets)
-
         legs: list[ArbLeg] = []
         total_ask_cost = 0.0
         min_available = float("inf")
-        all_valid = True
 
         for market in active_markets:
             if not market.tokens:
-                all_valid = False
-                break
+                return None
 
-            if is_neg_risk:
-                arb_leg = self._get_neg_risk_leg(market)
-            else:
-                arb_leg = self._get_standard_leg(market)
-
+            arb_leg = self._get_neg_risk_leg(market) if is_neg_risk else self._get_standard_leg(market)
             if arb_leg is None:
-                all_valid = False
-                break
+                return None
 
             legs.append(arb_leg)
-            total_ask_cost += arb_leg.price
+            total_ask_cost += arb_leg.economic_cost if arb_leg.economic_cost is not None else arb_leg.price
             min_available = min(min_available, arb_leg.available_size)
 
-        if not all_valid or not legs:
+        if not legs:
             return None
 
         gross_edge = PAYOUT_PER_SHARE - total_ask_cost
@@ -189,7 +179,6 @@ class ArbitrageDetector:
             return None
 
         edge_pct = (net_edge / total_ask_cost) * 100 if total_ask_cost > 0 else 0
-
         if net_edge < self._config.min_edge_usd:
             return None
         if edge_pct < self._config.min_edge_pct:
@@ -203,7 +192,6 @@ class ArbitrageDetector:
             leg.size = max_size
 
         confidence = self._estimate_confidence(net_edge, edge_pct, max_size, total_ask_cost)
-
         return ArbOpportunity(
             arb_type=ArbType.MULTI_OUTCOME,
             event_id=event.event_id,
@@ -232,21 +220,17 @@ class ArbitrageDetector:
         return ArbLeg(
             token_id=yes_token.token_id,
             condition_id=market.condition_id,
-            outcome=yes_token.outcome or market.outcomes[0] if market.outcomes else "Yes",
+            outcome=yes_token.outcome or (market.outcomes[0] if market.outcomes else "Yes"),
             side=OrderSide.BUY,
             price=snap.best_ask,
             size=0,
             available_size=snap.best_ask_size,
+            execution_price=snap.best_ask,
+            economic_cost=snap.best_ask,
         )
 
     def _get_neg_risk_leg(self, market: MarketInfo) -> Optional[ArbLeg]:
-        """neg_risk 市场：通过 No token 的 bid 来等效获得 Yes 头寸.
-
-        在 neg_risk 市场中:
-        - 买 Yes @ ask_yes 直接获得
-        - 或者等效地：卖 No @ bid_no，成本 = 1 - bid_no
-        - 取两者中较优的
-        """
+        """neg_risk 市场：通过 No token 的 bid 来等效获得 Yes 头寸."""
         if len(market.tokens) < 2:
             return None
 
@@ -256,35 +240,16 @@ class ArbitrageDetector:
         snap_yes = self._ob.get_snapshot(yes_token.token_id)
         snap_no = self._ob.get_snapshot(no_token.token_id)
 
-        effective_ask_via_yes = snap_yes.best_ask if (snap_yes and snap_yes.best_ask) else None
-        effective_ask_via_no = (1.0 - snap_no.best_bid) if (snap_no and snap_no.best_bid) else None
+        effective_ask_via_yes = snap_yes.best_ask if (snap_yes and snap_yes.best_ask is not None) else None
+        no_bid = snap_no.best_bid if (snap_no and snap_no.best_bid is not None) else None
+        effective_ask_via_no = (1.0 - no_bid) if no_bid is not None else None
 
         if effective_ask_via_yes is None and effective_ask_via_no is None:
             return None
 
-        if effective_ask_via_yes is not None and effective_ask_via_no is not None:
-            if effective_ask_via_yes <= effective_ask_via_no:
-                return ArbLeg(
-                    token_id=yes_token.token_id,
-                    condition_id=market.condition_id,
-                    outcome=yes_token.outcome or "Yes",
-                    side=OrderSide.BUY,
-                    price=effective_ask_via_yes,
-                    size=0,
-                    available_size=snap_yes.best_ask_size if snap_yes else 0,
-                )
-            else:
-                return ArbLeg(
-                    token_id=no_token.token_id,
-                    condition_id=market.condition_id,
-                    outcome=yes_token.outcome or "Yes",
-                    side=OrderSide.SELL,
-                    price=effective_ask_via_no,
-                    size=0,
-                    available_size=snap_no.best_bid_size if snap_no else 0,
-                )
-
-        if effective_ask_via_yes is not None:
+        if effective_ask_via_yes is not None and (
+            effective_ask_via_no is None or effective_ask_via_yes <= effective_ask_via_no
+        ):
             return ArbLeg(
                 token_id=yes_token.token_id,
                 condition_id=market.condition_id,
@@ -293,9 +258,20 @@ class ArbitrageDetector:
                 price=effective_ask_via_yes,
                 size=0,
                 available_size=snap_yes.best_ask_size if snap_yes else 0,
+                execution_price=effective_ask_via_yes,
+                economic_cost=effective_ask_via_yes,
             )
 
-        assert effective_ask_via_no is not None
+        if effective_ask_via_no is None or no_bid is None:
+            LOG.warning(
+                "neg_risk 腿构建失败: market=%s yes_token=%s no_token=%s effective_ask_via_no=%s no_bid=%s",
+                market.condition_id[:12],
+                yes_token.token_id[:16],
+                no_token.token_id[:16],
+                effective_ask_via_no,
+                no_bid,
+            )
+            return None
         return ArbLeg(
             token_id=no_token.token_id,
             condition_id=market.condition_id,
@@ -304,38 +280,45 @@ class ArbitrageDetector:
             price=effective_ask_via_no,
             size=0,
             available_size=snap_no.best_bid_size if snap_no else 0,
+            execution_price=no_bid,
+            economic_cost=effective_ask_via_no,
         )
 
     def verify_opportunity_with_depth(
         self, opp: ArbOpportunity, target_size: float
     ) -> Optional[ArbOpportunity]:
-        """用 VWAP 重新验证套利机会（考虑滑点）.
-
-        初始扫描用 best ask 快速筛选，此方法用实际可执行深度重新计算。
-        """
+        """用 VWAP 重新验证套利机会（考虑滑点）."""
         total_vwap_cost = 0.0
         verified_legs: list[ArbLeg] = []
         actual_min_size = float("inf")
 
         for leg in opp.legs:
-            result = self._ob.get_executable_ask_price(leg.token_id, target_size)
+            if leg.side == OrderSide.BUY:
+                result = self._ob.get_executable_ask_price(leg.token_id, target_size)
+            else:
+                result = self._ob.get_executable_bid_price(leg.token_id, target_size)
             if result is None:
                 LOG.debug("深度验证失败: token=%s… 无足够深度", leg.token_id[:20])
                 return None
 
             vwap, filled = result
-            total_vwap_cost += vwap
+            economic_cost = vwap if leg.side == OrderSide.BUY else (1.0 - vwap)
+            total_vwap_cost += economic_cost
             actual_min_size = min(actual_min_size, filled)
 
-            verified_legs.append(ArbLeg(
-                token_id=leg.token_id,
-                condition_id=leg.condition_id,
-                outcome=leg.outcome,
-                side=leg.side,
-                price=vwap,
-                size=min(target_size, filled),
-                available_size=filled,
-            ))
+            verified_legs.append(
+                ArbLeg(
+                    token_id=leg.token_id,
+                    condition_id=leg.condition_id,
+                    outcome=leg.outcome,
+                    side=leg.side,
+                    price=economic_cost,
+                    size=min(target_size, filled),
+                    available_size=filled,
+                    execution_price=vwap,
+                    economic_cost=economic_cost,
+                )
+            )
 
         gross_edge = PAYOUT_PER_SHARE - total_vwap_cost
         fee = self._fees.estimate_fee(total_vwap_cost, num_legs=len(verified_legs))
@@ -345,7 +328,6 @@ class ArbitrageDetector:
             return None
 
         edge_pct = (net_edge / total_vwap_cost) * 100 if total_vwap_cost > 0 else 0
-
         return ArbOpportunity(
             arb_type=opp.arb_type,
             event_id=opp.event_id,
@@ -364,13 +346,7 @@ class ArbitrageDetector:
     def _estimate_confidence(
         self, net_edge: float, edge_pct: float, max_size: float, total_cost: float
     ) -> float:
-        """估算套利机会的置信度 (0-1).
-
-        考虑因素：
-        - 利润率越高越可信
-        - 可执行深度越大越可信
-        - 总成本越接近 1.0 越不可信（可能是定价合理只是 spread 大）
-        """
+        """估算套利机会的置信度 (0-1)."""
         score = 0.0
 
         if edge_pct >= 5.0:
@@ -398,6 +374,33 @@ class ArbitrageDetector:
 
         return min(1.0, score)
 
+    def _is_monotonic_time_ladder(self, markets: list[MarketInfo]) -> bool:
+        if len(markets) < 2:
+            return False
+        if any(m.neg_risk for m in markets):
+            return False
+        if any(len(m.tokens) != 2 for m in markets):
+            return False
+
+        stems: set[str] = set()
+        for market in markets:
+            outcomes = {(token.outcome or "").strip().lower() for token in market.tokens}
+            if outcomes != {"yes", "no"}:
+                return False
+            stem = self._extract_deadline_stem(market.question)
+            if not stem:
+                return False
+            stems.add(stem)
+        return len(stems) == 1
+
+    def _extract_deadline_stem(self, question: str) -> str:
+        normalized = re.sub(r"\s+", " ", (question or "")).strip().rstrip("?").strip()
+        lowered = normalized.lower()
+        if " by " not in lowered:
+            return ""
+        stem = re.sub(r"\s+by\s+.+$", "", lowered).strip(" .!?")
+        return stem
+
 
 def format_arb_opportunity_zh(opp: ArbOpportunity) -> str:
     """将套利机会格式化为中文可读文本."""
@@ -416,8 +419,11 @@ def format_arb_opportunity_zh(opp: ArbOpportunity) -> str:
         "各腿详情:",
     ]
     for i, leg in enumerate(opp.legs, 1):
+        price_text = f"${leg.execution_price:.4f}"
+        if leg.side == OrderSide.SELL and leg.economic_cost is not None:
+            price_text += f" (econ=${leg.economic_cost:.4f})"
         lines.append(
-            f"  {i}. {leg.outcome} | {leg.side.value} @ ${leg.price:.4f} | "
+            f"  {i}. {leg.outcome} | {leg.side.value} @ {price_text} | "
             f"深度={leg.available_size:.1f}"
         )
     return "\n".join(lines)

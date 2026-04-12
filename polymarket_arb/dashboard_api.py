@@ -57,6 +57,10 @@ class DashboardState:
         self.ws_status: dict = {}
         self.ai_status: dict = {}
         self.ai_decisions: list[dict] = []
+        self.market_catalog: dict[str, dict] = {}
+        self.universe_status: dict = {}
+        self.research_signal_status: dict = {}
+        self.backtest_last_report: dict = {}
 
     def update(self, **kwargs: Any) -> None:
         with self._lock:
@@ -119,6 +123,9 @@ class DashboardState:
                 "book_summary": dict(self.book_summary) if self.book_summary else None,
                 "ws_status": dict(self.ws_status) if self.ws_status else None,
                 "ai_status": dict(self.ai_status) if self.ai_status else None,
+                "universe_status": dict(self.universe_status) if self.universe_status else None,
+                "research_signal_status": dict(self.research_signal_status) if self.research_signal_status else None,
+                "backtest_last_report": dict(self.backtest_last_report) if self.backtest_last_report else None,
                 "ts": time.time(),
             }
 
@@ -233,10 +240,30 @@ async def api_ws() -> JSONResponse:
 async def api_ai() -> JSONResponse:
     state = _get_state()
     with state._lock:
+        market_catalog = dict(state.market_catalog)
         return JSONResponse({
             "status": dict(state.ai_status) if state.ai_status else None,
-            "decisions": list(state.ai_decisions[-30:]),
+            "decisions": [
+                _enrich_ai_decision(decision, market_catalog)
+                for decision in state.ai_decisions[-30:]
+            ],
         })
+
+
+@app.get("/api/research-signals")
+async def api_research_signals() -> JSONResponse:
+    state = _get_state()
+    with state._lock:
+        data = dict(state.research_signal_status) if state.research_signal_status else {}
+    return JSONResponse(data)
+
+
+@app.get("/api/backtest-report")
+async def api_backtest_report() -> JSONResponse:
+    state = _get_state()
+    with state._lock:
+        data = dict(state.backtest_last_report) if state.backtest_last_report else {}
+    return JSONResponse(data)
 
 
 def _format_duration(seconds: float) -> str:
@@ -265,3 +292,87 @@ def start_dashboard_server(
     thread = threading.Thread(target=_run, daemon=True, name="dashboard")
     thread.start()
     return thread
+
+
+_AI_VALIDATION_MIN_AGE_SEC = 300.0
+_AI_VALIDATION_MOVE_THRESHOLD = 0.01
+
+
+def _enrich_ai_decision(decision: dict, market_catalog: dict[str, dict]) -> dict:
+    now = time.time()
+    enriched = dict(decision)
+    market_info = _lookup_market_info(str(decision.get("market_id", "")), market_catalog)
+    if market_info:
+        enriched.setdefault("market_question", market_info.get("question", ""))
+        enriched["current_price"] = market_info.get("yes_price")
+        enriched.setdefault("volume_24h", market_info.get("volume_24h"))
+        enriched.setdefault("liquidity", market_info.get("liquidity"))
+
+    entry_price = _safe_float(enriched.get("decision_price"))
+    current_price = _safe_float(enriched.get("current_price"))
+    timestamp = _safe_float(enriched.get("timestamp")) or now
+    age_sec = max(0.0, now - timestamp)
+    enriched["age_sec"] = round(age_sec, 1)
+
+    if entry_price is not None and current_price is not None:
+        price_delta = current_price - entry_price
+        enriched["price_delta"] = round(price_delta, 4)
+        enriched["price_delta_pct_pts"] = round(price_delta * 100.0, 2)
+    else:
+        price_delta = None
+
+    enriched["validation"] = _build_ai_validation(
+        action=str(enriched.get("action", "")),
+        age_sec=age_sec,
+        entry_price=entry_price,
+        current_price=current_price,
+        price_delta=price_delta,
+    )
+    return enriched
+
+
+def _build_ai_validation(
+    *,
+    action: str,
+    age_sec: float,
+    entry_price: float | None,
+    current_price: float | None,
+    price_delta: float | None,
+) -> dict[str, Any]:
+    if action not in {"BUY_YES", "BUY_NO", "SELL_YES", "SELL_NO"}:
+        return {"status": "not_applicable", "label": "不评估", "detail": "仅评估方向性决策"}
+    if entry_price is None or current_price is None or price_delta is None:
+        return {"status": "pending", "label": "待验证", "detail": "缺少价格数据"}
+    if age_sec < _AI_VALIDATION_MIN_AGE_SEC:
+        remaining = int(_AI_VALIDATION_MIN_AGE_SEC - age_sec)
+        return {"status": "pending", "label": "待验证", "detail": f"等待 {remaining}s"}
+    if abs(price_delta) < _AI_VALIDATION_MOVE_THRESHOLD:
+        return {"status": "neutral", "label": "未显著验证", "detail": f"变化 {price_delta * 100.0:+.2f}pp"}
+
+    expected_up = action in {"BUY_YES", "SELL_NO"}
+    is_correct = price_delta > 0 if expected_up else price_delta < 0
+    return {
+        "status": "correct" if is_correct else "wrong",
+        "label": "正确" if is_correct else "错误",
+        "detail": f"变化 {price_delta * 100.0:+.2f}pp",
+    }
+
+
+def _lookup_market_info(market_id: str, market_catalog: dict[str, dict]) -> dict[str, Any]:
+    if not market_id:
+        return {}
+    if market_id in market_catalog:
+        return dict(market_catalog[market_id])
+    for key, value in market_catalog.items():
+        if key.startswith(market_id) or market_id.startswith(key):
+            return dict(value)
+    return {}
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None

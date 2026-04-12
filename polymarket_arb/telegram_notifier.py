@@ -52,18 +52,19 @@ class TelegramNotifier:
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }
+        correlation_id = f"tg-{category}-{int(time.time() * 1000)}"
 
         try:
             resp = requests.post(url, json=payload, timeout=10)
             if resp.status_code == 200:
                 self._last_sent[category] = time.time()
                 return True
-            LOG.warning("Telegram 发送失败: HTTP %d - %s", resp.status_code, resp.text[:200])
+            LOG.warning("[cid=%s] Telegram 发送失败: HTTP %d - %s", correlation_id, resp.status_code, resp.text[:200])
             if "migrate_to_chat_id" in resp.text:
                 LOG.error("群组已升级为超级群，请更新 TELEGRAM_CHAT_ID")
             return False
-        except Exception as e:
-            LOG.error("Telegram 发送异常: %s", e)
+        except requests.RequestException as e:
+            LOG.error("[cid=%s] Telegram 发送异常: %s", correlation_id, e)
             return False
 
     def notify_arb_found(self, message: str) -> bool:

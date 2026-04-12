@@ -35,6 +35,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from polymarket_arb.confidence import confidence_from_signal_strength
 from polymarket_arb.fair_value_model import compute_general_fair_value
 
 LOG = logging.getLogger(__name__)
@@ -101,13 +102,21 @@ class MomentumSignal:
     def __init__(self, window: int = 20):
         self._window = window
         self._prices: dict[str, list[tuple[float, float]]] = {}  # token_id -> [(ts, mid_price)]
+        self._max_tracked_tokens = max(200, window * 20)
 
     def record(self, token_id: str, mid_price: float) -> None:
-        if token_id not in self._prices:
-            self._prices[token_id] = []
-        self._prices[token_id].append((time.time(), mid_price))
-        if len(self._prices[token_id]) > self._window * 2:
-            self._prices[token_id] = self._prices[token_id][-self._window:]
+        now = time.time()
+        history = self._prices.setdefault(token_id, [])
+        history.append((now, mid_price))
+        if len(history) > self._window * 2:
+            self._prices[token_id] = history[-self._window:]
+        if len(self._prices) > self._max_tracked_tokens:
+            oldest_token = min(
+                self._prices.items(),
+                key=lambda item: item[1][-1][0] if item[1] else float("inf"),
+            )[0]
+            if oldest_token != token_id:
+                self._prices.pop(oldest_token, None)
 
     def compute(self, token_id: str) -> float:
         """计算动量分数.
@@ -211,6 +220,10 @@ class StatisticalMispricingDetector:
         self._min_confidence = min_confidence
         self._momentum = MomentumSignal()
 
+    @staticmethod
+    def _normalize_signal_strength(value: float) -> float:
+        return min(1.0, abs(float(value)))
+
     def analyze(
         self,
         market_id: str,
@@ -243,8 +256,12 @@ class StatisticalMispricingDetector:
         deviation = model_prob - market_price
         deviation_pct = deviation / market_price if market_price > 0 else 0
 
-        signal_strength = (abs(obi) + abs(momentum) + abs(cross_dev)) / 3.0
-        confidence = min(1.0, signal_strength * 2.0)
+        signal_strength = (
+            self._normalize_signal_strength(obi)
+            + self._normalize_signal_strength(momentum)
+            + self._normalize_signal_strength(cross_dev)
+        ) / 3.0
+        confidence = confidence_from_signal_strength(signal_strength, scale=2.0)
 
         if abs(deviation) < self._min_deviation:
             return None

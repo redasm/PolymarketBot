@@ -12,3 +12,4 @@ custom_pricing_rules.json
 arb_state.json
 positions_snapshot.json
 *.log
+data/

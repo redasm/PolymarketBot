@@ -6,10 +6,16 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Optional
+from typing import Any
 
 from polymarket_arb.book_store import EnhancedBookStore
-from polymarket_arb.models import MarketContext, MarketInfo, RiskState
+from polymarket_arb.models import (
+    MarketContext,
+    MarketInfo,
+    ResearchSignal,
+    ResearchSignalReport,
+    RiskState,
+)
 from polymarket_arb.volatility_estimator import VolEstimator
 
 
@@ -28,11 +34,15 @@ class MarketContextBuilder:
         edge_signals: list[dict] | None = None,
         recent_trades: list[dict] | None = None,
         risk_state: RiskState | None = None,
+        research_report: ResearchSignalReport | dict | None = None,
+        research_signals: list[ResearchSignal] | list[dict] | None = None,
     ) -> MarketContext:
         """从各组件收集数据构建 MarketContext."""
         market_summaries = self._summarize_markets(active_markets or [])
         book_summary = book_store.get_summary() if book_store else {}
         vol_snap = vol_estimator.snapshot() if vol_estimator else {}
+        research_overview = self._summarize_research_report(research_report, research_signals or [])
+        research_summary = self._summarize_research_signals(research_signals or [])
 
         risk_dict: dict[str, Any] = {}
         if risk_state:
@@ -51,6 +61,8 @@ class MarketContextBuilder:
             edge_signals=(edge_signals or [])[-5:],
             recent_trades=(recent_trades or [])[-10:],
             risk_state=risk_dict,
+            research_overview=research_overview,
+            research_signals=research_summary,
         )
 
     def to_prompt_text(self, ctx: MarketContext) -> str:
@@ -96,6 +108,27 @@ class MarketContextBuilder:
                 f"daily_pnl=${r.get('daily_pnl', 0)}, halted={r.get('halted', False)}"
             )
 
+        if ctx.research_overview:
+            overview = ctx.research_overview
+            parts.append(
+                f"\n## Research Overview: signals={overview.get('signal_count', 0)}, "
+                f"topics={overview.get('topic_count', 0)}, rows={overview.get('row_count', 0)}, "
+                f"cache_hit={overview.get('cache_hit', False)}, "
+                f"avg_conf={overview.get('avg_confidence', 0)}, "
+                f"dominant={overview.get('dominant_stance', 'uncertain')}"
+            )
+            if overview.get("sources"):
+                parts.append(f"- source_mix={overview.get('sources')}")
+
+        if ctx.research_signals:
+            parts.append("\n## Research Signals")
+            for sig in ctx.research_signals[:5]:
+                parts.append(
+                    f"- topic={sig.get('topic_id')}, stance={sig.get('stance')}, "
+                    f"conf={sig.get('confidence')}, fresh={sig.get('freshness_sec')}s, "
+                    f"sources={sig.get('sources')}, summary={sig.get('summary', '')[:120]}"
+                )
+
         if ctx.recent_trades:
             parts.append(f"\n## Recent Trades: {len(ctx.recent_trades)} entries")
 
@@ -115,3 +148,72 @@ class MarketContextBuilder:
                 "neg_risk": m.neg_risk,
             })
         return result
+
+    def _summarize_research_signals(
+        self,
+        signals: list[ResearchSignal] | list[dict],
+    ) -> list[dict]:
+        result: list[dict] = []
+        for sig in signals[:5]:
+            row = sig.to_dict() if hasattr(sig, "to_dict") else dict(sig)
+            result.append({
+                "topic_id": row.get("topic_id", "")[:80],
+                "summary": (row.get("summary", "") or "")[:180],
+                "confidence": row.get("confidence", 0.0),
+                "freshness_sec": row.get("freshness_sec", 0.0),
+                "stance": row.get("stance", "uncertain"),
+                "sources": list(row.get("sources", []))[:3],
+                "event_candidates": list(row.get("event_candidates", []))[:3],
+            })
+        return result
+
+    def _summarize_research_report(
+        self,
+        report: ResearchSignalReport | dict | None,
+        signals: list[ResearchSignal] | list[dict],
+    ) -> dict:
+        if report is None:
+            rows = [sig.to_dict() if hasattr(sig, "to_dict") else dict(sig) for sig in signals[:5]]
+            if not rows:
+                return {}
+            confidences = [float(row.get("confidence", 0.0)) for row in rows]
+            stance_counts: dict[str, int] = {}
+            source_names: set[str] = set()
+            for row in rows:
+                stance = row.get("stance", "uncertain")
+                stance_counts[stance] = stance_counts.get(stance, 0) + 1
+                source_names.update(row.get("sources", []))
+            dominant = max(stance_counts, key=stance_counts.get) if stance_counts else "uncertain"
+            return {
+                "signal_count": len(rows),
+                "topic_count": len(rows),
+                "row_count": len(rows),
+                "cache_hit": False,
+                "avg_confidence": round(sum(confidences) / len(confidences), 3),
+                "dominant_stance": dominant,
+                "sources": sorted(source_names)[:5],
+            }
+
+        row = report.to_dict() if hasattr(report, "to_dict") else dict(report)
+        signals_rows = list(row.get("signals", []))
+        confidences = [float(sig.get("confidence", 0.0)) for sig in signals_rows] or [0.0]
+        stances: dict[str, int] = {}
+        for sig in signals_rows:
+            stance = sig.get("stance", "uncertain")
+            stances[stance] = stances.get(stance, 0) + 1
+        dominant = max(stances, key=stances.get) if stances else "uncertain"
+        sources = row.get("source_counts", {})
+        sorted_sources = [
+            f"{name}:{count}"
+            for name, count in sorted(sources.items(), key=lambda item: (-item[1], item[0]))
+        ]
+        return {
+            "signal_count": len(signals_rows),
+            "topic_count": int(row.get("topic_count", len(signals_rows))),
+            "row_count": int(row.get("row_count", len(signals_rows))),
+            "cache_hit": bool(row.get("cache_hit", False)),
+            "dropped_rows": int(row.get("dropped_rows", 0)),
+            "avg_confidence": round(sum(confidences) / max(1, len(confidences)), 3),
+            "dominant_stance": dominant,
+            "sources": sorted_sources[:5],
+        }

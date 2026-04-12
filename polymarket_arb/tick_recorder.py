@@ -141,6 +141,7 @@ class TickRecorder:
             self._ensure_file()
             if self._file is not None:
                 self._file.write(line_bytes)
+                self._file.flush()
                 self._bytes_written += len(line_bytes)
                 self._tick_count += 1
 

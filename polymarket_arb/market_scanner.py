@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any, Optional
 
 import requests
 
 from polymarket_arb.config import ArbConfig
-from polymarket_arb.models import EventInfo, MarketInfo, TokenInfo
+from polymarket_arb.models import EventInfo, MarketInfo, ResearchSignal, ResearchSignalReport, TokenInfo
+from research_signal.service import ResearchSignalService
 
 LOG = logging.getLogger(__name__)
 
 _SESSION: Optional[requests.Session] = None
+_MOJIBAKE_MARKERS = ("â", "Ã", "Â", "\x80", "\x82", "\x84", "\x85", "\x91", "\x92", "\x93", "\x94", "\x96", "\x97")
+
+
+class APIResponseValidationError(ValueError):
+    """远端 API 返回结构与预期不符."""
 
 
 def _get_session() -> requests.Session:
@@ -24,23 +31,44 @@ def _get_session() -> requests.Session:
     return _SESSION
 
 
+def _load_json_payload(resp: requests.Response, *, expected_type: type, endpoint: str) -> Any:
+    try:
+        payload = resp.json()
+    except ValueError as e:
+        raise APIResponseValidationError(f"{endpoint} 返回了无法解析的 JSON") from e
+    if not isinstance(payload, expected_type):
+        raise APIResponseValidationError(
+            f"{endpoint} 返回类型异常: expected={expected_type.__name__}, got={type(payload).__name__}"
+        )
+    return payload
+
+
+def _normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    fixed = text
+    if any(marker in fixed for marker in _MOJIBAKE_MARKERS):
+        try:
+            repaired = fixed.encode("latin-1").decode("utf-8")
+            if repaired:
+                fixed = repaired
+        except UnicodeError:
+            LOG.debug("文本修复失败，保留原始内容: value=%r", text[:120])
+
+    fixed = fixed.replace("\ufffd", "")
+    fixed = re.sub(r"\s+", " ", fixed).strip()
+    return fixed
+
+
 def _parse_market(raw: dict) -> Optional[MarketInfo]:
     """将 Gamma API 返回的单个 market JSON 转为 MarketInfo."""
     condition_id = raw.get("condition_id") or raw.get("conditionId") or ""
     if not condition_id:
         return None
-
-    tokens_raw = raw.get("tokens") or []
-    tokens: list[TokenInfo] = []
-    for t in tokens_raw:
-        token_id = t.get("token_id") or ""
-        outcome = t.get("outcome") or ""
-        price = float(t.get("price") or 0)
-        winner = t.get("winner")
-        if winner is not None:
-            winner = bool(winner)
-        if token_id:
-            tokens.append(TokenInfo(token_id=token_id, outcome=outcome, price=price, winner=winner))
 
     outcomes = raw.get("outcomes") or []
     if isinstance(outcomes, str):
@@ -59,25 +87,51 @@ def _parse_market(raw: dict) -> Optional[MarketInfo]:
             outcome_prices_raw = []
     outcome_prices = [float(p) for p in outcome_prices_raw if p is not None]
 
+    tokens_raw = raw.get("tokens") or []
+    tokens: list[TokenInfo] = []
+    for t in tokens_raw:
+        token_id = t.get("token_id") or t.get("tokenId") or t.get("clobTokenId") or ""
+        outcome = _normalize_text(t.get("outcome") or "")
+        price = float(t.get("price") or 0)
+        winner = t.get("winner")
+        if winner is not None:
+            winner = bool(winner)
+        if token_id:
+            tokens.append(TokenInfo(token_id=token_id, outcome=outcome, price=price, winner=winner))
+
+    if not tokens:
+        clob_token_ids = raw.get("clobTokenIds") or raw.get("clob_token_ids") or []
+        if isinstance(clob_token_ids, str):
+            try:
+                import json
+                clob_token_ids = json.loads(clob_token_ids)
+            except Exception:
+                clob_token_ids = [part.strip() for part in clob_token_ids.split(",") if part.strip()]
+        for idx, token_id in enumerate(clob_token_ids):
+            outcome = _normalize_text(outcomes[idx]) if idx < len(outcomes) else f"Outcome {idx + 1}"
+            price = outcome_prices[idx] if idx < len(outcome_prices) else 0.0
+            if token_id:
+                tokens.append(TokenInfo(token_id=str(token_id), outcome=str(outcome), price=float(price)))
+
     neg_risk = raw.get("neg_risk") or raw.get("negRisk") or False
     if isinstance(neg_risk, str):
         neg_risk = neg_risk.lower() in ("true", "1")
 
     return MarketInfo(
         condition_id=condition_id,
-        question=raw.get("question") or raw.get("title") or "",
-        slug=raw.get("market_slug") or raw.get("slug") or "",
+        question=_normalize_text(raw.get("question") or raw.get("title") or ""),
+        slug=_normalize_text(raw.get("market_slug") or raw.get("slug") or ""),
         tokens=tokens,
         active=bool(raw.get("active", True)),
         closed=bool(raw.get("closed", False)),
         volume_24h=float(raw.get("volume_num_24hr") or raw.get("volume24hr") or 0),
         liquidity=float(raw.get("liquidity") or 0),
         event_id=raw.get("event_id") or raw.get("eventId") or "",
-        event_slug=raw.get("event_slug") or "",
-        outcomes=outcomes,
+        event_slug=_normalize_text(raw.get("event_slug") or ""),
+        outcomes=[_normalize_text(outcome) for outcome in outcomes],
         outcome_prices=outcome_prices,
         neg_risk=bool(neg_risk),
-        end_date=raw.get("end_date_iso") or raw.get("endDate") or "",
+        end_date=_normalize_text(raw.get("end_date_iso") or raw.get("endDate") or ""),
         raw=raw,
     )
 
@@ -97,8 +151,8 @@ def _parse_event(raw: dict) -> Optional[EventInfo]:
 
     return EventInfo(
         event_id=event_id,
-        slug=raw.get("slug") or "",
-        title=raw.get("title") or "",
+        slug=_normalize_text(raw.get("slug") or ""),
+        title=_normalize_text(raw.get("title") or ""),
         markets=markets,
         active=bool(raw.get("active", True)),
         closed=bool(raw.get("closed", False)),
@@ -126,6 +180,7 @@ class MarketScanner:
         if limit <= 0:
             limit = self._config.market_fetch_limit
 
+        self._market_cache.clear()
         all_markets: list[MarketInfo] = []
         offset = 0
         session = _get_session()
@@ -139,12 +194,13 @@ class MarketScanner:
                 "order": "volume_24hr",
                 "ascending": "false",
             }
+            request_id = f"markets-{offset}-{int(time.time() * 1000)}"
             try:
                 resp = session.get(f"{self._gamma_host}/markets", params=params, timeout=15)
                 resp.raise_for_status()
-                rows = resp.json()
-            except Exception as e:
-                LOG.error("Gamma /markets 请求失败 (offset=%d): %s", offset, e)
+                rows = _load_json_payload(resp, expected_type=list, endpoint="Gamma /markets")
+            except (requests.RequestException, APIResponseValidationError) as e:
+                LOG.error("[cid=%s] Gamma /markets 请求失败 (offset=%d): %s", request_id, offset, e)
                 break
 
             if not rows:
@@ -172,6 +228,7 @@ class MarketScanner:
 
     def fetch_active_events(self, *, limit: int = 50) -> list[EventInfo]:
         """拉取活跃事件（含嵌套的 markets），用于多结果套利检测."""
+        self._event_cache.clear()
         all_events: list[EventInfo] = []
         offset = 0
         session = _get_session()
@@ -185,12 +242,13 @@ class MarketScanner:
                 "order": "volume_24hr",
                 "ascending": "false",
             }
+            request_id = f"events-{offset}-{int(time.time() * 1000)}"
             try:
                 resp = session.get(f"{self._gamma_host}/events", params=params, timeout=15)
                 resp.raise_for_status()
-                rows = resp.json()
-            except Exception as e:
-                LOG.error("Gamma /events 请求失败 (offset=%d): %s", offset, e)
+                rows = _load_json_payload(resp, expected_type=list, endpoint="Gamma /events")
+            except (requests.RequestException, APIResponseValidationError) as e:
+                LOG.error("[cid=%s] Gamma /events 请求失败 (offset=%d): %s", request_id, offset, e)
                 break
 
             if not rows:
@@ -217,3 +275,21 @@ class MarketScanner:
 
     def get_cached_event(self, event_id: str) -> Optional[EventInfo]:
         return self._event_cache.get(event_id)
+
+    def enrich_markets_with_research(
+        self,
+        markets: list[MarketInfo],
+        signal_service: ResearchSignalService | None,
+        *,
+        window_sec: int = 86400,
+        signals: list[ResearchSignal] | None = None,
+        report: ResearchSignalReport | None = None,
+    ) -> list[MarketInfo]:
+        """用研究信号对市场做只读 enrichment."""
+        if signal_service is None or not markets:
+            return markets
+        if report is not None:
+            signals = report.signals
+        if signals is None:
+            signals = signal_service.get_signals(markets, window_sec)
+        return signal_service.attach_to_markets(markets, signals)

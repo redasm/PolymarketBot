@@ -82,7 +82,10 @@ def compute_fair_updown(
 
     tau_norm = tau_sec / window_sec
     log_ratio = math.log(s_now / ref_px)
-    sigma_scaled = max(MIN_SIGMA, sigma_15m * math.sqrt(tau_norm))
+    # sigma_15m is calibrated on a fixed 15-minute horizon, so the square-root
+    # time scaling must always reference 900 seconds instead of the market's
+    # configurable total window length.
+    sigma_scaled = max(MIN_SIGMA, sigma_15m * math.sqrt(tau_sec / (15 * 60)))
     z_score = (log_ratio + drift * tau_norm) / sigma_scaled
 
     fair_up = _standard_normal_cdf(z_score)

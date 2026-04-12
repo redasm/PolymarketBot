@@ -150,6 +150,14 @@ class ArbLeg:
     price: float
     size: float
     available_size: float  # 该价位可用深度
+    execution_price: Optional[float] = None
+    economic_cost: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.execution_price is None:
+            self.execution_price = self.price
+        if self.economic_cost is None:
+            self.economic_cost = self.price
 
 
 @dataclass
@@ -169,6 +177,9 @@ class TradeRecord:
     timestamp: float = field(default_factory=time.time)
     fill_price: Optional[float] = None
     fill_size: Optional[float] = None
+    economic_cost: Optional[float] = None
+    rolled_back: bool = False
+    simulated: bool = False
 
 
 @dataclass
@@ -255,21 +266,176 @@ class MarketContext:
     recent_trades: list[dict] = field(default_factory=list)
     risk_state: dict = field(default_factory=dict)
     portfolio: dict = field(default_factory=dict)
+    research_overview: dict = field(default_factory=dict)
+    research_signals: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class ResearchSignal:
+    """标准化后的研究信号摘要."""
+
+    topic_id: str
+    event_candidates: list[str] = field(default_factory=list)
+    summary: str = ""
+    sources: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+    freshness_sec: float = 0.0
+    stance: str = "uncertain"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "topic_id": self.topic_id,
+            "event_candidates": list(self.event_candidates),
+            "summary": self.summary,
+            "sources": list(self.sources),
+            "confidence": round(self.confidence, 3),
+            "freshness_sec": round(self.freshness_sec, 1),
+            "stance": self.stance,
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass
+class ResearchSignalReport:
+    """一轮 research signal 聚合后的结构化报告."""
+
+    generated_at: float
+    window_sec: int
+    market_count: int
+    row_count: int
+    topic_count: int
+    source_counts: dict[str, int] = field(default_factory=dict)
+    signals: list[ResearchSignal] = field(default_factory=list)
+    cache_hit: bool = False
+    dropped_rows: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "generated_at": self.generated_at,
+            "window_sec": self.window_sec,
+            "market_count": self.market_count,
+            "row_count": self.row_count,
+            "topic_count": self.topic_count,
+            "source_counts": dict(self.source_counts),
+            "cache_hit": self.cache_hit,
+            "dropped_rows": self.dropped_rows,
+            "signals": [signal.to_dict() for signal in self.signals],
+        }
+
+
+@dataclass
+class MarketSnapshotRow:
+    """回测用市场快照行."""
+
+    ts_ms: int
+    condition_id: str
+    token_id: str
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
+    bid_size: float = 0.0
+    ask_size: float = 0.0
+
+
+@dataclass
+class OrderBookEventRow:
+    """回测用订单簿事件."""
+
+    ts_ms: int
+    condition_id: str
+    token_id: str
+    side: str
+    price: float
+    size: float
+    event_type: str = "update"
+
+
+@dataclass
+class TradeEventRow:
+    """回测用成交事件."""
+
+    ts_ms: int
+    condition_id: str
+    token_id: str
+    side: str
+    price: float
+    size: float
+
+
+@dataclass
+class EventMetadataRow:
+    """回测/研究共用的事件元数据."""
+
+    event_id: str
+    condition_id: str
+    title: str
+    slug: str = ""
+    market_slug: str = ""
+    outcomes: list[str] = field(default_factory=list)
+    end_date: str = ""
+
+
+@dataclass
+class SimulatedExecution:
+    """回测执行模型输出."""
+
+    filled: bool
+    filled_size: float
+    average_price: Optional[float]
+    fees_paid: float
+    slippage_bps: float
+    latency_ms: int
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BacktestReport:
+    """回测结果摘要."""
+
+    strategy_name: str
+    dataset_name: str
+    total_signals: int = 0
+    total_trades: int = 0
+    filled_trades: int = 0
+    gross_pnl: float = 0.0
+    net_pnl: float = 0.0
+    max_drawdown: float = 0.0
+    win_rate: float = 0.0
+    avg_slippage_bps: float = 0.0
+    notes: list[str] = field(default_factory=list)
+    generated_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "strategy_name": self.strategy_name,
+            "dataset_name": self.dataset_name,
+            "total_signals": self.total_signals,
+            "total_trades": self.total_trades,
+            "filled_trades": self.filled_trades,
+            "gross_pnl": round(self.gross_pnl, 4),
+            "net_pnl": round(self.net_pnl, 4),
+            "max_drawdown": round(self.max_drawdown, 4),
+            "win_rate": round(self.win_rate, 4),
+            "avg_slippage_bps": round(self.avg_slippage_bps, 2),
+            "notes": list(self.notes),
+            "generated_at": self.generated_at,
+        }
 
 
 @dataclass
 class FeeStructure:
     """Polymarket 手续费结构."""
 
-    taker_fee_rate: float = 0.02  # 2% taker fee on winning outcome
+    taker_fee_rate: float = 0.02
     maker_rebate: float = 0.0
 
     def estimate_fee(self, cost: float, num_legs: int) -> float:
-        """估算最坏情况的手续费（假设胜出方收 taker fee）。
+        """按总成交成本估算 taker fee.
 
-        对于套利：买入所有结果中只有一个会胜出，
-        所以 fee = taker_rate * payout_of_winning_leg。
-        由于套利策略中所有结果都买入相同数量的份额，
-        胜出方的 payout 固定为 $1.00/share。
+        这里采用更保守的模型：把套利中所有腿的成交成本都视为会产生 taker fee。
+        这样即使真实费率模型比它更宽松，也只会低估利润，不会高估利润。
+        `num_legs` 目前保留用于兼容调用方。
         """
-        return self.taker_fee_rate * 1.0  # 对单份额而言
+        if cost <= 0:
+            return 0.0
+        return self.taker_fee_rate * cost

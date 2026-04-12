@@ -110,6 +110,12 @@ polymarket_arb/
     ├── statistical_model.py           # T2 贝叶斯定价 + FairValueModel 现货锚定
     ├── maker_strategy.py              # T3 做市策略（VolEstimator 驱动 spread）
     └── strategy_orchestrator.py       # 策略编排器（优先级调度 + 资金分配）
+
+research/
+└── backtest/                          # 回测/离线研究骨架（runner、execution model、reports）
+
+research_signal/
+└── ...                                # 研究信号聚合骨架（collectors/normalizers/scorers/service）
 ```
 
 ## 核心设计决策
@@ -199,6 +205,9 @@ Dashboard 更新（volatility / edge / book_summary）+ Telegram 通知
 
 ```bash
 cd PolymarketBot
+
+cd /d E:\AppProject\PolymarketBot
+
 python -m venv .venv
 
 # Windows
@@ -227,14 +236,31 @@ cp .env.example .env
 | `ARB_MIN_EDGE_PCT` | 最小利润率门槛 | 0.3% |
 | `ARB_SCAN_INTERVAL_SEC` | 定时扫描间隔 | 5s |
 | `ARB_MAX_ORDER_SIZE_USDC` | 单笔最大下单量 | 50 USDC |
+| `ORDERBOOK_SNAPSHOT_TTL_SEC` | REST 订单簿快照缓存 TTL | 0.5s |
+| `POLYMARKET_TAKER_FEE_RATE` | Polymarket taker 费率假设 | 2.0% |
+| `KALSHI_TAKER_FEE_RATE` | Kalshi taker 费率假设 | 0.3% |
 | `RISK_MAX_TOTAL_EXPOSURE` | 全局最大敞口 | 500 USDC |
 | `RISK_MAX_DAILY_LOSS` | 日亏损止损线 | 50 USDC |
 | `VOL_FAST_MINUTES` | 快速波动率窗口 | 60 分钟 |
 | `VOL_SLOW_MINUTES` | 慢速波动率窗口 | 360 分钟 |
 | `EDGE_MIN_BPS` | Edge 引擎最小触发阈值 | 100 bps |
 | `EDGE_MAX_SPREAD_BPS` | 最大可接受 spread | 500 bps |
+| `AI_AUTO_RECOVER_SEC` | AI 降级后自动恢复等待时间 | 1800s |
+| `RESEARCH_SIGNAL_ENABLED` | 启用研究信号摘要 | false |
+| `BACKTEST_ENABLED` | 启用回测状态展示 | false |
 
 完整配置见 `.env.example`。
+
+几个新增参数建议保持保守默认值：
+
+- `ORDERBOOK_SNAPSHOT_TTL_SEC`
+  建议保持在 `0.2-0.8s`。太小会重新回到高频 REST 压力，太大会让扫描看到的盘口变旧。
+- `POLYMARKET_TAKER_FEE_RATE`
+  当前实现按更保守的“成本侧计费”估算，目的是避免高估套利利润。除非你已经核实最新官方费率模型，否则不建议往下调。
+- `KALSHI_TAKER_FEE_RATE`
+  默认 `0.3%` 是偏保守的中位数假设。做跨平台利润回测时建议把它和真实账户成交单据对齐。
+- `AI_AUTO_RECOVER_SEC`
+  默认 30 分钟，避免 AI 因短期连续亏损被永久锁死；如果你希望 AI 更谨慎，可以调到 `3600-7200`。
 
 ## 运行
 
@@ -242,11 +268,105 @@ cp .env.example .env
 # Dry Run 模式（默认，只扫描不交易）
 python run_arb_bot.py
 
+# 独立运行 research signal 调试，不要求钱包参数
+python run_research.py --limit 20 --show-markets
+python run_research.py --query btc --json
+
 # 或作为模块运行
 python -m polymarket_arb.main_loop
+
+# 运行最小回测 runner
+python -m research.backtest.run --dataset default
+
+# 刷新研究信号摘要
+python -m research_signal.refresh --limit 10
 ```
 
 **强烈建议**先用 `ARB_DRY_RUN=true` 观察一段时间，确认策略逻辑和信号质量符合预期后再切换为实盘。
+
+`run_research.py` 适合单独验证研究层：
+
+- 拉取活跃市场并按 `--query` 过滤
+- 输出 research signal 聚合报告、来源分布、cache hit 状态
+- 用 `--json` 导出结构化结果，方便后续接 AI context 或离线分析
+
+Research layer 也支持两种可选扩展源：
+
+- 额外 RSS feeds：设置 `RESEARCH_SIGNAL_EXTRA_RSS_FEEDS`，格式如 `custom=https://example.com/rss?q={query}`
+- 本地知识库：设置 `RESEARCH_SIGNAL_KNOWLEDGE_ENABLED=true`，并把 `*.jsonl` 放到 `RESEARCH_SIGNAL_KNOWLEDGE_DIR`
+
+本地知识库 JSONL 每行可包含这些字段：
+
+```json
+{
+  "topic": "BTC ETF approval odds",
+  "summary": "ETF approval usually boosts BTC sentiment",
+  "tags": ["btc", "etf", "approval"],
+  "event_id": "1234",
+  "condition_id": "0xabc",
+  "source": "local_knowledge_base",
+  "link": "https://example.com/note",
+  "published_ts": 1710000000
+}
+```
+
+仓库里也放了一个最小示例文件：
+
+- [example_signals.jsonl](e:/AppProject/PolymarketBot/data/research_signal/knowledge/example_signals.jsonl)
+
+把 `RESEARCH_SIGNAL_KNOWLEDGE_ENABLED=true` 打开后，`run_research.py` 和主循环都会自动读取它。
+
+## Dry-Run 验证清单
+
+建议第一次接通 research 扩展源时，按下面顺序验证：
+
+1. 准备 `.env`
+   设置 `ARB_DRY_RUN=true`
+   设置 `RESEARCH_SIGNAL_ENABLED=true`
+   设置 `RESEARCH_SIGNAL_KNOWLEDGE_ENABLED=true`
+   设置 `RESEARCH_SIGNAL_KNOWLEDGE_DIR=data/research_signal/knowledge`
+
+2. 单独验证 research 层
+
+```bash
+python run_research.py --query btc --show-markets
+python run_research.py --query btc --json
+```
+
+预期检查点：
+
+- 输出里能看到 `source_counts`
+- `signals` 里出现 `local_knowledge_base`
+- `cache_hit` 在第二次运行时变为 `true`
+
+3. 启动 dry-run 主循环
+
+```bash
+python run_arb_bot.py
+```
+
+预期检查点：
+
+- Dashboard 的 `Research Signals` 卡片里能看到信号数量和摘要
+- `strategy_status.meta.research_overlay` 会开始累计 `applied / boosted / penalized / vetoed`
+- `AI decisions` 里会附带 `research_overlay`
+
+4. 如需验证离线回放
+
+```bash
+python -m research.backtest.run --dataset default
+```
+
+预期检查点：
+
+- 不要求钱包私钥也能运行
+- 生成 report、trade log 和 recommended params
+
+5. 最后再考虑切到 live
+
+- 先确认 `research` 没有系统性反向误导
+- 先确认 `strategy overlay` 更多是在降噪，而不是频繁 veto 全部信号
+- 先确认 AI 成本、风控和 dashboard 状态都稳定
 
 ## 测试
 

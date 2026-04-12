@@ -13,18 +13,17 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
 
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.models import (
     ArbOpportunity,
-    PositionSnapshot,
     RiskState,
     TradeRecord,
     TradeStatus,
 )
 
 LOG = logging.getLogger(__name__)
+_PENDING_RESERVATION_TTL_SEC = 30.0
 
 
 class RiskManager:
@@ -35,12 +34,14 @@ class RiskManager:
         self._state = RiskState()
         self._market_exposure: dict[str, float] = {}  # condition_id -> 敞口
         self._recent_arb_markets: dict[str, float] = {}  # event_id -> 最后执行时间
+        self._pending_reservations: dict[str, tuple[str, float, float]] = {}
         self._daily_reset_ts: float = _start_of_day()
         self._effective_max_total_exposure = config.max_total_exposure
         self._effective_max_daily_loss = config.max_daily_loss
 
     @property
     def state(self) -> RiskState:
+        self._reconcile_pending_reservations()
         return self._state
 
     def pre_trade_check(self, opp: ArbOpportunity, proposed_size: float) -> tuple[bool, str, float]:
@@ -50,6 +51,7 @@ class RiskManager:
             (允许交易, 原因, 调整后的数量)
         """
         self._maybe_reset_daily()
+        self._reconcile_pending_reservations()
 
         can, reason = self._state.check_can_trade(
             max_positions=self._config.max_open_positions,
@@ -63,8 +65,8 @@ class RiskManager:
         event_id = opp.event_id
         if event_id in self._recent_arb_markets:
             last_ts = self._recent_arb_markets[event_id]
-            if time.time() - last_ts < 60:
-                return False, f"事件 {event_id} 60秒内已执行过套利", 0.0
+            if time.time() - last_ts < self._config.risk_event_cooldown_sec:
+                return False, f"事件 {event_id} {self._format_cooldown_label()}内已执行过套利", 0.0
 
         for market in opp.markets:
             cid = market.condition_id
@@ -76,16 +78,30 @@ class RiskManager:
         if remaining_total <= 0:
             return False, "全局敞口已满", 0.0
 
-        per_market_remaining = self._config.max_exposure_per_market
+        per_market_size_limit = float("inf")
+        exposure_per_share_by_market: dict[str, float] = {}
+        for leg in opp.legs:
+            leg_exposure = leg.economic_cost if leg.economic_cost is not None else leg.price
+            if leg_exposure <= 0:
+                continue
+            exposure_per_share_by_market[leg.condition_id] = (
+                exposure_per_share_by_market.get(leg.condition_id, 0.0) + leg_exposure
+            )
+
         for market in opp.markets:
             cid = market.condition_id
             used = self._market_exposure.get(cid, 0.0)
-            per_market_remaining = min(per_market_remaining, self._config.max_exposure_per_market - used)
+            remaining = self._config.max_exposure_per_market - used
+            if remaining <= 0:
+                return False, f"市场 {cid[:12]} 敞口已达上限", 0.0
+            per_share_market_exposure = exposure_per_share_by_market.get(cid, 0.0)
+            if per_share_market_exposure > 0:
+                per_market_size_limit = min(per_market_size_limit, remaining / per_share_market_exposure)
 
         max_affordable_size = min(
             proposed_size,
             remaining_total / opp.total_cost if opp.total_cost > 0 else 0,
-            per_market_remaining / opp.total_cost if opp.total_cost > 0 else 0,
+            per_market_size_limit,
             opp.max_executable_size,
         )
 
@@ -97,28 +113,63 @@ class RiskManager:
     def record_execution(self, opp: ArbOpportunity, trades: list[TradeRecord]) -> None:
         """记录交易执行结果，更新风险状态."""
         filled_trades = [t for t in trades if t.status == TradeStatus.FILLED]
-        failed_trades = [t for t in trades if t.status == TradeStatus.FAILED]
+        partially_filled_trades = [t for t in trades if t.status == TradeStatus.PARTIAL]
+        pending_trades = [t for t in trades if t.status == TradeStatus.PENDING]
+        actual_exposure_trades = filled_trades + partially_filled_trades
+        failed_trades = [t for t in trades if t.status in (TradeStatus.FAILED, TradeStatus.CANCELLED)]
+        execution_success = (
+            len(trades) == len(opp.legs)
+            and len(filled_trades) == len(opp.legs)
+            and not failed_trades
+        )
+        event_should_cooldown = bool(actual_exposure_trades or pending_trades)
 
-        if failed_trades:
+        if execution_success:
+            self._state.consecutive_failures = 0
+        elif trades:
             self._state.consecutive_failures += 1
             if self._state.consecutive_failures >= self._config.max_consecutive_failures > 0:
                 self._state.is_halted = True
                 self._state.halt_reason = f"连续失败 {self._state.consecutive_failures} 次"
                 LOG.error("风控熔断: %s", self._state.halt_reason)
-        elif filled_trades:
-            self._state.consecutive_failures = 0
 
-        total_cost = sum(t.price * t.size for t in filled_trades)
-        self._state.total_exposure += total_cost
+        actual_cost = sum(
+            (t.economic_cost if t.economic_cost is not None else t.price)
+            * (t.fill_size if t.fill_size is not None else t.size)
+            for t in actual_exposure_trades
+        )
+        pending_cost = sum(
+            (t.economic_cost if t.economic_cost is not None else t.price) * t.size
+            for t in pending_trades
+        )
+        self._state.total_exposure += actual_cost + pending_cost
 
-        for t in filled_trades:
+        for t in actual_exposure_trades:
             cid = t.condition_id
-            self._market_exposure[cid] = self._market_exposure.get(cid, 0.0) + t.price * t.size
+            leg_cost = t.economic_cost if t.economic_cost is not None else t.price
+            exposure_size = t.fill_size if t.fill_size is not None else t.size
+            exposure = leg_cost * exposure_size
+            self._market_exposure[cid] = self._market_exposure.get(cid, 0.0) + exposure
 
-        if filled_trades:
-            self._state.open_positions += 1
+        for t in pending_trades:
+            cid = t.condition_id
+            leg_cost = t.economic_cost if t.economic_cost is not None else t.price
+            exposure = leg_cost * t.size
+            self._market_exposure[cid] = self._market_exposure.get(cid, 0.0) + exposure
+            reservation_key = t.order_id or t.trade_id
+            self._pending_reservations[reservation_key] = (
+                cid,
+                exposure,
+                time.time(),
+            )
+
+        self._state.open_positions = sum(1 for exposure in self._market_exposure.values() if exposure > 0)
+
+        if event_should_cooldown:
             self._recent_arb_markets[opp.event_id] = time.time()
-            expected_profit = opp.net_edge * filled_trades[0].size if filled_trades else 0
+
+        if execution_success and filled_trades:
+            expected_profit = opp.net_edge * min(t.size for t in filled_trades)
             self._state.daily_pnl += expected_profit
 
         LOG.info(
@@ -134,7 +185,12 @@ class RiskManager:
         self._state.daily_pnl += pnl
         exposure = self._market_exposure.pop(condition_id, 0.0)
         self._state.total_exposure = max(0, self._state.total_exposure - exposure)
-        self._state.open_positions = max(0, self._state.open_positions - 1)
+        self._pending_reservations = {
+            key: value
+            for key, value in self._pending_reservations.items()
+            if value[0] != condition_id
+        }
+        self._state.open_positions = sum(1 for exp in self._market_exposure.values() if exp > 0)
 
     def apply_ai_adjustment(self, adjustments: dict) -> None:
         """应用 AI 建议的风控参数调整（受硬上限约束）.
@@ -170,6 +226,12 @@ class RiskManager:
         self._state.consecutive_failures = 0
         LOG.info("风控熔断已手动解除")
 
+    def _format_cooldown_label(self) -> str:
+        seconds = self._config.risk_event_cooldown_sec
+        if abs(seconds - round(seconds)) < 1e-9:
+            return f"{int(round(seconds))}秒"
+        return f"{seconds:.1f}秒"
+
     def _maybe_reset_daily(self) -> None:
         """检查是否需要重置日盈亏."""
         today = _start_of_day()
@@ -177,6 +239,25 @@ class RiskManager:
             LOG.info("日切: 重置日盈亏 $%.2f -> $0.00", self._state.daily_pnl)
             self._state.daily_pnl = 0.0
             self._daily_reset_ts = today
+
+    def _reconcile_pending_reservations(self) -> None:
+        now = time.time()
+        expired_keys = [
+            key for key, (_, _, created_ts) in self._pending_reservations.items()
+            if now - created_ts >= _PENDING_RESERVATION_TTL_SEC
+        ]
+        for key in expired_keys:
+            condition_id, exposure, _ = self._pending_reservations.pop(key)
+            current = self._market_exposure.get(condition_id, 0.0)
+            remaining = max(0.0, current - exposure)
+            if remaining > 0:
+                self._market_exposure[condition_id] = remaining
+            else:
+                self._market_exposure.pop(condition_id, None)
+            self._state.total_exposure = max(0.0, self._state.total_exposure - exposure)
+            LOG.info("释放过期预留敞口: key=%s, market=%s, exposure=$%.4f", key[:16], condition_id[:12], exposure)
+
+        self._state.open_positions = sum(1 for exp in self._market_exposure.values() if exp > 0)
 
     def format_status_zh(self) -> str:
         """格式化风控状态为中文文本."""

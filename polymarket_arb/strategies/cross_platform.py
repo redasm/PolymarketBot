@@ -34,13 +34,21 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import requests
+
+from polymarket_arb.confidence import confidence_from_edge_pct
 
 LOG = logging.getLogger(__name__)
 
 KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+DEFAULT_POLY_FEE_RATE = 0.02
+DEFAULT_KALSHI_FEE_RATE = 0.003
+
+
+class KalshiResponseValidationError(ValueError):
+    """Kalshi API 返回结构异常."""
 
 
 @dataclass
@@ -86,33 +94,55 @@ class KalshiClient:
         self._session = requests.Session()
         self._session.headers.update({"Accept": "application/json"})
 
+    def _load_json(self, resp: requests.Response, *, expected_type: type, endpoint: str) -> Any:
+        try:
+            payload = resp.json()
+        except ValueError as e:
+            raise KalshiResponseValidationError(f"{endpoint} 返回了无法解析的 JSON") from e
+        if not isinstance(payload, expected_type):
+            raise KalshiResponseValidationError(
+                f"{endpoint} 返回类型异常: expected={expected_type.__name__}, got={type(payload).__name__}"
+            )
+        return payload
+
     def get_market(self, ticker: str) -> Optional[dict]:
         """获取单个市场的当前价格."""
+        request_id = f"kalshi-market-{ticker}-{int(time.time() * 1000)}"
         try:
             resp = self._session.get(f"{self._base}/markets/{ticker}", timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                return data.get("market") or data
-            LOG.warning("Kalshi get_market %s: HTTP %d", ticker, resp.status_code)
+            resp.raise_for_status()
+            data = self._load_json(resp, expected_type=dict, endpoint="Kalshi /markets/{ticker}")
+            market = data.get("market") or data
+            if not isinstance(market, dict):
+                raise KalshiResponseValidationError("Kalshi /markets/{ticker} 缺少 market 对象")
+            return market
+        except requests.RequestException as e:
+            LOG.warning("[cid=%s] Kalshi get_market %s 请求失败: %s", request_id, ticker, e)
             return None
-        except Exception as e:
-            LOG.error("Kalshi API 错误: %s", e)
+        except KalshiResponseValidationError as e:
+            LOG.error("[cid=%s] Kalshi get_market %s 响应校验失败: %s", request_id, ticker, e)
             return None
 
     def get_event_markets(self, event_ticker: str) -> list[dict]:
         """获取一个事件下的所有市场."""
+        request_id = f"kalshi-event-{event_ticker}-{int(time.time() * 1000)}"
         try:
             resp = self._session.get(
                 f"{self._base}/events/{event_ticker}/markets",
                 params={"limit": 50},
                 timeout=10,
             )
-            if resp.status_code == 200:
-                data = resp.json()
-                return data.get("markets") or []
+            resp.raise_for_status()
+            data = self._load_json(resp, expected_type=dict, endpoint="Kalshi /events/{event}/markets")
+            markets = data.get("markets") or []
+            if not isinstance(markets, list):
+                raise KalshiResponseValidationError("Kalshi /events/{event}/markets 缺少 markets 列表")
+            return [item for item in markets if isinstance(item, dict)]
+        except requests.RequestException as e:
+            LOG.error("[cid=%s] Kalshi events API 请求错误: %s", request_id, e)
             return []
-        except Exception as e:
-            LOG.error("Kalshi events API 错误: %s", e)
+        except KalshiResponseValidationError as e:
+            LOG.error("[cid=%s] Kalshi events API 响应校验失败: %s", request_id, e)
             return []
 
     def extract_prices(self, market: dict) -> tuple[float, float]:
@@ -199,8 +229,8 @@ class CrossPlatformScanner:
 
         任一方向 cost < 1.0 (扣费后) → 套利
         """
-        poly_fee_rate = 0.02
-        kalshi_fee_rate = 0.0
+        poly_fee_rate = DEFAULT_POLY_FEE_RATE
+        kalshi_fee_rate = DEFAULT_KALSHI_FEE_RATE
 
         cost_a = pair.poly_yes_price + pair.kalshi_no_price
         cost_b = (1.0 - pair.poly_no_price) + pair.kalshi_yes_price
@@ -209,8 +239,10 @@ class CrossPlatformScanner:
             if cost <= 0 or cost >= 1.0:
                 continue
 
+            poly_cost = pair.poly_yes_price if "poly_yes" in direction else (1.0 - pair.poly_no_price)
+            kalshi_cost = pair.kalshi_no_price if "kalshi_no" in direction else pair.kalshi_yes_price
             gross = 1.0 - cost
-            fee = poly_fee_rate + kalshi_fee_rate
+            fee = (poly_fee_rate * poly_cost) + (kalshi_fee_rate * kalshi_cost)
             net = gross - fee
 
             if net <= 0.005:
@@ -221,13 +253,13 @@ class CrossPlatformScanner:
             opp = CrossPlatformOpportunity(
                 pair=pair,
                 direction=direction,
-                poly_cost=pair.poly_yes_price if "poly_yes" in direction else (1.0 - pair.poly_no_price),
-                kalshi_cost=pair.kalshi_no_price if "kalshi_no" in direction else pair.kalshi_yes_price,
+                poly_cost=poly_cost,
+                kalshi_cost=kalshi_cost,
                 total_cost=cost,
                 gross_edge=gross,
                 net_edge=net,
                 edge_pct=edge_pct,
-                confidence=min(1.0, edge_pct / 10.0),
+                confidence=confidence_from_edge_pct(edge_pct, full_confidence_pct=10.0),
             )
             LOG.info(
                 "跨平台机会: %s | %s | poly=%.2f kalshi=%.2f | edge=%.2f%%",

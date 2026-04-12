@@ -9,7 +9,8 @@ def now_ms() -> int:
 
 def floor_ts(ts_ms: int, interval_ms: int) -> int:
     """将时间戳向下对齐到最近的 interval 边界."""
-    assert interval_ms > 0, "interval_ms must be positive"
+    if interval_ms <= 0:
+        raise ValueError("interval_ms must be positive")
     return (ts_ms // interval_ms) * interval_ms
 
 

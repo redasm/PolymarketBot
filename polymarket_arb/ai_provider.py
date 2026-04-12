@@ -8,6 +8,7 @@ DeepSeek / Gemini / Together 等 OpenAI 兼容 API 直接复用 OpenAIProvider�
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -43,6 +44,19 @@ _PRICING: dict[str, tuple[float, float]] = {
     "gemini-2.0-flash": (0.1, 0.4),
     "claude-sonnet-4-20250514": (3.0, 15.0),
 }
+_DEFAULT_MAX_OUTPUT_TOKENS = 4096
+
+
+class LLMProviderError(RuntimeError):
+    """LLM provider 基础异常."""
+
+
+class LLMConfigurationError(LLMProviderError, ValueError):
+    """配置错误：缺失 API key 或 provider 配置非法."""
+
+
+class LLMRequestError(LLMProviderError):
+    """请求阶段错误：网络异常、HTTP 错误、响应格式异常."""
 
 
 @dataclass
@@ -115,26 +129,104 @@ class OpenAIProvider(LLMProvider):
         resp = await self._client.chat.completions.create(**kwargs)
         latency = (time.monotonic() - start) * 1000
 
+        return _parse_openai_compatible_response(resp, model=self._model, latency_ms=round(latency, 1))
+
+
+def _parse_openai_compatible_response(resp: Any, *, model: str, latency_ms: float) -> LLMResponse:
+    if isinstance(resp, str):
+        try:
+            payload = json.loads(resp)
+        except json.JSONDecodeError as e:
+            raise LLMRequestError(
+                f"OpenAI 兼容响应格式异常: 返回了字符串而非 completion 对象, preview={resp[:200]!r}"
+            ) from e
+        return _parse_openai_compatible_dict(payload, fallback_model=model, latency_ms=latency_ms)
+
+    if isinstance(resp, dict):
+        return _parse_openai_compatible_dict(resp, fallback_model=model, latency_ms=latency_ms)
+
+    if hasattr(resp, "choices"):
         msg = resp.choices[0].message
-        content = msg.content or ""
+        content = _coerce_openai_message_content(getattr(msg, "content", ""))
         tool_calls_parsed: list[dict] = []
-        if msg.tool_calls:
+        if getattr(msg, "tool_calls", None):
             for tc in msg.tool_calls:
                 try:
                     args = json.loads(tc.function.arguments)
-                except (json.JSONDecodeError, AttributeError):
+                except (json.JSONDecodeError, AttributeError, TypeError):
                     args = {}
                 tool_calls_parsed.append({"name": tc.function.name, "arguments": args})
 
-        usage = resp.usage
+        usage = getattr(resp, "usage", None)
         return LLMResponse(
             content=content,
-            input_tokens=usage.prompt_tokens if usage else 0,
-            output_tokens=usage.completion_tokens if usage else 0,
-            model=resp.model or self._model,
-            latency_ms=round(latency, 1),
+            input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
+            output_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+            model=getattr(resp, "model", None) or model,
+            latency_ms=latency_ms,
             tool_calls=tool_calls_parsed,
         )
+
+    raise LLMRequestError(
+        f"OpenAI 兼容响应格式异常: type={type(resp).__name__}, missing choices field"
+    )
+
+
+def _parse_openai_compatible_dict(payload: dict[str, Any], *, fallback_model: str, latency_ms: float) -> LLMResponse:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise LLMRequestError("OpenAI 兼容响应缺少 choices 列表")
+
+    message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+    if not isinstance(message, dict):
+        raise LLMRequestError("OpenAI 兼容响应中的 message 字段格式异常")
+
+    tool_calls_parsed: list[dict] = []
+    for tc in message.get("tool_calls", []) or []:
+        if not isinstance(tc, dict):
+            continue
+        function = tc.get("function", {})
+        if not isinstance(function, dict):
+            function = {}
+        raw_args = function.get("arguments", {})
+        if isinstance(raw_args, str):
+            try:
+                parsed_args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                parsed_args = {}
+        elif isinstance(raw_args, dict):
+            parsed_args = raw_args
+        else:
+            parsed_args = {}
+        tool_calls_parsed.append({"name": function.get("name", ""), "arguments": parsed_args})
+
+    usage = payload.get("usage", {})
+    if not isinstance(usage, dict):
+        usage = {}
+
+    return LLMResponse(
+        content=_coerce_openai_message_content(message.get("content", "")),
+        input_tokens=int(usage.get("prompt_tokens", 0) or 0),
+        output_tokens=int(usage.get("completion_tokens", 0) or 0),
+        model=str(payload.get("model") or fallback_model),
+        latency_ms=latency_ms,
+        tool_calls=tool_calls_parsed,
+    )
+
+
+def _coerce_openai_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text" and isinstance(item.get("text"), str):
+                    text_parts.append(item["text"])
+            elif isinstance(item, str):
+                text_parts.append(item)
+        return "\n".join(part for part in text_parts if part)
+    return str(content or "")
 
 
 class AnthropicProvider(LLMProvider):
@@ -156,22 +248,28 @@ class AnthropicProvider(LLMProvider):
         json_mode: bool = False,
         tools: list[dict] | None = None,
     ) -> LLMResponse:
-        system_msg = ""
+        system_parts: list[str] = []
         chat_messages: list[dict] = []
         for m in messages:
             if m["role"] == "system":
-                system_msg = m["content"]
+                sanitized = _sanitize_system_prompt(m.get("content", ""))
+                if sanitized:
+                    system_parts.append(sanitized)
             else:
                 chat_messages.append(m)
 
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": chat_messages,
-            "max_tokens": 2048,
+            "max_tokens": _DEFAULT_MAX_OUTPUT_TOKENS,
             "temperature": temperature,
         }
-        if system_msg:
-            kwargs["system"] = system_msg
+        if system_parts:
+            kwargs["system"] = "\n\n".join(system_parts)
+        if json_mode:
+            json_instruction = "Return valid JSON only. Do not include markdown fences or commentary."
+            system_parts.append(json_instruction)
+            kwargs["system"] = "\n\n".join(system_parts)
 
         anthropic_tools: list[dict] | None = None
         if tools:
@@ -213,9 +311,11 @@ class AnthropicProvider(LLMProvider):
 class OllamaProvider(LLMProvider):
     """本地 Ollama 部署的开源模型."""
 
-    def __init__(self, api_base: str, model: str) -> None:
+    def __init__(self, api_base: str, model: str, *, max_retries: int = 2, retry_delay_sec: float = 0.25) -> None:
         self._model = model
         self._base = api_base.rstrip("/")
+        self._max_retries = max(0, int(max_retries))
+        self._retry_delay_sec = max(0.0, float(retry_delay_sec))
         try:
             import httpx
             self._httpx = httpx
@@ -240,12 +340,68 @@ class OllamaProvider(LLMProvider):
             payload["format"] = "json"
 
         start = time.monotonic()
-        async with self._httpx.AsyncClient(timeout=120) as client:
-            resp = await client.post(f"{self._base}/api/chat", json=payload)
-            resp.raise_for_status()
-        latency = (time.monotonic() - start) * 1000
+        request_error_cls = getattr(self._httpx, "RequestError", ())
+        http_status_error_cls = getattr(self._httpx, "HTTPStatusError", ())
+        data: dict[str, Any] | None = None
+        correlation_id = f"ollama-{int(time.time() * 1000)}"
+        for attempt in range(self._max_retries + 1):
+            try:
+                async with self._httpx.AsyncClient(timeout=120) as client:
+                    resp = await client.post(f"{self._base}/api/chat", json=payload)
+                    resp.raise_for_status()
+                data = resp.json()
+                break
+            except Exception as e:
+                should_retry = False
+                if request_error_cls and isinstance(e, request_error_cls):
+                    should_retry = attempt < self._max_retries
+                    if should_retry:
+                        LOG.warning(
+                            "[cid=%s] Ollama 请求失败，准备重试 (%d/%d): %s",
+                            correlation_id,
+                            attempt + 1,
+                            self._max_retries + 1,
+                            e,
+                        )
+                        await asyncio.sleep(self._retry_delay_sec)
+                        continue
+                    raise LLMRequestError(
+                        f"Ollama 请求失败: base={self._base}, model={self._model}, error={e}"
+                    ) from e
+                if http_status_error_cls and isinstance(e, http_status_error_cls):
+                    response = getattr(e, "response", None)
+                    status_code = getattr(response, "status_code", "unknown")
+                    if isinstance(status_code, int) and status_code >= 500 and attempt < self._max_retries:
+                        LOG.warning(
+                            "[cid=%s] Ollama HTTP %s，准备重试 (%d/%d)",
+                            correlation_id,
+                            status_code,
+                            attempt + 1,
+                            self._max_retries + 1,
+                        )
+                        await asyncio.sleep(self._retry_delay_sec)
+                        continue
+                    detail = ""
+                    if response is not None:
+                        try:
+                            body_preview = response.text.strip()
+                        except Exception:
+                            body_preview = ""
+                        if body_preview:
+                            detail = f", body={body_preview[:200]!r}"
+                    raise LLMRequestError(
+                        f"Ollama HTTP 请求失败: status={status_code}, base={self._base}, model={self._model}{detail}"
+                    ) from e
+                if isinstance(e, ValueError):
+                    raise LLMRequestError(
+                        f"Ollama 返回了无法解析的响应: base={self._base}, model={self._model}"
+                    ) from e
+                raise
 
-        data = resp.json()
+        if data is None:
+            raise LLMRequestError(f"Ollama 请求失败: base={self._base}, model={self._model}, error=unknown")
+
+        latency = (time.monotonic() - start) * 1000
         content = data.get("message", {}).get("content", "")
         input_tokens = data.get("prompt_eval_count", 0)
         output_tokens = data.get("eval_count", 0)
@@ -262,6 +418,33 @@ class OllamaProvider(LLMProvider):
         return 0.0
 
 
+def _require_api_key(provider_name: str) -> str:
+    if provider_name in ("openai", "deepseek", "gemini"):
+        return "AI_API_KEY 或 OPENAI_API_KEY"
+    return "AI_API_KEY"
+
+
+def _sanitize_system_prompt(content: Any, *, max_chars: int = 8_000) -> str:
+    text = str(content or "")
+    cleaned_chars: list[str] = []
+    for ch in text:
+        if ch in "\n\t" or ord(ch) >= 32:
+            cleaned_chars.append(ch)
+    cleaned = "".join(cleaned_chars).replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in cleaned.split("\n")]
+    compact_lines: list[str] = []
+    previous_blank = False
+    for line in lines:
+        if line:
+            compact_lines.append(line)
+            previous_blank = False
+            continue
+        if not previous_blank:
+            compact_lines.append("")
+        previous_blank = True
+    return "\n".join(compact_lines).strip()[:max_chars]
+
+
 def create_provider(config: ArbConfig) -> LLMProvider:
     """工厂函数：根据 AI_PROVIDER 配置创建对应 provider."""
     provider_name = config.ai_provider.lower().strip()
@@ -272,12 +455,18 @@ def create_provider(config: ArbConfig) -> LLMProvider:
     if provider_name in ("openai", "deepseek", "gemini"):
         if not api_base:
             api_base = _OPENAI_COMPAT_DEFAULTS.get(provider_name, "")
-        assert api_key, f"AI_API_KEY is required for provider={provider_name}"
+        if not api_key:
+            raise LLMConfigurationError(
+                f"缺少 API Key: provider={provider_name}，请设置 {_require_api_key(provider_name)}"
+            )
         LOG.info("LLM provider: %s (model=%s, base=%s)", provider_name, model, api_base)
         return OpenAIProvider(api_key=api_key, api_base=api_base, model=model)
 
     if provider_name == "anthropic":
-        assert api_key, "AI_API_KEY is required for provider=anthropic"
+        if not api_key:
+            raise LLMConfigurationError(
+                f"缺少 API Key: provider={provider_name}，请设置 {_require_api_key(provider_name)}"
+            )
         LOG.info("LLM provider: anthropic (model=%s)", model)
         return AnthropicProvider(api_key=api_key, model=model)
 

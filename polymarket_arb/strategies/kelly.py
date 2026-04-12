@@ -49,6 +49,7 @@ class KellyResult:
     expected_growth_rate: float  # 预期对数增长率
     edge: float  # edge = p*b - q
     bankroll: float  # 当前资金
+    warning_reason: str = ""
 
 
 def kelly_binary(
@@ -75,7 +76,7 @@ def kelly_binary(
         KellyResult 包含最优下注额和相关统计
     """
     if win_prob <= 0 or win_prob >= 1 or net_odds <= 0 or bankroll <= 0:
-        return KellyResult(0, 0, 0, 0, 0, bankroll)
+        return KellyResult(0, 0, 0, 0, 0, bankroll, warning_reason="invalid_inputs")
 
     p = win_prob
     q = 1.0 - p
@@ -83,7 +84,7 @@ def kelly_binary(
 
     edge = p * b - q
     if edge <= 0:
-        return KellyResult(0, 0, 0, 0, edge, bankroll)
+        return KellyResult(0, 0, 0, 0, edge, bankroll, warning_reason="non_positive_edge")
 
     raw_f = edge / b  # f* = (pb - q) / b
     raw_f = max(0.0, min(1.0, raw_f))
@@ -92,10 +93,32 @@ def kelly_binary(
     adjusted_f = min(adjusted_f, max_bet_pct)
 
     optimal_usdc = adjusted_f * bankroll
+    effective_fraction = adjusted_f
+    warning_reason = ""
     if optimal_usdc < min_bet_usdc:
+        LOG.info(
+            "Kelly 建议仓位低于最小下注额，已抑制下单: bankroll=%.2f adjusted_f=%.4f size=%.4f min_bet=%.2f",
+            bankroll,
+            adjusted_f,
+            optimal_usdc,
+            min_bet_usdc,
+        )
         optimal_usdc = 0.0
+        effective_fraction = 0.0
+        warning_reason = "below_min_bet"
 
-    growth_rate = p * math.log(1 + adjusted_f * b) + q * math.log(1 - adjusted_f) if adjusted_f < 1.0 else 0.0
+    if effective_fraction >= 1.0:
+        LOG.warning(
+            "Kelly 调整后仓位达到满仓，expected_growth_rate 退化为 -inf: win_prob=%.4f net_odds=%.4f",
+            win_prob,
+            net_odds,
+        )
+        growth_rate = float("-inf")
+        warning_reason = warning_reason or "full_bankroll_risk"
+    elif effective_fraction <= 0:
+        growth_rate = 0.0
+    else:
+        growth_rate = p * math.log(1 + effective_fraction * b) + q * math.log(1 - effective_fraction)
 
     return KellyResult(
         raw_fraction=raw_f,
@@ -104,6 +127,7 @@ def kelly_binary(
         expected_growth_rate=growth_rate,
         edge=edge,
         bankroll=bankroll,
+        warning_reason=warning_reason,
     )
 
 
@@ -127,11 +151,11 @@ def kelly_for_structural_arb(
     所以 win_prob = execution_success_prob < 1.0
     """
     if total_cost_per_share <= 0 or net_edge_per_share <= 0:
-        return KellyResult(0, 0, 0, 0, 0, bankroll)
+        return KellyResult(0, 0, 0, 0, 0, bankroll, warning_reason="invalid_inputs")
 
     net_odds = net_edge_per_share / total_cost_per_share
 
-    loss_on_fail = total_cost_per_share * 0.5
+    loss_on_fail = total_cost_per_share
 
     adjusted_odds = net_edge_per_share / loss_on_fail if loss_on_fail > 0 else net_odds
 
@@ -214,16 +238,17 @@ def kelly_multi_opportunity(
         edge = p * b - (1 - p)
         if edge > 0:
             raw_f = edge / b
-            growth = p * math.log(1 + raw_f * kelly_fraction * b) + (1 - p) * math.log(1 - raw_f * kelly_fraction)
-            scored.append((growth, i, p, b, raw_f, max_sz))
+            adjusted_f = max(0.0, min(1.0, raw_f * kelly_fraction))
+            growth = p * math.log(1 + adjusted_f * b) + (1 - p) * math.log(1 - adjusted_f)
+            scored.append((growth, i, adjusted_f, max_sz))
 
     scored.sort(reverse=True)
 
     allocations = [0.0] * len(opportunities)
     remaining = bankroll
 
-    for _, idx, p, b, raw_f, max_sz in scored:
-        alloc = min(raw_f * kelly_fraction * remaining, max_sz, remaining * 0.2)
+    for _, idx, adjusted_f, max_sz in scored:
+        alloc = min(adjusted_f * remaining, max_sz, remaining * 0.2)
         if alloc < 1.0:
             continue
         allocations[idx] = alloc

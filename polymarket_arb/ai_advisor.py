@@ -35,6 +35,7 @@ from polymarket_arb.models import AIDecision, MarketContext
 
 LOG = logging.getLogger(__name__)
 
+_VALID_ACTIONS = {"BUY_YES", "BUY_NO", "SELL_YES", "SELL_NO", "HOLD", "CLOSE"}
 
 class AIAdvisor:
     """AI 决策顾问，通过 LLMProvider 抽象调用 LLM."""
@@ -50,6 +51,7 @@ class AIAdvisor:
         self._call_count = 0
         self._consecutive_losses = 0
         self._degraded = False
+        self._degraded_ts = 0.0
         self._decision_history: list[dict] = []
         self._last_eval_ts = 0.0
 
@@ -68,7 +70,10 @@ class AIAdvisor:
     def should_evaluate(self) -> bool:
         """检查是否到了下一次 AI 评估的时间."""
         if self._degraded:
-            return False
+            if self._degraded_ts and (time.time() - self._degraded_ts) >= self._config.ai_auto_recover_sec:
+                self.reset_degradation(reason="auto_recover_timeout")
+            else:
+                return False
         return (time.time() - self._last_eval_ts) >= self._config.ai_eval_interval_sec
 
     async def evaluate_markets(self, context: MarketContext) -> list[AIDecision]:
@@ -88,17 +93,10 @@ class AIAdvisor:
         decisions_raw = self._extract_decisions(resp)
         decisions: list[AIDecision] = []
         for d in decisions_raw:
-            action = d.get("action", "HOLD")
-            if action == "HOLD":
+            parsed = self._parse_decision_dict(d, require_market_id=True)
+            if parsed is None or parsed.action == "HOLD":
                 continue
-            decisions.append(AIDecision(
-                action=action,
-                market_id=d.get("market_id", ""),
-                confidence=float(d.get("confidence", 0)),
-                recommended_size_pct=float(d.get("recommended_size_pct", 0)),
-                reasoning=d.get("reasoning", ""),
-                urgency=float(d.get("urgency", 0.5)),
-            ))
+            decisions.append(parsed)
 
         for dec in decisions:
             self._record_decision("market_eval", dec)
@@ -130,14 +128,7 @@ class AIAdvisor:
         resp = await self._call_llm(messages, tools=[EXECUTION_TOOL])
         parsed = self._extract_single_decision(resp)
 
-        decision = AIDecision(
-            action=parsed.get("action", "HOLD"),
-            market_id=parsed.get("market_id", ""),
-            confidence=float(parsed.get("confidence", 0)),
-            recommended_size_pct=float(parsed.get("recommended_size_pct", 0)),
-            reasoning=parsed.get("reasoning", ""),
-            urgency=float(parsed.get("urgency", 0.5)),
-        )
+        decision = self._parse_decision_dict(parsed, require_market_id=False) or self._hold_decision("invalid_execution_schema")
 
         self._record_decision("execution", decision)
         return decision
@@ -157,11 +148,7 @@ class AIAdvisor:
 
         resp = await self._call_llm(messages, tools=[RISK_TOOL])
         parsed = self._extract_risk_adjustment(resp)
-        adjustments = parsed.get("adjustments", {})
-
-        for key in ("max_exposure_factor", "daily_loss_factor"):
-            if key in adjustments:
-                adjustments[key] = max(0.5, min(1.5, float(adjustments[key])))
+        adjustments = self._sanitize_risk_adjustments(parsed.get("adjustments", {}))
 
         if adjustments:
             LOG.info(
@@ -178,14 +165,18 @@ class AIAdvisor:
             self._consecutive_losses += 1
             if self._consecutive_losses >= 5:
                 self._degraded = True
+                self._degraded_ts = time.time()
                 LOG.warning("AI 已降级: 连续 %d 笔亏损", self._consecutive_losses)
         else:
             self._consecutive_losses = 0
+            if self._degraded:
+                self.reset_degradation(reason="successful_trade")
 
-    def reset_degradation(self) -> None:
+    def reset_degradation(self, reason: str = "manual") -> None:
         self._degraded = False
+        self._degraded_ts = 0.0
         self._consecutive_losses = 0
-        LOG.info("AI 降级已手动解除")
+        LOG.info("AI 降级已解除: %s", reason)
 
     def get_status(self) -> dict:
         """获取 AI 顾问状态摘要."""
@@ -229,7 +220,7 @@ class AIAdvisor:
         )
 
         if resp.tool_calls:
-            return resp.tool_calls[0].get("arguments", {})
+            return self._merge_tool_call_arguments(resp.tool_calls)
 
         if resp.content:
             try:
@@ -238,6 +229,44 @@ class AIAdvisor:
                 LOG.warning("LLM 返回非 JSON 内容: %s", resp.content[:200])
                 return {}
         return {}
+
+    def _merge_tool_call_arguments(self, tool_calls: list[dict[str, Any]]) -> dict[str, Any]:
+        merged: dict[str, Any] = {}
+        merged_decisions: list[dict[str, Any]] = []
+        merged_adjustments: dict[str, Any] = {}
+        reasoning_parts: list[str] = []
+
+        for tool_call in tool_calls:
+            args = tool_call.get("arguments", {})
+            if not isinstance(args, dict):
+                continue
+
+            if isinstance(args.get("decisions"), list):
+                merged_decisions.extend(item for item in args["decisions"] if isinstance(item, dict))
+
+            adjustments = args.get("adjustments")
+            if isinstance(adjustments, dict):
+                merged_adjustments.update(adjustments)
+
+            reasoning = args.get("reasoning")
+            if isinstance(reasoning, str):
+                cleaned = reasoning.strip()
+                if cleaned:
+                    reasoning_parts.append(cleaned)
+
+            for key, value in args.items():
+                if key in {"decisions", "adjustments", "reasoning"}:
+                    continue
+                merged[key] = value
+
+        if merged_decisions:
+            merged["decisions"] = merged_decisions
+        if merged_adjustments:
+            merged["adjustments"] = merged_adjustments
+        if reasoning_parts:
+            merged["reasoning"] = " | ".join(dict.fromkeys(reasoning_parts))
+
+        return merged
 
     def _check_budget(self) -> bool:
         """检查是否超出日成本上限."""
@@ -258,7 +287,7 @@ class AIAdvisor:
     def _extract_decisions(self, parsed: dict) -> list[dict]:
         """从 LLM 响应提取决策列表."""
         if "decisions" in parsed:
-            return parsed["decisions"]
+            return parsed["decisions"] if isinstance(parsed["decisions"], list) else []
         if isinstance(parsed, list):
             return parsed
         return []
@@ -285,6 +314,60 @@ class AIAdvisor:
             recommended_size_pct=0.0,
             reasoning=reason,
         )
+
+    def _parse_decision_dict(
+        self,
+        raw: dict[str, Any],
+        *,
+        require_market_id: bool,
+    ) -> AIDecision | None:
+        if not isinstance(raw, dict):
+            return None
+        action = str(raw.get("action", "HOLD")).upper()
+        if action not in _VALID_ACTIONS:
+            LOG.warning("AI 返回非法 action=%r，已降级为 HOLD", raw.get("action"))
+            action = "HOLD"
+        market_id = str(raw.get("market_id", "")).strip()
+        if require_market_id and action != "HOLD" and not market_id:
+            LOG.warning("AI 返回缺少 market_id 的决策，已忽略: %s", raw)
+            return None
+        reasoning = str(raw.get("reasoning", "") or "").strip()[:500]
+        if not reasoning:
+            reasoning = "no_reasoning"
+        return AIDecision(
+            action=action,
+            market_id=market_id,
+            confidence=self._coerce_float(raw.get("confidence"), default=0.0, min_value=0.0, max_value=1.0),
+            recommended_size_pct=self._coerce_float(raw.get("recommended_size_pct"), default=0.0, min_value=0.0, max_value=0.1),
+            reasoning=reasoning,
+            urgency=self._coerce_float(raw.get("urgency"), default=0.5, min_value=0.0, max_value=1.0),
+        )
+
+    def _sanitize_risk_adjustments(self, raw: Any) -> dict[str, float]:
+        if not isinstance(raw, dict):
+            return {}
+        adjustments: dict[str, float] = {}
+        for key in ("max_exposure_factor", "daily_loss_factor"):
+            if key not in raw:
+                continue
+            value = self._coerce_float(raw.get(key), default=None, min_value=0.5, max_value=1.5)
+            if value is not None:
+                adjustments[key] = value
+        return adjustments
+
+    def _coerce_float(
+        self,
+        value: Any,
+        *,
+        default: float | None,
+        min_value: float,
+        max_value: float,
+    ) -> float | None:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return max(min_value, min(max_value, parsed))
 
     def _record_decision(self, decision_type: str, decision: AIDecision) -> None:
         entry = {

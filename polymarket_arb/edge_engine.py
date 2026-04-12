@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from polymarket_arb.book_store import EnhancedBookStore
+from polymarket_arb.confidence import clamp_confidence
 from polymarket_arb.fair_value_model import compute_edge_bps, compute_general_fair_value
 from polymarket_arb.utils_time import now_ms
 from polymarket_arb.volatility_estimator import VolEstimator
@@ -80,11 +81,23 @@ class EdgeEngine:
         min_depth: float = 50.0,
         max_spread_bps: float = 500.0,
         min_confidence: float = 0.4,
+        confidence_full_bps: float = 500.0,
+        confidence_imbalance_weight: float = 0.1,
+        volatility_spike_ratio: float = 2.0,
+        volatility_spike_penalty: float = 0.7,
+        volatility_calm_ratio: float = 0.8,
+        volatility_calm_boost: float = 1.1,
     ) -> None:
         self.min_edge_bps = min_edge_bps
         self.min_depth = min_depth
         self.max_spread_bps = max_spread_bps
         self.min_confidence = min_confidence
+        self.confidence_full_bps = confidence_full_bps
+        self.confidence_imbalance_weight = confidence_imbalance_weight
+        self.volatility_spike_ratio = volatility_spike_ratio
+        self.volatility_spike_penalty = volatility_spike_penalty
+        self.volatility_calm_ratio = volatility_calm_ratio
+        self.volatility_calm_boost = volatility_calm_boost
         self._last_decision: Optional[EdgeDecision] = None
 
     def evaluate(
@@ -237,9 +250,9 @@ class EdgeEngine:
         vol_estimator: Optional[VolEstimator],
     ) -> float:
         """综合 edge 大小、OBI 和波动率计算置信度."""
-        conf = min(1.0, edge_bps / 500.0)
+        conf = min(1.0, edge_bps / self.confidence_full_bps)
 
-        conf += 0.1 * abs(imbalance)
+        conf += self.confidence_imbalance_weight * abs(imbalance)
 
         if vol_estimator is not None:
             vol_snap = vol_estimator.snapshot()
@@ -247,12 +260,12 @@ class EdgeEngine:
             slow_vol = vol_snap.get("sigma_slow_15m")
             if fast_vol and slow_vol and slow_vol > 0:
                 vol_ratio = fast_vol / slow_vol
-                if vol_ratio > 2.0:
-                    conf *= 0.7
-                elif vol_ratio < 0.8:
-                    conf *= 1.1
+                if vol_ratio > self.volatility_spike_ratio:
+                    conf *= self.volatility_spike_penalty
+                elif vol_ratio < self.volatility_calm_ratio:
+                    conf *= self.volatility_calm_boost
 
-        return max(0.0, min(1.0, conf))
+        return clamp_confidence(conf)
 
     def _veto_decision(self, ts: int, snap: dict, veto_reasons: list[str]) -> EdgeDecision:
         return EdgeDecision(
