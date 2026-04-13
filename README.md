@@ -259,8 +259,16 @@ cp .env.example .env
   当前实现按更保守的“成本侧计费”估算，目的是避免高估套利利润。除非你已经核实最新官方费率模型，否则不建议往下调。
 - `KALSHI_TAKER_FEE_RATE`
   默认 `0.3%` 是偏保守的中位数假设。做跨平台利润回测时建议把它和真实账户成交单据对齐。
+- `CROSS_PLATFORM_PAIRS_JSON`
+  T1 需要明确的 Poly/Kalshi 事件配对，默认留空。主循环现在支持把跨平台机会写进 telemetry，但不会在没有配对表时自行猜测映射。
 - `AI_AUTO_RECOVER_SEC`
   默认 30 分钟，避免 AI 因短期连续亏损被永久锁死；如果你希望 AI 更谨慎，可以调到 `3600-7200`。
+
+当前主循环的观测口径：
+
+- T0 结构性套利继续进入 `opportunities` / `trades`
+- T1/T2/T3 的信号会额外写入 `data/telemetry/*.strategy_signals.ndjson`
+- 因此以后看到 “0 arbs” 时，要同时检查 `strategy_signals`，不要再把它误解成“整套策略都没有信号”
 
 ## 运行
 
@@ -516,6 +524,8 @@ tail -n 50 arb_bot.log
 1. 用 `tmux` 在服务器后台运行 `python run_arb_bot.py`
 2. 用另一条本地 SSH 隧道访问 dashboard
 3. 不要直接把 dashboard 监听改成 `0.0.0.0`
+
+更完整的日志/telemetry 值守建议见 [SERVER_OBSERVABILITY.md](/abs/c:/AppProject/PolymarketBot/SERVER_OBSERVABILITY.md)。
 
 ## 免责声明
 

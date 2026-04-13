@@ -28,3 +28,4 @@ def setup_logging(level: str = "INFO", log_file: str = "arb_bot.log") -> None:
 
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)

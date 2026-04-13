@@ -49,12 +49,15 @@ class OrderBookAnalyzer:
         *,
         retry_count: int = 2,
         retry_delay_sec: float = 0.15,
+        missing_orderbook_cooldown_sec: float = 300.0,
     ):
         self._client = clob_client
         self._snapshot_ttl_sec = max(0.0, snapshot_ttl_sec)
         self._retry_count = max(0, int(retry_count))
         self._retry_delay_sec = max(0.0, float(retry_delay_sec))
+        self._missing_orderbook_cooldown_sec = max(0.0, float(missing_orderbook_cooldown_sec))
         self._snapshot_cache: dict[str, OrderBookSnapshot] = {}
+        self._missing_orderbook_until: dict[str, float] = {}
 
     def get_snapshot(self, token_id: str) -> Optional[OrderBookSnapshot]:
         """获取单个 token 的订单簿快照."""
@@ -62,6 +65,11 @@ class OrderBookAnalyzer:
         now = time.time()
         if cached is not None and self._snapshot_ttl_sec > 0 and (now - cached.timestamp) <= self._snapshot_ttl_sec:
             return cached
+        missing_until = self._missing_orderbook_until.get(token_id)
+        if missing_until is not None:
+            if now < missing_until:
+                return None
+            self._missing_orderbook_until.pop(token_id, None)
 
         book = None
         correlation_id = f"book-{token_id[:12]}-{int(now * 1000)}"
@@ -70,6 +78,15 @@ class OrderBookAnalyzer:
                 book = self._client.get_order_book(token_id)
                 break
             except Exception as e:
+                if _is_missing_orderbook_error(e):
+                    self._missing_orderbook_until[token_id] = time.time() + self._missing_orderbook_cooldown_sec
+                    LOG.warning(
+                        "[cid=%s] token=%s… 暂无 orderbook，进入 %.0fs 冷却",
+                        correlation_id,
+                        token_id[:20],
+                        self._missing_orderbook_cooldown_sec,
+                    )
+                    return None
                 if attempt < self._retry_count:
                     LOG.warning(
                         "[cid=%s] get_order_book 失败，准备重试 (%d/%d) token=%s…: %s",
@@ -201,3 +218,8 @@ class OrderBookAnalyzer:
             if delay > 0 and tid != token_ids[-1]:
                 time.sleep(delay)
         return result
+
+
+def _is_missing_orderbook_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return "no orderbook exists" in message

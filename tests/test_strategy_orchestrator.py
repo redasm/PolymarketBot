@@ -346,3 +346,24 @@ def test_process_signals_prefers_higher_confidence_after_edge_normalization():
     ready = orchestrator.process_signals()
 
     assert [signal.market_id for signal in ready] == ["market-2", "market-1"]
+
+
+def test_record_processed_prunes_executed_signal_history():
+    orchestrator = StrategyOrchestrator(total_bankroll=1000)
+
+    for idx in range(2505):
+        orchestrator.record_processed(
+            StrategySignal(
+                tier=StrategyTier.STATISTICAL_ARB,
+                signal_type=f"signal-{idx}",
+                market_id=f"market-{idx}",
+                description="signal",
+                expected_edge=10.0,
+                confidence=0.5,
+                recommended_size_usdc=10.0,
+            )
+        )
+
+    status = orchestrator.get_status()
+
+    assert status["meta"]["executed_signals"] == 2000

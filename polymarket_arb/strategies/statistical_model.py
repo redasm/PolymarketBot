@@ -239,6 +239,36 @@ class StatisticalMispricingDetector:
         Returns:
             ProbabilityEstimate 或 None（无显著偏差时）
         """
+        estimate = self.estimate_market_probability(
+            market_id=market_id,
+            outcome=outcome,
+            market_price=market_price,
+            bids_total_size=bids_total_size,
+            asks_total_size=asks_total_size,
+            mid_price=mid_price,
+            related_market_prices=related_market_prices,
+        )
+        deviation = estimate.deviation
+        confidence = estimate.confidence
+
+        if abs(deviation) < self._min_deviation:
+            return None
+        if confidence < self._min_confidence:
+            return None
+
+        return estimate
+
+    def estimate_market_probability(
+        self,
+        *,
+        market_id: str,
+        outcome: str,
+        market_price: float,
+        bids_total_size: float,
+        asks_total_size: float,
+        mid_price: Optional[float] = None,
+        related_market_prices: Optional[dict[str, float]] = None,
+    ) -> ProbabilityEstimate:
         if mid_price is not None:
             self._momentum.record(market_id, mid_price)
 
@@ -262,11 +292,6 @@ class StatisticalMispricingDetector:
             + self._normalize_signal_strength(cross_dev)
         ) / 3.0
         confidence = confidence_from_signal_strength(signal_strength, scale=2.0)
-
-        if abs(deviation) < self._min_deviation:
-            return None
-        if confidence < self._min_confidence:
-            return None
 
         return ProbabilityEstimate(
             market_id=market_id,

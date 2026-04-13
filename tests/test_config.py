@@ -15,8 +15,10 @@ from tests.conftest import make_test_config, write_test_env
         ("scan_interval_sec", 0.0, "ARB_SCAN_INTERVAL_SEC"),
         ("orderbook_retry_count", -1, "ORDERBOOK_RETRY_COUNT"),
         ("orderbook_retry_delay_sec", -0.1, "ORDERBOOK_RETRY_DELAY_SEC"),
+        ("orderbook_missing_cooldown_sec", -1.0, "ORDERBOOK_MISSING_COOLDOWN_SEC"),
         ("max_multi_outcome_legs", 1, "ARB_MAX_MULTI_OUTCOME_LEGS"),
         ("risk_event_cooldown_sec", -1.0, "RISK_EVENT_COOLDOWN_SEC"),
+        ("risk_pending_reservation_ttl_sec", -1.0, "RISK_PENDING_RESERVATION_TTL_SEC"),
         ("edge_min_confidence", 1.5, "EDGE_MIN_CONFIDENCE"),
         ("edge_confidence_full_bps", 0.0, "EDGE_CONFIDENCE_FULL_BPS"),
     ],
@@ -32,13 +34,16 @@ def test_from_env_loads_new_edge_and_cooldown_config(tmp_path):
     env_path = write_test_env(tmp_path)
     env_path.write_text(
         env_path.read_text(encoding="utf-8")
-        + "\nEDGE_CONFIDENCE_FULL_BPS=650\nEDGE_CONFIDENCE_IMBALANCE_WEIGHT=0.2\n",
+        + "\nEDGE_CONFIDENCE_FULL_BPS=650\nEDGE_CONFIDENCE_IMBALANCE_WEIGHT=0.2\nORDERBOOK_MISSING_COOLDOWN_SEC=120\nCROSS_PLATFORM_PAIRS_JSON=[]\nRISK_PENDING_RESERVATION_TTL_SEC=300\n",
         encoding="utf-8",
     )
 
     cfg = ArbConfig.from_env(env_path)
 
     assert cfg.risk_event_cooldown_sec == 60.0
+    assert cfg.orderbook_missing_cooldown_sec == 120.0
+    assert cfg.cross_platform_pairs_json == "[]"
+    assert cfg.risk_pending_reservation_ttl_sec == 300.0
     assert cfg.edge_confidence_full_bps == 650.0
     assert cfg.edge_confidence_imbalance_weight == 0.2
     assert cfg.telemetry_record_enabled is False

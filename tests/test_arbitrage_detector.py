@@ -158,6 +158,34 @@ class TestMultiOutcomeArbDetection:
 
         assert detector.scan_multi_outcome_event(event) is None
 
+    def test_multi_outcome_arb_skip_for_too_many_legs_is_debug_only(self, make_snapshot, caplog):
+        snapshots = {
+            f"tok-{i}": make_snapshot(token_id=f"tok-{i}", best_ask=0.03, best_bid=0.02)
+            for i in range(21)
+        }
+        markets = [
+            MarketInfo(
+                condition_id=f"c{i}",
+                question=f"Candidate {i}?",
+                slug=f"cand-{i}",
+                tokens=[TokenInfo(token_id=f"tok-{i}", outcome=f"Candidate {i}")],
+                active=True,
+                closed=False,
+                event_id="e-many",
+            )
+            for i in range(21)
+        ]
+        event = EventInfo(event_id="e-many", slug="e-many", title="Who wins many?", markets=markets)
+        detector = ArbitrageDetector(
+            make_test_config(max_multi_outcome_legs=20),
+            MockOrderBookAnalyzer(snapshots),
+        )
+
+        with caplog.at_level("INFO"):
+            assert detector.scan_multi_outcome_event(event) is None
+
+        assert "跳过超多腿多结果事件" not in caplog.text
+
     def test_neg_risk_sell_leg_uses_bid_for_execution_and_complement_for_cost(self, make_snapshot):
         snapshots = {
             "yes1": make_snapshot(

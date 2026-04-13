@@ -101,6 +101,7 @@ class StrategyOrchestrator:
         StrategyTier.STATISTICAL_ARB: 0.30,
         StrategyTier.MARKET_MAKING: 0.20,
     }
+    _MAX_SIGNAL_HISTORY = 2000
 
     def __init__(
         self,
@@ -214,11 +215,11 @@ class StrategyOrchestrator:
             alloc.trade_count += 1
             alloc.last_trade_ts = time.time()
         alloc.realized_pnl += pnl
-        self._executed_signals.append(signal)
+        self._append_executed_signal(signal)
 
     def record_processed(self, signal: StrategySignal) -> None:
         """记录信号已被编排器消费，但未进入真实执行."""
-        self._executed_signals.append(signal)
+        self._append_executed_signal(signal)
 
     def record_settlement(self, tier: StrategyTier, amount: float, pnl: float) -> None:
         """仓位结算后释放敞口."""
@@ -229,6 +230,11 @@ class StrategyOrchestrator:
 
     def update_bankroll(self, new_bankroll: float) -> None:
         self._bankroll = new_bankroll
+
+    def _append_executed_signal(self, signal: StrategySignal) -> None:
+        self._executed_signals.append(signal)
+        if len(self._executed_signals) > self._MAX_SIGNAL_HISTORY:
+            del self._executed_signals[:-self._MAX_SIGNAL_HISTORY]
 
     def get_status(self) -> dict[str, Any]:
         tier_keys = {

@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import logging
+import os
+import re
 import signal
 import threading
 import time
@@ -40,6 +43,9 @@ from polymarket_arb.market_scanner import MarketScanner
 from polymarket_arb.models import ArbOpportunity, ArbType, MarketInfo, ResearchSignalReport
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
 from polymarket_arb.risk_manager import RiskManager
+from polymarket_arb.strategies.cross_platform import CrossPlatformScanner, KalshiClient
+from polymarket_arb.strategies.maker_strategy import DynamicSpreadCalculator, MakerStrategy
+from polymarket_arb.strategies.statistical_model import StatisticalMispricingDetector
 from polymarket_arb.strategies.strategy_orchestrator import (
     StrategyOrchestrator,
     StrategySignal,
@@ -65,10 +71,16 @@ def _signal_handler(sig: int, frame: Any) -> None:
     _SHUTDOWN_EVENT.set()
 
 
-def _log_startup_summary(config: ArbConfig) -> None:
+def _build_run_instance_id(*, now_ts: float | None = None) -> str:
+    ts = time.gmtime(now_ts if now_ts is not None else time.time())
+    return f"run-{os.getpid()}-{time.strftime('%Y%m%dT%H%M%SZ', ts)}"
+
+
+def _log_startup_summary(config: ArbConfig, run_id: str) -> None:
     safe_cfg = config.dump_safe()
     LOG.info("=" * 60)
     LOG.info("Polymarket 套利机器人启动")
+    LOG.info("实例: run_id=%s pid=%d", run_id, os.getpid())
     LOG.info("模式: %s", "DRY RUN (仅扫描)" if config.dry_run else "LIVE (实盘交易)")
     LOG.info(
         "基础: clob=%s gamma=%s funder=%s",
@@ -162,6 +174,26 @@ def _create_research_signal_service(config: ArbConfig) -> Optional["ResearchSign
         return None
 
 
+def _create_cross_platform_scanner(config: ArbConfig, ob_analyzer: OrderBookAnalyzer) -> CrossPlatformScanner | None:
+    raw = (config.cross_platform_pairs_json or "").strip()
+    if not raw:
+        return None
+
+    try:
+        pairs = json.loads(raw)
+    except json.JSONDecodeError as e:
+        LOG.error("跨平台配对配置解析失败: %s", e)
+        return None
+    if not isinstance(pairs, list):
+        LOG.error("跨平台配对配置必须是 JSON list")
+        return None
+
+    scanner = CrossPlatformScanner(KalshiClient(), ob_analyzer)
+    scanner.load_pairs_from_config([item for item in pairs if isinstance(item, dict)])
+    LOG.info("跨平台扫描器已启用: 配对=%d", len(getattr(scanner, "_pairs", [])))
+    return scanner
+
+
 def _select_ws_targets(
     markets: list[MarketInfo],
     max_count: int,
@@ -201,7 +233,173 @@ def _event_focus_text(event: Any) -> str:
 def _matches_focus(text: str, keywords: list[str]) -> bool:
     if not keywords:
         return True
-    return any(keyword in text for keyword in keywords)
+    normalized_tokens = [
+        token
+        for token in re.split(r"[^a-z0-9]+", text.lower())
+        if token
+    ]
+    return any(
+        token == keyword or token.startswith(keyword)
+        for keyword in keywords
+        for token in normalized_tokens
+    )
+
+
+def _collect_cross_platform_strategy_signals(
+    *,
+    config: ArbConfig,
+    scanner: Any | None,
+) -> list[StrategySignal]:
+    if scanner is None:
+        return []
+
+    signals: list[StrategySignal] = []
+    for opp in scanner.scan():
+        signals.append(
+            StrategySignal(
+                tier=StrategyTier.CROSS_PLATFORM,
+                signal_type=f"cross_platform_{opp.direction}",
+                market_id=opp.pair.polymarket_condition_id,
+                description=opp.pair.event_description[:120],
+                expected_edge=opp.edge_pct * 100.0,
+                confidence=opp.confidence,
+                recommended_size_usdc=config.default_order_size_usdc,
+                urgency=0.9,
+                payload={
+                    "direction": opp.direction,
+                    "pair_id": opp.pair.pair_id,
+                    "event_description": opp.pair.event_description,
+                    "poly_cost": opp.poly_cost,
+                    "kalshi_cost": opp.kalshi_cost,
+                    "total_cost": opp.total_cost,
+                    "net_edge": opp.net_edge,
+                    "edge_pct": opp.edge_pct,
+                },
+            )
+        )
+    return signals
+
+
+def _collect_statistical_strategy_signals(
+    *,
+    config: ArbConfig,
+    candidate_markets: list[MarketInfo],
+    ob_analyzer: OrderBookAnalyzer,
+    detector: StatisticalMispricingDetector,
+)-> list[StrategySignal]:
+    signals: list[StrategySignal] = []
+    for market in candidate_markets:
+        if len(market.tokens) != 2 or market.closed or not market.active:
+            continue
+
+        yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
+        snap = ob_analyzer.get_snapshot(yes_token.token_id)
+        if snap is None or snap.mid is None:
+            continue
+
+        bids_total_size = sum(level.size for level in snap.bids[:5])
+        asks_total_size = sum(level.size for level in snap.asks[:5])
+        estimate = detector.analyze(
+            market_id=market.condition_id,
+            outcome="YES",
+            market_price=float(snap.mid),
+            bids_total_size=bids_total_size,
+            asks_total_size=asks_total_size,
+            mid_price=float(snap.mid),
+        )
+        if estimate is None:
+            continue
+
+        action = "buy_yes" if estimate.is_underpriced else "buy_no"
+        signals.append(
+            StrategySignal(
+                tier=StrategyTier.STATISTICAL_ARB,
+                signal_type=f"statistical_{action}",
+                market_id=market.condition_id,
+                description=f"{market.question[:80]} | deviation={estimate.deviation:+.4f}",
+                expected_edge=estimate.abs_edge * 10_000.0,
+                confidence=estimate.confidence,
+                recommended_size_usdc=config.default_order_size_usdc,
+                urgency=min(1.0, 0.5 + estimate.confidence * 0.4),
+                payload={
+                    "outcome": estimate.outcome,
+                    "model_prob": estimate.model_prob,
+                    "market_prob": estimate.market_prob,
+                    "deviation": estimate.deviation,
+                    "deviation_pct": estimate.deviation_pct,
+                    "signals": dict(estimate.signals),
+                },
+            )
+        )
+    return signals
+
+
+def _collect_maker_strategy_signals(
+    *,
+    candidate_markets: list[MarketInfo],
+    ob_analyzer: OrderBookAnalyzer,
+    maker_strategy: MakerStrategy,
+    fair_values_by_market: dict[str, float],
+    detector: StatisticalMispricingDetector | None = None,
+)-> list[StrategySignal]:
+    signals: list[StrategySignal] = []
+    for market in candidate_markets:
+        if len(market.tokens) != 2 or market.closed or not market.active:
+            continue
+
+        yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
+        snap = ob_analyzer.get_snapshot(yes_token.token_id)
+        if snap is None or snap.mid is None:
+            continue
+        fair_value = fair_values_by_market.get(market.condition_id)
+        if fair_value is None and detector is not None:
+            bids_total_size = sum(level.size for level in snap.bids[:5])
+            asks_total_size = sum(level.size for level in snap.asks[:5])
+            estimate = detector.estimate_market_probability(
+                market_id=market.condition_id,
+                outcome="YES",
+                market_price=float(snap.mid),
+                bids_total_size=bids_total_size,
+                asks_total_size=asks_total_size,
+                mid_price=float(snap.mid),
+            )
+            fair_value = estimate.model_prob
+        if fair_value is None:
+            continue
+
+        quote = maker_strategy.compute_quote(
+            token_id=yes_token.token_id,
+            condition_id=market.condition_id,
+            fair_value=float(fair_value),
+            tick_size=max(float(getattr(snap, "tick_size", 0.01) or 0.01), 0.01),
+            mid_price=float(snap.mid),
+        )
+        if quote is None or (quote.bid_price is None and quote.ask_price is None):
+            continue
+
+        signals.append(
+            StrategySignal(
+                tier=StrategyTier.MARKET_MAKING,
+                signal_type="maker_quote",
+                market_id=market.condition_id,
+                description=f"{market.question[:80]} | maker fair={fair_value:.4f} spread={quote.spread:.4f}",
+                expected_edge=max(0.0, quote.spread) * 10_000.0,
+                confidence=0.5,
+                recommended_size_usdc=max(quote.bid_size, quote.ask_size),
+                urgency=0.2,
+                payload={
+                    "quote": {
+                        "bid_price": quote.bid_price,
+                        "ask_price": quote.ask_price,
+                        "bid_size": quote.bid_size,
+                        "ask_size": quote.ask_size,
+                        "spread": quote.spread,
+                        "fair_value": quote.fair_value,
+                    }
+                },
+            )
+        )
+    return signals
 
 
 def _market_priority_score(market: MarketInfo) -> tuple[float, float, float]:
@@ -311,7 +509,8 @@ def main(dotenv_path: str | None = None) -> None:
     _SHUTDOWN_EVENT.clear()
     config = ArbConfig.from_env(dotenv_path)
     setup_logging(config.log_level, config.log_file)
-    _log_startup_summary(config)
+    run_id = _build_run_instance_id()
+    _log_startup_summary(config, run_id)
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -327,6 +526,7 @@ def main(dotenv_path: str | None = None) -> None:
         snapshot_ttl_sec=config.orderbook_snapshot_ttl_sec,
         retry_count=config.orderbook_retry_count,
         retry_delay_sec=config.orderbook_retry_delay_sec,
+        missing_orderbook_cooldown_sec=config.orderbook_missing_cooldown_sec,
     )
     detector = ArbitrageDetector(config, ob_analyzer)
     executor = ExecutionEngine(config, trading_client or ro_client)
@@ -351,6 +551,16 @@ def main(dotenv_path: str | None = None) -> None:
         volatility_calm_ratio=config.edge_volatility_calm_ratio,
         volatility_calm_boost=config.edge_volatility_calm_boost,
     )
+    statistical_detector = StatisticalMispricingDetector(
+        min_deviation=max(0.02, config.edge_min_bps / 10_000.0),
+        min_confidence=config.edge_min_confidence,
+    )
+    maker_strategy = MakerStrategy(
+        spread_calc=DynamicSpreadCalculator(vol_estimator=vol_estimator),
+        default_size=config.default_order_size_usdc,
+        max_inventory=max(config.max_exposure_per_market, config.default_order_size_usdc),
+    )
+    cross_platform_scanner = _create_cross_platform_scanner(config, ob_analyzer)
     tick_recorder = TickRecorder(
         output_dir=config.tick_record_dir,
         enabled=config.tick_record_enabled,
@@ -383,6 +593,8 @@ def main(dotenv_path: str | None = None) -> None:
         LOG.info("Telemetry 录制已开启: %s", config.telemetry_record_dir)
         event_recorder.write_event("risk_events", {
             "event": "startup",
+            "run_id": run_id,
+            "pid": os.getpid(),
             "mode": "dry_run" if config.dry_run else "live",
             "scan_interval_sec": config.scan_interval_sec,
             "universe_refresh_sec": config.market_universe_refresh_sec,
@@ -619,6 +831,77 @@ def main(dotenv_path: str | None = None) -> None:
                 report=research_report,
             )
 
+        edge_decision = edge_engine.evaluate(enhanced_store, vol_estimator)
+        if edge_decision.direction != "NONE":
+            dash_state.append_opportunity({
+                "arb_type": "edge_engine",
+                "event_title": f"[Edge] {edge_decision.market_id or 'active_market'}",
+                "total_cost": edge_decision.market_price,
+                "net_edge": edge_decision.edge_bps / 10000.0,
+                "edge_pct": edge_decision.edge_bps / 100.0,
+                "confidence": edge_decision.confidence,
+                "direction": edge_decision.direction,
+                "fair_value": edge_decision.fair_value,
+                "timestamp": time.time(),
+            })
+
+        strategy_signals = _collect_cross_platform_strategy_signals(
+            config=config,
+            scanner=cross_platform_scanner,
+        )
+        statistical_signals = _collect_statistical_strategy_signals(
+            config=config,
+            candidate_markets=scanned_markets,
+            ob_analyzer=ob_analyzer,
+            detector=statistical_detector,
+        )
+        strategy_signals.extend(statistical_signals)
+        fair_values_by_market = {
+            signal.market_id: float(signal.payload.get("model_prob"))
+            for signal in statistical_signals
+            if signal.payload.get("model_prob") is not None
+        }
+        maker_signals = _collect_maker_strategy_signals(
+            candidate_markets=scanned_markets,
+            ob_analyzer=ob_analyzer,
+            maker_strategy=maker_strategy,
+            fair_values_by_market=fair_values_by_market,
+            detector=statistical_detector,
+        )
+        strategy_signals.extend(maker_signals)
+
+        active_markets_for_overlay = universe_markets if universe_markets else scanned_markets
+        for signal in strategy_signals:
+            submitted = orchestrator.submit_signal(
+                signal,
+                active_markets=active_markets_for_overlay,
+                research_report=research_report,
+                research_signals=research_signals,
+            )
+            signal_for_record = _find_pending_signal(orchestrator, signal) or signal
+            overlay_payload = _find_pending_signal_overlay(orchestrator, signal)
+            dash_state.append_opportunity({
+                "arb_type": signal_for_record.signal_type,
+                "event_title": signal_for_record.description,
+                "total_cost": None,
+                "net_edge": signal_for_record.expected_edge / 10_000.0,
+                "edge_pct": signal_for_record.expected_edge / 100.0,
+                "confidence": signal_for_record.confidence,
+                "market_id": signal_for_record.market_id,
+                "tier": signal_for_record.tier.name,
+                "recommended_size_usdc": signal_for_record.recommended_size_usdc,
+                "submitted": submitted,
+                "timestamp": signal_for_record.timestamp,
+            })
+            if event_recorder.is_enabled:
+                event_recorder.write_event(
+                    "strategy_signals",
+                    _serialize_strategy_signal(signal_for_record, submitted=submitted, research_overlay=overlay_payload),
+                )
+
+        for signal in orchestrator.process_signals():
+            orchestrator.record_processed(signal)
+
         for opp in opportunities:
             if _SHUTDOWN_EVENT.is_set():
                 break
@@ -699,20 +982,6 @@ def main(dotenv_path: str | None = None) -> None:
                     f"已成交腿数: {len(filled)}/{len(opp.legs)}"
                 )
 
-        edge_decision = edge_engine.evaluate(enhanced_store, vol_estimator)
-        if edge_decision.direction != "NONE":
-            dash_state.append_opportunity({
-                "arb_type": "edge_engine",
-                "event_title": f"[Edge] {edge_decision.market_id or 'active_market'}",
-                "total_cost": edge_decision.market_price,
-                "net_edge": edge_decision.edge_bps / 10000.0,
-                "edge_pct": edge_decision.edge_bps / 100.0,
-                "confidence": edge_decision.confidence,
-                "direction": edge_decision.direction,
-                "fair_value": edge_decision.fair_value,
-                "timestamp": time.time(),
-            })
-
         if ai_advisor and ai_advisor.should_evaluate():
             _run_ai_cycle(
                 ai_advisor=ai_advisor,
@@ -789,6 +1058,7 @@ def main(dotenv_path: str | None = None) -> None:
         if event_recorder.is_enabled and (now_ts - last_telemetry_heartbeat_ts) >= _TELEMETRY_HEARTBEAT_SEC:
             event_recorder.write_event("risk_events", {
                 "event": "cycle_summary",
+                "run_id": run_id,
                 "cycle": cycle,
                 "markets_scanned": len(scanned_markets),
                 "universe_market_count": len(cached_universe_markets),
@@ -823,10 +1093,19 @@ def main(dotenv_path: str | None = None) -> None:
     if ws_feed is not None:
         ws_feed.stop()
         LOG.info("WebSocket feed 已停止")
+    if event_recorder.is_enabled:
+        event_recorder.write_event("risk_events", {
+            "event": "shutdown",
+            "run_id": run_id,
+            "pid": os.getpid(),
+            "cycle": cycle,
+            "arbs_found_total": total_arbs_found,
+            "arbs_executed_total": total_arbs_executed,
+        })
     tick_recorder.close()
     event_recorder.close()
     dash_state.update(is_running=False)
-    LOG.info("机器人已停止。总计: %d 周期, %d 机会, %d 执行", cycle, total_arbs_found, total_arbs_executed)
+    LOG.info("机器人已停止: run_id=%s。总计: %d 周期, %d 机会, %d 执行", run_id, cycle, total_arbs_found, total_arbs_executed)
     notifier.send("🛑 套利机器人已停止", category="shutdown", force=True)
 
 
@@ -1028,14 +1307,21 @@ def _estimate_ai_trade_outcome(verified: ArbOpportunity, trades: list[Any], arb_
 
 
 def _find_pending_signal_overlay(orchestrator: StrategyOrchestrator, signal: StrategySignal) -> dict[str, Any]:
+    pending = _find_pending_signal(orchestrator, signal)
+    if pending is not None:
+        return dict(pending.payload.get("research_overlay", {}))
+    return {}
+
+
+def _find_pending_signal(orchestrator: StrategyOrchestrator, signal: StrategySignal) -> StrategySignal | None:
     for pending in getattr(orchestrator, "_pending_signals", []):
         if (
             pending.market_id == signal.market_id
             and pending.signal_type == signal.signal_type
             and abs(float(pending.timestamp) - float(signal.timestamp)) < 1e-6
         ):
-            return dict(pending.payload.get("research_overlay", {}))
-    return {}
+            return pending
+    return None
 
 
 def _serialize_opportunity_event(opp: ArbOpportunity, *, stage: str) -> dict[str, Any]:
@@ -1094,6 +1380,28 @@ def _serialize_trade_execution(opp: ArbOpportunity, trades: list[Any], arb_succe
             }
             for trade in trades
         ],
+    }
+
+
+def _serialize_strategy_signal(
+    signal: StrategySignal,
+    *,
+    submitted: bool,
+    research_overlay: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "tier": signal.tier.name,
+        "signal_type": signal.signal_type,
+        "market_id": signal.market_id,
+        "description": signal.description,
+        "expected_edge": signal.expected_edge,
+        "confidence": signal.confidence,
+        "recommended_size_usdc": signal.recommended_size_usdc,
+        "urgency": signal.urgency,
+        "submitted": submitted,
+        "research_overlay": dict(research_overlay or {}),
+        "payload": dict(signal.payload),
+        "timestamp": signal.timestamp,
     }
 
 

@@ -76,6 +76,8 @@ class ArbConfig:
     orderbook_snapshot_ttl_sec: float
     orderbook_retry_count: int
     orderbook_retry_delay_sec: float
+    orderbook_missing_cooldown_sec: float
+    cross_platform_pairs_json: str
     polymarket_taker_fee_rate: float
     kalshi_taker_fee_rate: float
     max_multi_outcome_legs: int
@@ -87,6 +89,7 @@ class ArbConfig:
     max_daily_loss: float
     max_consecutive_failures: int
     risk_event_cooldown_sec: float
+    risk_pending_reservation_ttl_sec: float
 
     # Telegram
     telegram_enabled: bool
@@ -195,6 +198,8 @@ class ArbConfig:
             raise ValueError("ORDERBOOK_RETRY_COUNT 不能为负数")
         if self.orderbook_retry_delay_sec < 0:
             raise ValueError("ORDERBOOK_RETRY_DELAY_SEC 不能为负数")
+        if self.orderbook_missing_cooldown_sec < 0:
+            raise ValueError("ORDERBOOK_MISSING_COOLDOWN_SEC 不能为负数")
         if self.max_multi_outcome_legs < 2:
             raise ValueError("ARB_MAX_MULTI_OUTCOME_LEGS 必须至少为 2")
         if self.max_open_positions <= 0:
@@ -205,6 +210,8 @@ class ArbConfig:
             raise ValueError("RISK_MAX_DAILY_LOSS 和 AI_MAX_COST_PER_DAY 不能为负数")
         if self.risk_event_cooldown_sec < 0:
             raise ValueError("RISK_EVENT_COOLDOWN_SEC 不能为负数")
+        if self.risk_pending_reservation_ttl_sec < 0:
+            raise ValueError("RISK_PENDING_RESERVATION_TTL_SEC 不能为负数")
         if self.data_cleanup_enabled and self.data_cleanup_interval_sec <= 0:
             raise ValueError("DATA_CLEANUP_INTERVAL_SEC 必须大于 0")
         if min(
@@ -279,6 +286,8 @@ class ArbConfig:
             orderbook_snapshot_ttl_sec=_env_float("ORDERBOOK_SNAPSHOT_TTL_SEC", 0.5),
             orderbook_retry_count=_env_int("ORDERBOOK_RETRY_COUNT", 2),
             orderbook_retry_delay_sec=_env_float("ORDERBOOK_RETRY_DELAY_SEC", 0.15),
+            orderbook_missing_cooldown_sec=_env_float("ORDERBOOK_MISSING_COOLDOWN_SEC", 300.0),
+            cross_platform_pairs_json=_env("CROSS_PLATFORM_PAIRS_JSON", ""),
             polymarket_taker_fee_rate=_env_float("POLYMARKET_TAKER_FEE_RATE", 0.02),
             kalshi_taker_fee_rate=_env_float("KALSHI_TAKER_FEE_RATE", 0.003),
             max_multi_outcome_legs=_env_int("ARB_MAX_MULTI_OUTCOME_LEGS", 20),
@@ -288,6 +297,7 @@ class ArbConfig:
             max_daily_loss=_env_float("RISK_MAX_DAILY_LOSS", 50.0),
             max_consecutive_failures=_env_int("RISK_MAX_CONSECUTIVE_FAILURES", 5),
             risk_event_cooldown_sec=_env_float("RISK_EVENT_COOLDOWN_SEC", 60.0),
+            risk_pending_reservation_ttl_sec=_env_float("RISK_PENDING_RESERVATION_TTL_SEC", 30.0),
             telegram_enabled=_env_bool("TELEGRAM_ENABLED", False),
             telegram_bot_token=_env("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=_env("TELEGRAM_CHAT_ID"),

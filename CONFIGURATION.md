@@ -124,6 +124,8 @@ Polymarket 由三套独立 API 组成：
 | `ARB_DRY_RUN` | bool | `true` | `true` = 只扫描不交易。**强烈建议初次运行使用** |
 | `ARB_MIN_LIQUIDITY` | float | `1000` | 最小市场流动性（USDC），低于此值的市场被跳过 |
 | `ARB_MIN_VOLUME_24H` | float | `500` | 最小 24h 交易量（USDC），低于此值的市场被跳过 |
+| `ORDERBOOK_MISSING_COOLDOWN_SEC` | float | `300` | 当 CLOB 返回 `No orderbook exists` 时，对该 token 的冷却时间（秒），避免持续重复请求同一无盘口 token |
+| `CROSS_PLATFORM_PAIRS_JSON` | str | *(空)* | T1 跨平台套利事件配对表，JSON 数组格式。为空时不启用跨平台扫描 |
 
 **利润计算公式（T0 结构性套利）：**
 
@@ -143,14 +145,20 @@ Polymarket 由三套独立 API 组成：
 | `RISK_MAX_TOTAL_EXPOSURE` | float | `500.0` | 全局最大敞口（USDC）。所有持仓总成本上限 |
 | `RISK_MAX_DAILY_LOSS` | float | `50.0` | 日亏损止损线（USDC）。触发后暂停全部交易，UTC 0:00 重置 |
 | `RISK_MAX_CONSECUTIVE_FAILURES` | int | `5` | 连续执行失败次数。达到上限触发熔断，需手动解除 |
+| `RISK_PENDING_RESERVATION_TTL_SEC` | float | `30` | `PENDING` 订单预留敞口的保留时间。到期后若仍未确认成交，会自动释放预留敞口 |
 
-**额外的内置风控规则（不可配置）：**
+**额外的内置风控规则：**
 
 | 规则 | 值 | 说明 |
 |------|-----|------|
 | 市场冷却 | 60 秒 | 同一 `event_id` 60 秒内不重复执行 |
 | 腿失败回滚 | 自动 | 多腿套利中任一腿失败，尝试撤销已提交的腿 |
 | API 连续错误暂停 | 10 次后暂停 60s | 连续 10 次 API 请求异常后休眠 60 秒 |
+
+补充说明：
+
+- `RISK_PENDING_RESERVATION_TTL_SEC` 主要影响 `PENDING` 订单的预留敞口，不影响已经确认 `FILLED/PARTIAL` 的真实敞口。
+- 如果你的真实订单类型可能长时间停留在 `PENDING`，建议把它调高到 `120-300` 秒；如果长期只用 `FOK/FAK`，保持默认值通常即可。
 
 ### Telegram 通知
 
@@ -263,6 +271,12 @@ FastAPI 后端 + HTML 前端，只读访问，绑定 `127.0.0.1`。
 |----------|------|--------|------|
 | `LOG_LEVEL` | str | `INFO` | 日志级别：`DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `LOG_FILE` | str | `arb_bot.log` | 日志文件路径。控制台和文件双输出 |
+
+补充说明：
+
+- `httpx` / `urllib3` / `requests` 的请求级日志会自动压到 `WARNING`，避免服务器长期运行时主日志被 HTTP 明细淹没。
+- 每次进程启动都会生成一个 `run_id` 并写入启动日志和 telemetry；如果某个 `run_id` 只有 `startup` 没有 `shutdown`，通常表示进程异常退出或被外部直接重启。
+- 主循环现在会把 T1/T2/T3 的信号写入 `data/telemetry/*.strategy_signals.ndjson`，便于区分“没有 T0 套利”和“策略本身没有任何信号”。
 
 ### AI 决策引擎
 

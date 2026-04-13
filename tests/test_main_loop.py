@@ -5,9 +5,15 @@ import time
 
 from polymarket_arb.dashboard_api import _enrich_ai_decision
 from polymarket_arb.main_loop import (
+    _collect_cross_platform_strategy_signals,
+    _collect_maker_strategy_signals,
+    _collect_statistical_strategy_signals,
     _estimate_ai_trade_outcome,
+    _build_run_instance_id,
     _focus_keywords,
+    _find_pending_signal,
     _find_pending_signal_overlay,
+    _serialize_strategy_signal,
     _build_ws_status,
     _create_research_signal_service,
     _is_live_execution_success,
@@ -22,6 +28,9 @@ from polymarket_arb.main_loop import (
 )
 from polymarket_arb.book_store import EnhancedBookStore
 from polymarket_arb.models import EventInfo, MarketInfo, OrderBookLevel, OrderSide, TokenInfo, TradeRecord, TradeStatus
+from polymarket_arb.strategies.cross_platform import CrossPlatformOpportunity, CrossPlatformPair
+from polymarket_arb.strategies.maker_strategy import MakerStrategy
+from polymarket_arb.strategies.statistical_model import StatisticalMispricingDetector
 from polymarket_arb.strategies.strategy_orchestrator import StrategyOrchestrator, StrategySignal, StrategyTier
 from polymarket_arb.tick_recorder import TickRecorder
 from polymarket_arb.dashboard_api import DashboardState
@@ -391,6 +400,15 @@ def test_focus_keywords_parsing_and_matching():
     assert _matches_focus("federal reserve decision", keywords) is False
 
 
+def test_matches_focus_does_not_match_partial_word_fragments():
+    keywords = _focus_keywords("eth,sol,arb")
+
+    assert _matches_focus("Will ETH be above 3000 by Friday?", keywords) is True
+    assert _matches_focus("Will Solana ETF launch this year?", keywords) is True
+    assert _matches_focus("Will Netherlands win the 2026 FIFA World Cup?", keywords) is False
+    assert _matches_focus("Which Caribbean team advances?", keywords) is False
+
+
 def test_select_scan_candidates_can_filter_by_focus_keywords():
     markets = [
         MarketInfo(condition_id="c1", question="Will BTC hit 120k?", slug="btc-120k", tokens=[TokenInfo("t1", "Yes"), TokenInfo("t2", "No")], volume_24h=1000, liquidity=1000),
@@ -415,3 +433,246 @@ def test_select_event_candidates_can_filter_by_focus_keywords():
 
 def test_telemetry_heartbeat_constant_is_one_minute():
     assert _TELEMETRY_HEARTBEAT_SEC == 60.0
+
+
+def test_build_run_instance_id_includes_pid_and_timestamp(monkeypatch):
+    monkeypatch.setattr("polymarket_arb.main_loop.os.getpid", lambda: 4321)
+
+    run_id = _build_run_instance_id(now_ts=1_776_054_476.0)
+
+    assert run_id.startswith("run-4321-")
+    assert " " not in run_id
+
+
+def test_collect_statistical_strategy_signals_scan_multiple_candidate_markets():
+    markets = [
+        MarketInfo(
+            condition_id="cond-1",
+            question="Will BTC rise?",
+            slug="btc-rise",
+            tokens=[TokenInfo("yes-1", "Yes"), TokenInfo("no-1", "No")],
+        ),
+        MarketInfo(
+            condition_id="cond-2",
+            question="Will ETH rise?",
+            slug="eth-rise",
+            tokens=[TokenInfo("yes-2", "Yes"), TokenInfo("no-2", "No")],
+        ),
+    ]
+
+    class _StubOrderBookAnalyzer:
+        def __init__(self, snapshots):
+            self.snapshots = snapshots
+
+        def get_snapshot(self, token_id):
+            return self.snapshots.get(token_id)
+
+    class _Snapshot:
+        def __init__(self, best_bid, best_ask, bid_size, ask_size, tick_size=0.01):
+            self.best_bid = best_bid
+            self.best_ask = best_ask
+            self.tick_size = tick_size
+            self.bids = [type("Level", (), {"price": best_bid, "size": bid_size})()]
+            self.asks = [type("Level", (), {"price": best_ask, "size": ask_size})()]
+
+        @property
+        def mid(self):
+            return (self.best_bid + self.best_ask) / 2.0
+
+        @property
+        def best_bid_size(self):
+            return self.bids[0].size
+
+        @property
+        def best_ask_size(self):
+            return self.asks[0].size
+
+    ob_analyzer = _StubOrderBookAnalyzer(
+        {
+            "yes-1": _Snapshot(0.38, 0.42, 900, 100),
+            "yes-2": _Snapshot(0.49, 0.50, 200, 200),
+        }
+    )
+    detector = StatisticalMispricingDetector(min_deviation=0.005, min_confidence=0.1)
+
+    signals = _collect_statistical_strategy_signals(
+        config=make_test_config(default_order_size_usdc=7.5),
+        candidate_markets=markets,
+        ob_analyzer=ob_analyzer,
+        detector=detector,
+    )
+
+    assert len(signals) == 1
+    assert signals[0].tier == StrategyTier.STATISTICAL_ARB
+    assert signals[0].signal_type == "statistical_buy_yes"
+    assert signals[0].market_id == "cond-1"
+    assert signals[0].recommended_size_usdc == 7.5
+    assert signals[0].expected_edge > 0
+
+
+def test_collect_maker_strategy_signals_use_snapshot_tick_size():
+    class _Snapshot:
+        def __init__(self, best_bid, best_ask, bid_size, ask_size, tick_size):
+            self.best_bid = best_bid
+            self.best_ask = best_ask
+            self.tick_size = tick_size
+            self.bids = [type("Level", (), {"price": best_bid, "size": bid_size})()]
+            self.asks = [type("Level", (), {"price": best_ask, "size": ask_size})()]
+
+        @property
+        def mid(self):
+            return (self.best_bid + self.best_ask) / 2.0
+
+    class _StubOrderBookAnalyzer:
+        def __init__(self, snapshots):
+            self.snapshots = snapshots
+
+        def get_snapshot(self, token_id):
+            return self.snapshots.get(token_id)
+
+    markets = [
+        MarketInfo(
+            condition_id="cond-1",
+            question="Will BTC rise?",
+            slug="btc-rise",
+            tokens=[TokenInfo("yes-1", "Yes"), TokenInfo("no-1", "No")],
+        )
+    ]
+    ob_analyzer = _StubOrderBookAnalyzer({"yes-1": _Snapshot(0.48, 0.50, 500, 500, 0.01)})
+    fair_values = {"cond-1": 0.55}
+
+    signals = _collect_maker_strategy_signals(
+        candidate_markets=markets,
+        ob_analyzer=ob_analyzer,
+        maker_strategy=MakerStrategy(default_size=12.0),
+        fair_values_by_market=fair_values,
+    )
+
+    assert len(signals) == 1
+    signal = signals[0]
+    assert signal.tier == StrategyTier.MARKET_MAKING
+    assert signal.signal_type == "maker_quote"
+    assert signal.payload["quote"]["bid_price"] == 0.53
+    assert signal.payload["quote"]["ask_price"] == 0.58
+    assert signal.recommended_size_usdc == 12.0
+
+
+def test_collect_maker_strategy_signals_can_compute_fair_value_without_t2_signal():
+    class _Snapshot:
+        def __init__(self, best_bid, best_ask, bid_size, ask_size, tick_size):
+            self.best_bid = best_bid
+            self.best_ask = best_ask
+            self.tick_size = tick_size
+            self.bids = [type("Level", (), {"price": best_bid, "size": bid_size})()]
+            self.asks = [type("Level", (), {"price": best_ask, "size": ask_size})()]
+
+        @property
+        def mid(self):
+            return (self.best_bid + self.best_ask) / 2.0
+
+    class _StubOrderBookAnalyzer:
+        def __init__(self, snapshots):
+            self.snapshots = snapshots
+
+        def get_snapshot(self, token_id):
+            return self.snapshots.get(token_id)
+
+    markets = [
+        MarketInfo(
+            condition_id="cond-1",
+            question="Will BTC rise?",
+            slug="btc-rise",
+            tokens=[TokenInfo("yes-1", "Yes"), TokenInfo("no-1", "No")],
+        )
+    ]
+    ob_analyzer = _StubOrderBookAnalyzer({"yes-1": _Snapshot(0.48, 0.50, 900, 100, 0.01)})
+
+    signals = _collect_maker_strategy_signals(
+        candidate_markets=markets,
+        ob_analyzer=ob_analyzer,
+        maker_strategy=MakerStrategy(default_size=12.0),
+        fair_values_by_market={},
+        detector=StatisticalMispricingDetector(min_deviation=0.5, min_confidence=0.9),
+    )
+
+    assert len(signals) == 1
+    assert signals[0].market_id == "cond-1"
+
+
+def test_collect_cross_platform_strategy_signals_maps_opportunities():
+    class _StubScanner:
+        def scan(self):
+            pair = CrossPlatformPair(
+                pair_id="pair-1",
+                event_description="BTC vs Kalshi",
+                polymarket_condition_id="cond-poly",
+                polymarket_token_id_yes="yes-token",
+                polymarket_slug="btc",
+                kalshi_ticker="KXBTC-YES",
+                kalshi_event_ticker="KXBTC",
+            )
+            return [
+                CrossPlatformOpportunity(
+                    pair=pair,
+                    direction="poly_yes_kalshi_no",
+                    poly_cost=0.41,
+                    kalshi_cost=0.46,
+                    total_cost=0.87,
+                    gross_edge=0.13,
+                    net_edge=0.12,
+                    edge_pct=13.79,
+                    confidence=0.91,
+                )
+            ]
+
+    signals = _collect_cross_platform_strategy_signals(
+        config=make_test_config(default_order_size_usdc=9.0),
+        scanner=_StubScanner(),
+    )
+
+    assert len(signals) == 1
+    assert signals[0].tier == StrategyTier.CROSS_PLATFORM
+    assert signals[0].signal_type == "cross_platform_poly_yes_kalshi_no"
+    assert signals[0].market_id == "cond-poly"
+    assert signals[0].recommended_size_usdc == 9.0
+
+
+def test_serialize_strategy_signal_uses_overlay_adjusted_pending_signal():
+    orchestrator = StrategyOrchestrator(total_bankroll=1000)
+    market = MarketInfo(
+        condition_id="cond-1234567890abcdef",
+        question="Will BTC break 100k before June?",
+        slug="btc-100k",
+        tokens=[TokenInfo(token_id="yes", outcome="Yes"), TokenInfo(token_id="no", outcome="No")],
+        event_id="event-1",
+        raw={
+            "research_signals": [{
+                "topic_id": "event:event-1",
+                "event_candidates": ["event-1"],
+                "summary": "BTC momentum remains strong",
+                "sources": ["google_news_rss"],
+                "confidence": 0.72,
+                "freshness_sec": 60.0,
+                "stance": "bullish",
+            }]
+        },
+    )
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id="cond-12345678",
+        description="signal",
+        expected_edge=80.0,
+        confidence=0.60,
+        recommended_size_usdc=100.0,
+    )
+
+    submitted = orchestrator.submit_signal(signal, active_markets=[market], research_report=None, research_signals=[])
+    pending = _find_pending_signal(orchestrator, signal)
+
+    payload = _serialize_strategy_signal(pending, submitted=submitted, research_overlay=_find_pending_signal_overlay(orchestrator, signal))
+
+    assert submitted is True
+    assert pending is not None
+    assert payload["confidence"] > 0.60
+    assert payload["recommended_size_usdc"] > 100.0

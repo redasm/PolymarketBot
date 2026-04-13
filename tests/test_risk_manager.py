@@ -131,7 +131,7 @@ def test_pending_reservation_expires_and_releases_exposure(monkeypatch):
     monkeypatch.setattr(
         risk_manager_module.time,
         "time",
-        lambda: base_time + risk_manager_module._PENDING_RESERVATION_TTL_SEC + 1,
+        lambda: base_time + mgr._pending_reservation_ttl_sec + 1,
     )
     state = mgr.state
 
@@ -166,12 +166,49 @@ def test_partial_fill_exposure_is_not_released_by_pending_ttl(monkeypatch):
     monkeypatch.setattr(
         risk_manager_module.time,
         "time",
-        lambda: base_time + risk_manager_module._PENDING_RESERVATION_TTL_SEC + 1,
+        lambda: base_time + mgr._pending_reservation_ttl_sec + 1,
     )
     state = mgr.state
 
     assert state.total_exposure == 0.45 * 2
     assert state.open_positions == 1
+
+
+def test_partial_fill_without_fill_size_does_not_assume_requested_size():
+    mgr = RiskManager(make_test_config())
+    opp = _make_opp()
+    trades = [
+        TradeRecord(
+            "t1",
+            "a1",
+            "yes",
+            "c1",
+            OrderSide.BUY,
+            0.45,
+            5,
+            status=TradeStatus.PARTIAL,
+            economic_cost=0.45,
+            fill_size=None,
+        ),
+    ]
+
+    mgr.record_execution(opp, trades)
+
+    assert mgr.state.total_exposure == 0.0
+    assert mgr.state.open_positions == 0
+
+
+def test_full_success_daily_pnl_uses_fill_size_when_present():
+    mgr = RiskManager(make_test_config())
+    opp = _make_opp()
+    trades = [
+        TradeRecord("t1", "a1", "yes", "c1", OrderSide.BUY, 0.45, 5, status=TradeStatus.FILLED, economic_cost=0.45, fill_size=2),
+        TradeRecord("t2", "a1", "no", "c1", OrderSide.BUY, 0.50, 5, status=TradeStatus.FILLED, economic_cost=0.50, fill_size=3),
+    ]
+
+    mgr.record_execution(opp, trades)
+
+    assert mgr.state.daily_pnl == opp.net_edge * 2
 
 
 def test_partial_or_pending_execution_counts_as_failure():
@@ -204,6 +241,23 @@ def test_event_cooldown_uses_configured_duration(monkeypatch):
 
     assert can_trade is True
     assert reason == ""
+
+
+def test_pending_reservation_ttl_uses_configured_duration(monkeypatch):
+    base_time = 1_000.0
+    monkeypatch.setattr(risk_manager_module.time, "time", lambda: base_time)
+    mgr = RiskManager(make_test_config(risk_pending_reservation_ttl_sec=300.0))
+    opp = _make_opp()
+    trades = [
+        TradeRecord("t1", "a1", "yes", "c1", OrderSide.BUY, 0.45, 5, status=TradeStatus.PENDING, economic_cost=0.45),
+    ]
+
+    mgr.record_execution(opp, trades)
+
+    monkeypatch.setattr(risk_manager_module.time, "time", lambda: base_time + 31.0)
+    state = mgr.state
+
+    assert state.total_exposure == 0.45 * 5
 
 
 def test_pre_trade_check_uses_leg_exposure_per_market_in_multi_outcome():

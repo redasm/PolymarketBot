@@ -143,7 +143,7 @@ class ArbitrageDetector:
             LOG.debug("跳过非互斥时间梯事件: %s", event.title)
             return None
         if len(active_markets) > self._config.max_multi_outcome_legs:
-            LOG.info(
+            LOG.debug(
                 "跳过超多腿多结果事件: %s, markets=%d > limit=%d",
                 event.title,
                 len(active_markets),

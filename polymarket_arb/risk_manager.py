@@ -23,7 +23,6 @@ from polymarket_arb.models import (
 )
 
 LOG = logging.getLogger(__name__)
-_PENDING_RESERVATION_TTL_SEC = 30.0
 
 
 class RiskManager:
@@ -38,6 +37,7 @@ class RiskManager:
         self._daily_reset_ts: float = _start_of_day()
         self._effective_max_total_exposure = config.max_total_exposure
         self._effective_max_daily_loss = config.max_daily_loss
+        self._pending_reservation_ttl_sec = config.risk_pending_reservation_ttl_sec
 
     @property
     def state(self) -> RiskState:
@@ -135,7 +135,7 @@ class RiskManager:
 
         actual_cost = sum(
             (t.economic_cost if t.economic_cost is not None else t.price)
-            * (t.fill_size if t.fill_size is not None else t.size)
+            * _resolved_exposure_size(t)
             for t in actual_exposure_trades
         )
         pending_cost = sum(
@@ -147,7 +147,7 @@ class RiskManager:
         for t in actual_exposure_trades:
             cid = t.condition_id
             leg_cost = t.economic_cost if t.economic_cost is not None else t.price
-            exposure_size = t.fill_size if t.fill_size is not None else t.size
+            exposure_size = _resolved_exposure_size(t)
             exposure = leg_cost * exposure_size
             self._market_exposure[cid] = self._market_exposure.get(cid, 0.0) + exposure
 
@@ -169,7 +169,7 @@ class RiskManager:
             self._recent_arb_markets[opp.event_id] = time.time()
 
         if execution_success and filled_trades:
-            expected_profit = opp.net_edge * min(t.size for t in filled_trades)
+            expected_profit = opp.net_edge * min(_resolved_execution_size(t) for t in filled_trades)
             self._state.daily_pnl += expected_profit
 
         LOG.info(
@@ -244,7 +244,7 @@ class RiskManager:
         now = time.time()
         expired_keys = [
             key for key, (_, _, created_ts) in self._pending_reservations.items()
-            if now - created_ts >= _PENDING_RESERVATION_TTL_SEC
+            if now - created_ts >= self._pending_reservation_ttl_sec
         ]
         for key in expired_keys:
             condition_id, exposure, _ = self._pending_reservations.pop(key)
@@ -279,3 +279,15 @@ def _start_of_day() -> float:
     now = datetime.datetime.now(datetime.timezone.utc)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return start.timestamp()
+
+
+def _resolved_execution_size(trade: TradeRecord) -> float:
+    if trade.fill_size is not None:
+        return float(trade.fill_size)
+    if trade.status == TradeStatus.FILLED:
+        return float(trade.size)
+    return 0.0
+
+
+def _resolved_exposure_size(trade: TradeRecord) -> float:
+    return _resolved_execution_size(trade)

@@ -233,13 +233,13 @@ class CrossPlatformScanner:
         kalshi_fee_rate = DEFAULT_KALSHI_FEE_RATE
 
         cost_a = pair.poly_yes_price + pair.kalshi_no_price
-        cost_b = (1.0 - pair.poly_no_price) + pair.kalshi_yes_price
+        cost_b = pair.poly_no_price + pair.kalshi_yes_price
 
         for direction, cost in [("poly_yes_kalshi_no", cost_a), ("poly_no_kalshi_yes", cost_b)]:
             if cost <= 0 or cost >= 1.0:
                 continue
 
-            poly_cost = pair.poly_yes_price if "poly_yes" in direction else (1.0 - pair.poly_no_price)
+            poly_cost = pair.poly_yes_price if "poly_yes" in direction else pair.poly_no_price
             kalshi_cost = pair.kalshi_no_price if "kalshi_no" in direction else pair.kalshi_yes_price
             gross = 1.0 - cost
             fee = (poly_fee_rate * poly_cost) + (kalshi_fee_rate * kalshi_cost)
