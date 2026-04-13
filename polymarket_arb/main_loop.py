@@ -871,15 +871,15 @@ def main(dotenv_path: str | None = None) -> None:
         strategy_signals.extend(maker_signals)
 
         active_markets_for_overlay = universe_markets if universe_markets else scanned_markets
-        for signal in strategy_signals:
+        for strategy_signal in strategy_signals:
             submitted = orchestrator.submit_signal(
-                signal,
+                strategy_signal,
                 active_markets=active_markets_for_overlay,
                 research_report=research_report,
                 research_signals=research_signals,
             )
-            signal_for_record = _find_pending_signal(orchestrator, signal) or signal
-            overlay_payload = _find_pending_signal_overlay(orchestrator, signal)
+            signal_for_record = _find_pending_signal(orchestrator, strategy_signal) or strategy_signal
+            overlay_payload = _find_pending_signal_overlay(orchestrator, strategy_signal)
             dash_state.append_opportunity({
                 "arb_type": signal_for_record.signal_type,
                 "event_title": signal_for_record.description,
@@ -899,8 +899,8 @@ def main(dotenv_path: str | None = None) -> None:
                     _serialize_strategy_signal(signal_for_record, submitted=submitted, research_overlay=overlay_payload),
                 )
 
-        for signal in orchestrator.process_signals():
-            orchestrator.record_processed(signal)
+        for processed_signal in orchestrator.process_signals():
+            orchestrator.record_processed(processed_signal)
 
         for opp in opportunities:
             if _SHUTDOWN_EVENT.is_set():

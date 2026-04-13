@@ -8,6 +8,7 @@ from polymarket_arb.main_loop import (
     _collect_cross_platform_strategy_signals,
     _collect_maker_strategy_signals,
     _collect_statistical_strategy_signals,
+    main,
     _estimate_ai_trade_outcome,
     _build_run_instance_id,
     _focus_keywords,
@@ -676,3 +677,7 @@ def test_serialize_strategy_signal_uses_overlay_adjusted_pending_signal():
     assert pending is not None
     assert payload["confidence"] > 0.60
     assert payload["recommended_size_usdc"] > 100.0
+
+
+def test_main_does_not_shadow_signal_module_name():
+    assert "signal" not in main.__code__.co_varnames
