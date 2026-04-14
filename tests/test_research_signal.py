@@ -7,7 +7,13 @@ import requests
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.models import MarketInfo, TokenInfo
 from research_signal.service import ResearchSignalService
-from research_signal.collectors.base import GenericRSSCollector, LocalKnowledgeBaseCollector, WebSearchCollector
+from research_signal.collectors.base import (
+    GenericHTTPJSONCollector,
+    GenericRSSCollector,
+    LocalKnowledgeBaseCollector,
+    SurfSignalCollector,
+    WebSearchCollector,
+)
 from research_signal.scorers.scoring import compute_confidence
 
 
@@ -104,6 +110,111 @@ def test_generic_rss_collector_parses_custom_feed(monkeypatch):
     assert len(rows) == 1
     assert rows[0]["source"] == "custom_rss"
     assert "BTC" in rows[0]["summary"]
+
+
+def test_generic_http_json_collector_parses_custom_api(monkeypatch):
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "articles": [
+                    {
+                        "headline": "BTC rallies on ETF demand",
+                        "url": "https://example.com/btc",
+                        "published_at": "2099-04-10T00:00:00Z",
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(requests, "get", lambda *args, **kwargs: _Resp())
+    collector = GenericHTTPJSONCollector(
+        sources=[
+            {
+                "name": "json_news",
+                "url": "https://example.com/news",
+                "items_path": "articles",
+                "summary_path": "headline",
+                "link_path": "url",
+                "published_path": "published_at",
+            }
+        ],
+        max_items_per_source=1,
+    )
+
+    rows = collector.collect(["Will BTC go up this week?"])
+
+    assert len(rows) == 1
+    assert rows[0]["source"] == "json_news"
+    assert "BTC" in rows[0]["summary"]
+    assert rows[0]["published_ts"] is not None
+
+
+def test_surf_signal_collector_parses_chat_completion(monkeypatch):
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "BTC sentiment remains constructive as flows and derivatives positioning stay supportive."
+                        }
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: _Resp())
+    collector = SurfSignalCollector(
+        enabled=True,
+        api_key="surf-key",
+        api_base="https://api.asksurf.ai/surf-ai",
+        model="surf-1.5-instant",
+        timeout_sec=5.0,
+    )
+
+    rows = collector.collect(["Will BTC go up this week?"])
+
+    assert len(rows) == 1
+    assert rows[0]["source"] == "surf_ai"
+    assert "BTC" in rows[0]["summary"]
+
+
+def test_surf_signal_collector_uses_cache(monkeypatch):
+    call_count = {"n": 0}
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            call_count["n"] += 1
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "BTC intelligence summary"
+                        }
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: _Resp())
+    collector = SurfSignalCollector(
+        enabled=True,
+        api_key="surf-key",
+        cache_ttl_sec=1800,
+    )
+
+    first = collector.collect(["Will BTC go up this week?"])
+    second = collector.collect(["Will BTC go up this week?"])
+
+    assert len(first) == 1
+    assert len(second) == 1
+    assert call_count["n"] == 1
 
 
 def test_local_knowledge_base_collector_matches_topic(tmp_path: Path):

@@ -12,9 +12,11 @@ from urllib.parse import urlparse
 
 from polymarket_arb.models import MarketInfo, ResearchSignal, ResearchSignalReport
 from research_signal.collectors.base import (
+    GenericHTTPJSONCollector,
     GenericRSSCollector,
     LocalKnowledgeBaseCollector,
     PolymarketEventCollector,
+    SurfSignalCollector,
     WebSearchCollector,
 )
 from research_signal.normalizers.topic import group_by_topic, normalize_topic, topic_overlap_score
@@ -31,6 +33,13 @@ class ResearchSignalService:
         cache_ttl_sec: int = 300,
         cache_dir: str = "data/research_signal",
         extra_rss_feeds: list[tuple[str, str]] | None = None,
+        http_json_sources: list[dict] | None = None,
+        surf_enabled: bool = False,
+        surf_api_key: str = "",
+        surf_api_base: str = "https://api.asksurf.ai/surf-ai",
+        surf_model: str = "surf-1.5-instant",
+        surf_timeout_sec: float = 8.0,
+        surf_cache_ttl_sec: float = 1800.0,
         knowledge_base_dir: str | None = None,
         knowledge_base_enabled: bool = False,
         knowledge_max_matches: int = 3,
@@ -41,6 +50,21 @@ class ResearchSignalService:
         self._event_collector = PolymarketEventCollector()
         self._web_collector = WebSearchCollector()
         self._generic_rss_collector = GenericRSSCollector(extra_rss_feeds or [])
+        self._http_json_collector = GenericHTTPJSONCollector(http_json_sources or [])
+        self._surf_collector = SurfSignalCollector(
+            enabled=surf_enabled,
+            api_key=surf_api_key,
+            api_base=surf_api_base,
+            model=surf_model,
+            timeout_sec=surf_timeout_sec,
+            cache_ttl_sec=surf_cache_ttl_sec,
+        )
+        if surf_enabled:
+            LOG.info(
+                "Surf collector enabled for research signals: model=%s ttl=%.0fs; first cache miss may add latency to report collection",
+                surf_model,
+                surf_cache_ttl_sec,
+            )
         self._knowledge_base_collector = (
             LocalKnowledgeBaseCollector(knowledge_base_dir or "", max_matches_per_topic=knowledge_max_matches)
             if knowledge_base_enabled and knowledge_base_dir
@@ -74,6 +98,8 @@ class ResearchSignalService:
         collected_rows = self._event_collector.collect(markets)
         collected_rows.extend(self._web_collector.collect(topics))
         collected_rows.extend(self._generic_rss_collector.collect(topics))
+        collected_rows.extend(self._http_json_collector.collect(topics))
+        collected_rows.extend(self._surf_collector.collect(topics))
         if self._knowledge_base_collector is not None:
             collected_rows.extend(self._knowledge_base_collector.collect(topics))
 

@@ -54,7 +54,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from polymarket_arb.models import OrderBookSnapshot
+from polymarket_arb.models import MarketInfo, OrderBookSnapshot
 
 LOG = logging.getLogger(__name__)
 
@@ -82,6 +82,7 @@ class TickRecorder:
         self._file = None
         self._bytes_written = 0
         self._tick_count = 0
+        self._token_metadata: dict[str, dict[str, str]] = {}
 
         if self._enabled:
             self._output_dir.mkdir(parents=True, exist_ok=True)
@@ -116,6 +117,7 @@ class TickRecorder:
         if mid is not None and snap.spread is not None and mid > 0:
             spread_bps = round((snap.spread / mid) * 10_000, 1)
 
+        metadata = dict(self._token_metadata.get(token_id, {}))
         record = {
             "ts_ms": ts_ms,
             "token_id": token_id,
@@ -129,6 +131,7 @@ class TickRecorder:
             "spread_bps": spread_bps,
             "bids_top3": bids_top3,
             "asks_top3": asks_top3,
+            **metadata,
         }
 
         self._write(record)
@@ -182,6 +185,22 @@ class TickRecorder:
         with self._lock:
             self._close_file()
         LOG.info("tick_recorder closed, total ticks recorded: %d", self._tick_count)
+
+    def register_markets(self, markets: list[MarketInfo]) -> None:
+        for market in markets:
+            for token in market.tokens:
+                outcome_role = (token.outcome or "").strip().lower()
+                if outcome_role not in {"yes", "no"}:
+                    outcome_role = outcome_role or "outcome"
+                self._token_metadata[token.token_id] = {
+                    "condition_id": market.condition_id,
+                    "event_id": market.event_id,
+                    "question": market.question,
+                    "slug": market.slug,
+                    "event_slug": market.event_slug,
+                    "event_title": getattr(market, "event_title", "") or "",
+                    "outcome_role": outcome_role,
+                }
 
     @property
     def tick_count(self) -> int:

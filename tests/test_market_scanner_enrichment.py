@@ -80,3 +80,29 @@ def test_market_scanner_enrichment_can_reuse_collected_report(monkeypatch):
 
     assert enriched[0].raw.get("research_signals")
     assert get_signals_called["value"] is False
+
+
+def test_market_scanner_enrichment_can_clear_stale_research_rows():
+    scanner = MarketScanner(make_test_config())
+    markets = [
+        MarketInfo(
+            condition_id="c1",
+            question="Will BTC go up this week?",
+            slug="btc-up",
+            tokens=[TokenInfo(token_id="t1", outcome="Yes")],
+            event_id="e1",
+            raw={"research_signals": [{"topic_id": "old"}]},
+        )
+    ]
+
+    dummy_service = SimpleNamespace(
+        attach_to_markets=lambda markets, signals: ResearchSignalService().attach_to_markets(markets, signals)
+    )
+
+    enriched = scanner.enrich_markets_with_research(
+        markets,
+        dummy_service,  # type: ignore[arg-type]
+        signals=[],
+    )
+
+    assert enriched[0].raw["research_signals"] == []

@@ -2,6 +2,7 @@
 
 import time
 
+from polymarket_arb.models import OrderBookLevel, OrderBookSnapshot
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
 
 
@@ -102,3 +103,259 @@ def test_get_snapshot_caches_missing_orderbook_failures_for_cooldown():
     time.sleep(0.01)
     assert analyzer.get_snapshot("another-token") is None
     assert client.calls == 2
+
+
+def test_get_snapshot_prefers_ws_mirror_before_rest():
+    class _Mirror:
+        def __init__(self, snap):
+            self._snap = snap
+
+        def get(self, token_id):
+            if token_id == self._snap.token_id:
+                return self._snap
+            return None
+
+    mirror_snap = OrderBookSnapshot(
+        token_id="ws-token",
+        best_bid=0.48,
+        best_ask=0.50,
+        bids=[OrderBookLevel(0.48, 20)],
+        asks=[OrderBookLevel(0.50, 25)],
+    )
+    client = _Client()
+    analyzer = OrderBookAnalyzer(client, snapshot_ttl_sec=0.0, live_mirror=_Mirror(mirror_snap))
+
+    snapshot = analyzer.get_snapshot("ws-token")
+
+    assert snapshot is mirror_snap
+    assert client.calls == 0
+
+
+def test_get_snapshot_does_not_apply_rest_ttl_to_recent_ws_snapshot():
+    class _Mirror:
+        def __init__(self, snap):
+            self._snap = snap
+
+        def get(self, token_id):
+            if token_id == self._snap.token_id:
+                return self._snap
+            return None
+
+    mirror_snap = OrderBookSnapshot(
+        token_id="ws-token",
+        best_bid=0.48,
+        best_ask=0.50,
+        bids=[OrderBookLevel(0.48, 20)],
+        asks=[OrderBookLevel(0.50, 25)],
+        timestamp=time.time() - 1.0,
+    )
+    client = _Client()
+    analyzer = OrderBookAnalyzer(
+        client,
+        snapshot_ttl_sec=0.1,
+        live_mirror=_Mirror(mirror_snap),
+        ws_snapshot_max_age_sec=5.0,
+    )
+
+    snapshot = analyzer.get_snapshot("ws-token")
+
+    assert snapshot is mirror_snap
+    assert client.calls == 0
+
+
+def test_stale_ws_snapshot_is_not_returned_via_cache_path():
+    class _Mirror:
+        def __init__(self, snap):
+            self._snap = snap
+
+        def get(self, token_id):
+            if token_id == self._snap.token_id:
+                return self._snap
+            return None
+
+    mirror_snap = OrderBookSnapshot(
+        token_id="ws-token",
+        best_bid=0.48,
+        best_ask=0.50,
+        bids=[OrderBookLevel(0.48, 20)],
+        asks=[OrderBookLevel(0.50, 25)],
+        timestamp=time.time() - 20.0,
+    )
+    client = _Client()
+    analyzer = OrderBookAnalyzer(
+        client,
+        snapshot_ttl_sec=60.0,
+        live_mirror=_Mirror(mirror_snap),
+        ws_snapshot_max_age_sec=5.0,
+    )
+
+    first = analyzer.get_snapshot("ws-token", allow_rest_fallback=False)
+    second = analyzer.get_snapshot("ws-token", allow_rest_fallback=False)
+
+    assert first is None
+    assert second is None
+    assert client.calls == 0
+
+
+def test_ws_snapshot_that_becomes_stale_is_not_returned_from_cache():
+    class _Mirror:
+        def __init__(self, snap):
+            self._snap = snap
+
+        def get(self, token_id):
+            if token_id == self._snap.token_id:
+                return self._snap
+            return None
+
+    mirror_snap = OrderBookSnapshot(
+        token_id="ws-token",
+        best_bid=0.48,
+        best_ask=0.50,
+        bids=[OrderBookLevel(0.48, 20)],
+        asks=[OrderBookLevel(0.50, 25)],
+        timestamp=time.time(),
+    )
+    client = _Client()
+    analyzer = OrderBookAnalyzer(
+        client,
+        snapshot_ttl_sec=60.0,
+        live_mirror=_Mirror(mirror_snap),
+        ws_snapshot_max_age_sec=5.0,
+    )
+
+    assert analyzer.get_snapshot("ws-token", allow_rest_fallback=False) is mirror_snap
+    mirror_snap.timestamp = time.time() - 20.0
+
+    snapshot = analyzer.get_snapshot("ws-token", allow_rest_fallback=False)
+
+    assert snapshot is None
+    assert client.calls == 0
+
+
+def test_batch_get_snapshots_only_hits_rest_for_tokens_missing_from_ws_and_cache():
+    class _Mirror:
+        def __init__(self, snapshots):
+            self._snapshots = snapshots
+
+        def get(self, token_id):
+            return self._snapshots.get(token_id)
+
+    mirror_snap = OrderBookSnapshot(
+        token_id="ws-token",
+        best_bid=0.40,
+        best_ask=0.42,
+        bids=[OrderBookLevel(0.40, 10)],
+        asks=[OrderBookLevel(0.42, 12)],
+    )
+    client = _Client()
+    analyzer = OrderBookAnalyzer(
+        client,
+        snapshot_ttl_sec=60.0,
+        live_mirror=_Mirror({"ws-token": mirror_snap}),
+    )
+    cached_snap = OrderBookSnapshot(
+        token_id="cached-token",
+        best_bid=0.51,
+        best_ask=0.53,
+        bids=[OrderBookLevel(0.51, 8)],
+        asks=[OrderBookLevel(0.53, 9)],
+    )
+    analyzer._set_cached_snapshot("cached-token", cached_snap, source="rest")
+
+    snapshots = analyzer.batch_get_snapshots(
+        ["ws-token", "cached-token", "rest-token", "rest-token"],
+        delay=0.0,
+    )
+
+    assert set(snapshots) == {"ws-token", "cached-token", "rest-token"}
+    assert snapshots["ws-token"] is mirror_snap
+    assert snapshots["cached-token"] is cached_snap
+    assert client.calls == 1
+
+
+def test_snapshot_stats_report_hit_mix_and_can_reset():
+    class _Mirror:
+        def __init__(self, snapshots):
+            self._snapshots = snapshots
+
+        def get(self, token_id):
+            return self._snapshots.get(token_id)
+
+    mirror_snap = OrderBookSnapshot(
+        token_id="ws-token",
+        best_bid=0.44,
+        best_ask=0.46,
+        bids=[OrderBookLevel(0.44, 10)],
+        asks=[OrderBookLevel(0.46, 10)],
+    )
+    client = _Client()
+    analyzer = OrderBookAnalyzer(
+        client,
+        snapshot_ttl_sec=60.0,
+        live_mirror=_Mirror({"ws-token": mirror_snap}),
+    )
+    cached_snap = OrderBookSnapshot(
+        token_id="cached-token",
+        best_bid=0.51,
+        best_ask=0.52,
+        bids=[OrderBookLevel(0.51, 5)],
+        asks=[OrderBookLevel(0.52, 6)],
+    )
+    analyzer._set_cached_snapshot("cached-token", cached_snap, source="rest")
+
+    assert analyzer.get_snapshot("ws-token") is mirror_snap
+    assert analyzer.get_snapshot("cached-token") is cached_snap
+    assert analyzer.get_snapshot("rest-token") is not None
+
+    stats = analyzer.snapshot_stats()
+
+    assert stats["ws_hit"] == 1
+    assert stats["cache_hit"] == 1
+    assert stats["rest_fallback"] == 1
+    assert stats["rest_success"] == 1
+    assert stats["rest_error"] == 0
+    assert stats["requests"] == 3
+
+    delta = analyzer.snapshot_stats(reset=True)
+    assert delta == stats
+    assert analyzer.snapshot_stats()["requests"] == 0
+
+
+def test_batch_get_snapshots_counts_logical_requests_once_per_token():
+    class _Mirror:
+        def __init__(self, snapshots):
+            self._snapshots = snapshots
+
+        def get(self, token_id):
+            return self._snapshots.get(token_id)
+
+    mirror_snap = OrderBookSnapshot(
+        token_id="ws-token",
+        best_bid=0.44,
+        best_ask=0.46,
+        bids=[OrderBookLevel(0.44, 10)],
+        asks=[OrderBookLevel(0.46, 10)],
+    )
+    client = _Client()
+    analyzer = OrderBookAnalyzer(
+        client,
+        snapshot_ttl_sec=60.0,
+        live_mirror=_Mirror({"ws-token": mirror_snap}),
+    )
+    analyzer._set_cached_snapshot("cached-token", OrderBookSnapshot(
+        token_id="cached-token",
+        best_bid=0.51,
+        best_ask=0.52,
+        bids=[OrderBookLevel(0.51, 5)],
+        asks=[OrderBookLevel(0.52, 6)],
+    ), source="rest")
+
+    snapshots = analyzer.batch_get_snapshots(
+        ["ws-token", "cached-token", "rest-token", "rest-token"],
+        delay=0.0,
+    )
+
+    assert set(snapshots) == {"ws-token", "cached-token", "rest-token"}
+    stats = analyzer.snapshot_stats()
+    assert stats["requests"] == 3
+    assert stats["rest_fallback"] == 1

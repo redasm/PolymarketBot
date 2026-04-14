@@ -1,13 +1,22 @@
 """main_loop 辅助逻辑测试：dry-run 不应算作真实执行成功."""
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 import time
 
 from polymarket_arb.dashboard_api import _enrich_ai_decision
+from polymarket_arb.market_scanner import MarketScanner
 from polymarket_arb.main_loop import (
+    _build_cycle_summary_payload,
+    _emit_cycle_metrics,
     _collect_cross_platform_strategy_signals,
     _collect_maker_strategy_signals,
+    _prime_candidate_orderbooks,
+    _advance_research_refresh,
+    _ResearchRefreshState,
     _collect_statistical_strategy_signals,
+    _evaluate_t2_market_quality,
     main,
     _estimate_ai_trade_outcome,
     _build_run_instance_id,
@@ -19,6 +28,7 @@ from polymarket_arb.main_loop import (
     _create_research_signal_service,
     _is_live_execution_success,
     _matches_focus,
+    _merge_focus_event_markets,
     _refresh_market_universe,
     _select_event_candidates,
     _select_scan_candidates,
@@ -28,13 +38,14 @@ from polymarket_arb.main_loop import (
     _start_ws_feed,
 )
 from polymarket_arb.book_store import EnhancedBookStore
-from polymarket_arb.models import EventInfo, MarketInfo, OrderBookLevel, OrderSide, TokenInfo, TradeRecord, TradeStatus
+from polymarket_arb.models import EventInfo, MarketInfo, OrderBookLevel, OrderSide, ResearchSignal, ResearchSignalReport, TokenInfo, TradeRecord, TradeStatus
 from polymarket_arb.strategies.cross_platform import CrossPlatformOpportunity, CrossPlatformPair
 from polymarket_arb.strategies.maker_strategy import MakerStrategy
 from polymarket_arb.strategies.statistical_model import StatisticalMispricingDetector
 from polymarket_arb.strategies.strategy_orchestrator import StrategyOrchestrator, StrategySignal, StrategyTier
 from polymarket_arb.tick_recorder import TickRecorder
 from polymarket_arb.dashboard_api import DashboardState
+from research_signal.service import ResearchSignalService
 
 from tests.test_execution_engine import _make_opp
 from tests.conftest import make_test_config
@@ -359,6 +370,59 @@ def test_select_event_candidates_prefers_high_volume_events():
     assert [event.event_id for event in selected] == ["e2"]
 
 
+def test_prime_candidate_orderbooks_dedupes_market_and_event_tokens():
+    markets = [
+        MarketInfo(
+            condition_id="cond-1",
+            question="Will BTC rise?",
+            slug="btc-rise",
+            tokens=[TokenInfo("yes-1", "Yes"), TokenInfo("no-1", "No")],
+        ),
+        MarketInfo(
+            condition_id="cond-2",
+            question="Will ETH rise?",
+            slug="eth-rise",
+            tokens=[TokenInfo("yes-2", "Yes"), TokenInfo("no-2", "No")],
+        ),
+    ]
+    events = [
+        EventInfo(
+            event_id="event-1",
+            slug="crypto-event",
+            title="Crypto event",
+            markets=[
+                markets[0],
+                MarketInfo(
+                    condition_id="cond-3",
+                    question="Will SOL rise?",
+                    slug="sol-rise",
+                    tokens=[TokenInfo("yes-3", "Yes"), TokenInfo("no-3", "No")],
+                ),
+            ],
+        )
+    ]
+
+    class _StubOrderBookAnalyzer:
+        def __init__(self):
+            self.calls = []
+
+        def batch_get_snapshots(self, token_ids, delay=0.0):
+            self.calls.append((list(token_ids), delay))
+            return {}
+
+    ob_analyzer = _StubOrderBookAnalyzer()
+
+    _prime_candidate_orderbooks(
+        candidate_markets=markets,
+        candidate_events=events,
+        ob_analyzer=ob_analyzer,
+    )
+
+    assert ob_analyzer.calls == [
+        (["yes-1", "no-1", "yes-2", "no-2", "yes-3", "no-3"], 0.0)
+    ]
+
+
 def test_refresh_market_universe_reuses_cache_before_interval():
     class _Scanner:
         def __init__(self):
@@ -408,12 +472,42 @@ def test_matches_focus_does_not_match_partial_word_fragments():
     assert _matches_focus("Will Solana ETF launch this year?", keywords) is True
     assert _matches_focus("Will Netherlands win the 2026 FIFA World Cup?", keywords) is False
     assert _matches_focus("Which Caribbean team advances?", keywords) is False
+    assert _matches_focus("Will Dominic Solanke score 20 goals this season?", keywords) is False
 
 
 def test_select_scan_candidates_can_filter_by_focus_keywords():
     markets = [
         MarketInfo(condition_id="c1", question="Will BTC hit 120k?", slug="btc-120k", tokens=[TokenInfo("t1", "Yes"), TokenInfo("t2", "No")], volume_24h=1000, liquidity=1000),
         MarketInfo(condition_id="c2", question="Will Fed cut rates?", slug="fed-rates", tokens=[TokenInfo("t3", "Yes"), TokenInfo("t4", "No")], volume_24h=2000, liquidity=2000),
+    ]
+
+    selected = _select_scan_candidates(markets, 10, focus_keywords=["btc"])
+
+    assert [market.condition_id for market in selected] == ["c1"]
+
+
+def test_select_scan_candidates_can_filter_by_inherited_event_metadata():
+    markets = [
+        MarketInfo(
+            condition_id="c1",
+            question="Will it happen by Friday?",
+            slug="happen-by-friday",
+            event_title="Bitcoin treasury event",
+            event_slug="bitcoin-treasury-event",
+            event_ticker="BTC-TREASURY",
+            tokens=[TokenInfo("t1", "Yes"), TokenInfo("t2", "No")],
+            volume_24h=1000,
+            liquidity=1000,
+        ),
+        MarketInfo(
+            condition_id="c2",
+            question="Will Fed cut rates?",
+            slug="fed-rates",
+            event_title="Fed event",
+            tokens=[TokenInfo("t3", "Yes"), TokenInfo("t4", "No")],
+            volume_24h=2000,
+            liquidity=2000,
+        ),
     ]
 
     selected = _select_scan_candidates(markets, 10, focus_keywords=["btc"])
@@ -432,6 +526,51 @@ def test_select_event_candidates_can_filter_by_focus_keywords():
     assert [event.event_id for event in selected] == ["e1"]
 
 
+def test_merge_focus_event_markets_adds_binary_markets_from_focus_events():
+    selected_markets = [
+        MarketInfo(
+            condition_id="c1",
+            question="Will BTC hit 120k?",
+            slug="btc-120k",
+            tokens=[TokenInfo("t1", "Yes"), TokenInfo("t2", "No")],
+            volume_24h=1000,
+            liquidity=1000,
+        )
+    ]
+    focus_events = [
+        EventInfo(
+            event_id="e1",
+            slug="bitcoin-event",
+            title="Bitcoin event",
+            markets=[
+                MarketInfo(
+                    condition_id="c2",
+                    question="Will it happen by Friday?",
+                    slug="happen-by-friday",
+                    tokens=[TokenInfo("t3", "Yes"), TokenInfo("t4", "No")],
+                    volume_24h=800,
+                    liquidity=900,
+                ),
+                MarketInfo(
+                    condition_id="c3",
+                    question="Will other outcome happen?",
+                    slug="other-outcome",
+                    tokens=[TokenInfo("t5", "Only")],
+                    volume_24h=900,
+                    liquidity=950,
+                ),
+            ],
+        )
+    ]
+
+    merged = _merge_focus_event_markets(selected_markets, focus_events, max_count=10)
+
+    assert [market.condition_id for market in merged] == ["c1", "c2"]
+    assert merged[1].event_id == "e1"
+    assert merged[1].event_slug == "bitcoin-event"
+    assert merged[1].event_title == "Bitcoin event"
+
+
 def test_telemetry_heartbeat_constant_is_one_minute():
     assert _TELEMETRY_HEARTBEAT_SEC == 60.0
 
@@ -443,6 +582,235 @@ def test_build_run_instance_id_includes_pid_and_timestamp(monkeypatch):
 
     assert run_id.startswith("run-4321-")
     assert " " not in run_id
+
+
+def test_build_cycle_summary_payload_includes_book_stats_and_timing():
+    payload = _build_cycle_summary_payload(
+        run_id="run-1",
+        cycle=12,
+        markets_scanned=6,
+        universe_market_count=195,
+        selected_event_count=4,
+        arbs_found_total=1,
+        arbs_executed_total=0,
+        ws_status={"connected": True, "subscribed_tokens": 12},
+        research_count=3,
+        daily_pnl=0.0,
+        open_positions=0,
+        focus_keywords=["btc"],
+        book_stats={
+            "requests": 20,
+            "ws_hit": 9,
+            "cache_hit": 7,
+            "rest_fallback": 4,
+            "rest_success": 3,
+            "rest_error": 1,
+            "missing_orderbook": 0,
+            "cooldown_skip": 0,
+        },
+        timing_stats={
+            "universe_refresh_sec": 1.2,
+            "prewarm_sec": 0.4,
+            "scan_cycle_sec": 2.3,
+            "strategy_sec": 0.8,
+            "total_cycle_sec": 5.1,
+        },
+    )
+
+    assert payload["event"] == "cycle_summary"
+    assert payload["book_stats"]["ws_hit"] == 9
+    assert payload["book_stats"]["rest_error"] == 1
+    assert payload["timing"]["prewarm_sec"] == 0.4
+    assert payload["timing"]["total_cycle_sec"] == 5.1
+    assert payload["cycle_status"] == "ok"
+
+
+def test_emit_cycle_metrics_writes_cycle_metrics_and_returns_payload():
+    class _StubAnalyzer:
+        def snapshot_stats(self, reset=False):
+            assert reset is True
+            return {
+                "requests": 8,
+                "ws_hit": 5,
+                "cache_hit": 2,
+                "rest_fallback": 1,
+                "rest_success": 1,
+                "rest_error": 0,
+                "missing_orderbook": 0,
+                "cooldown_skip": 0,
+            }
+
+    class _StubRecorder:
+        def __init__(self):
+            self.is_enabled = True
+            self.events = []
+
+        def write_event(self, category, payload):
+            self.events.append((category, payload))
+
+    recorder = _StubRecorder()
+    payload = _emit_cycle_metrics(
+        event_recorder=recorder,
+        ob_analyzer=_StubAnalyzer(),
+        cycle_perf_start=time.perf_counter() - 0.25,
+        cycle_timing={"scan_cycle_sec": 0.2},
+        run_id="run-1",
+        cycle=9,
+        markets_scanned=6,
+        universe_market_count=195,
+        selected_event_count=4,
+        arbs_found_total=0,
+        arbs_executed_total=0,
+        ws_status={"connected": True, "subscribed_tokens": 12},
+        research_count=1,
+        daily_pnl=0.0,
+        open_positions=0,
+        focus_keywords=["btc"],
+    )
+
+    assert payload["book_stats"]["ws_hit"] == 5
+    assert payload["timing"]["total_cycle_sec"] >= 0.2
+    assert payload["cycle_status"] == "ok"
+    assert recorder.events == [("cycle_metrics", payload)]
+
+
+def test_emit_cycle_metrics_can_mark_error_cycles():
+    class _StubAnalyzer:
+        def snapshot_stats(self, reset=False):
+            assert reset is True
+            return {
+                "requests": 1,
+                "ws_hit": 0,
+                "cache_hit": 0,
+                "rest_fallback": 1,
+                "rest_success": 0,
+                "rest_error": 1,
+                "missing_orderbook": 0,
+                "cooldown_skip": 0,
+            }
+
+    class _StubRecorder:
+        def __init__(self):
+            self.is_enabled = True
+            self.events = []
+
+        def write_event(self, category, payload):
+            self.events.append((category, payload))
+
+    recorder = _StubRecorder()
+    payload = _emit_cycle_metrics(
+        event_recorder=recorder,
+        ob_analyzer=_StubAnalyzer(),
+        cycle_perf_start=time.perf_counter() - 0.1,
+        cycle_timing={"scan_cycle_sec": 0.05},
+        run_id="run-err",
+        cycle=2,
+        markets_scanned=0,
+        universe_market_count=10,
+        selected_event_count=0,
+        arbs_found_total=0,
+        arbs_executed_total=0,
+        ws_status={"connected": False, "subscribed_tokens": 0},
+        research_count=0,
+        daily_pnl=0.0,
+        open_positions=0,
+        focus_keywords=[],
+        cycle_status="error",
+    )
+
+    assert payload["cycle_status"] == "error"
+    assert recorder.events == [("cycle_metrics", payload)]
+
+
+def test_advance_research_refresh_is_non_blocking_and_reuses_completed_report():
+    class _SlowService:
+        def collect_report(self, markets, window_sec):
+            time.sleep(0.15)
+            return ResearchSignalReport(
+                generated_at=time.time(),
+                window_sec=window_sec,
+                market_count=len(markets),
+                row_count=1,
+                topic_count=1,
+                signals=[
+                    ResearchSignal(
+                        topic_id="event:e1",
+                        summary="BTC signal",
+                        sources=["test"],
+                        confidence=0.8,
+                    )
+                ],
+            )
+
+    markets = [
+        MarketInfo(
+            condition_id="c1",
+            question="Will BTC go up this week?",
+            slug="btc-up",
+            tokens=[TokenInfo("yes", "Yes"), TokenInfo("no", "No")],
+            event_id="e1",
+        )
+    ]
+    state = _ResearchRefreshState()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        start = time.perf_counter()
+        report = _advance_research_refresh(
+            research_signal_service=_SlowService(),
+            research_executor=executor,
+            state=state,
+            universe_markets=markets,
+            scanned_markets=[],
+            max_items=5,
+            window_sec=86400,
+            refresh_interval_sec=300.0,
+            now_ts=1.0,
+        )
+        elapsed = time.perf_counter() - start
+
+        assert report is None
+        assert state.pending_future is not None
+        assert elapsed < 0.1
+
+        state.pending_future.result(timeout=1.0)
+        report = _advance_research_refresh(
+            research_signal_service=_SlowService(),
+            research_executor=executor,
+            state=state,
+            universe_markets=markets,
+            scanned_markets=[],
+            max_items=5,
+            window_sec=86400,
+            refresh_interval_sec=300.0,
+            now_ts=2.0,
+        )
+
+    assert report is not None
+    assert report.signals[0].summary == "BTC signal"
+
+
+def test_research_stale_rows_are_cleared_when_no_fresh_report_is_available():
+    scanner = MarketScanner(make_test_config())
+    markets = [
+        MarketInfo(
+            condition_id="c1",
+            question="Will BTC go up this week?",
+            slug="btc-up",
+            tokens=[TokenInfo("yes", "Yes"), TokenInfo("no", "No")],
+            event_id="e1",
+            raw={"research_signals": [{"topic_id": "stale-topic"}]},
+        )
+    ]
+
+    scanner.enrich_markets_with_research(
+        markets,
+        SimpleNamespace(
+            attach_to_markets=lambda markets, signals: ResearchSignalService().attach_to_markets(markets, signals)
+        ),  # type: ignore[arg-type]
+        signals=[],
+    )
+
+    assert markets[0].raw["research_signals"] == []
 
 
 def test_collect_statistical_strategy_signals_scan_multiple_candidate_markets():
@@ -490,8 +858,10 @@ def test_collect_statistical_strategy_signals_scan_multiple_candidate_markets():
 
     ob_analyzer = _StubOrderBookAnalyzer(
         {
-            "yes-1": _Snapshot(0.38, 0.42, 900, 100),
+            "yes-1": _Snapshot(0.399, 0.401, 900, 100),
+            "no-1": _Snapshot(0.599, 0.601, 100, 900),
             "yes-2": _Snapshot(0.49, 0.50, 200, 200),
+            "no-2": _Snapshot(0.50, 0.51, 200, 200),
         }
     )
     detector = StatisticalMispricingDetector(min_deviation=0.005, min_confidence=0.1)
@@ -509,6 +879,97 @@ def test_collect_statistical_strategy_signals_scan_multiple_candidate_markets():
     assert signals[0].market_id == "cond-1"
     assert signals[0].recommended_size_usdc == 7.5
     assert signals[0].expected_edge > 0
+    assert signals[0].payload["quality"]["passes"] is True
+
+
+def test_collect_statistical_strategy_signals_filters_poor_quality_markets():
+    markets = [
+        MarketInfo(
+            condition_id="cond-1",
+            question="Will BTC rise?",
+            slug="btc-rise",
+            tokens=[TokenInfo("yes-1", "Yes"), TokenInfo("no-1", "No")],
+        )
+    ]
+
+    class _StubOrderBookAnalyzer:
+        def __init__(self, snapshots):
+            self.snapshots = snapshots
+
+        def get_snapshot(self, token_id):
+            return self.snapshots.get(token_id)
+
+    class _Snapshot:
+        def __init__(self, best_bid, best_ask, bid_size, ask_size, tick_size=0.01):
+            self.best_bid = best_bid
+            self.best_ask = best_ask
+            self.tick_size = tick_size
+            self.bids = [type("Level", (), {"price": best_bid, "size": bid_size})()]
+            self.asks = [type("Level", (), {"price": best_ask, "size": ask_size})()]
+
+        @property
+        def mid(self):
+            return (self.best_bid + self.best_ask) / 2.0
+
+        @property
+        def spread(self):
+            return self.best_ask - self.best_bid
+
+        @property
+        def best_bid_size(self):
+            return self.bids[0].size
+
+        @property
+        def best_ask_size(self):
+            return self.asks[0].size
+
+    ob_analyzer = _StubOrderBookAnalyzer(
+        {
+            "yes-1": _Snapshot(0.30, 0.40, 900, 50),
+            "no-1": _Snapshot(0.59, 0.60, 50, 900),
+        }
+    )
+    detector = StatisticalMispricingDetector(min_deviation=0.005, min_confidence=0.1)
+
+    signals = _collect_statistical_strategy_signals(
+        config=make_test_config(t2_max_spread_bps=100.0, t2_min_top_depth=100.0, t2_max_complement_error_bps=200.0),
+        candidate_markets=markets,
+        ob_analyzer=ob_analyzer,
+        detector=detector,
+    )
+
+    assert signals == []
+
+
+def test_evaluate_t2_market_quality_reports_reasons():
+    class _Snapshot:
+        def __init__(self, best_bid, best_ask, bid_size, ask_size):
+            self.best_bid = best_bid
+            self.best_ask = best_ask
+            self.bids = [type("Level", (), {"price": best_bid, "size": bid_size})()]
+            self.asks = [type("Level", (), {"price": best_ask, "size": ask_size})()]
+
+        @property
+        def mid(self):
+            return (self.best_bid + self.best_ask) / 2.0
+
+        @property
+        def spread(self):
+            return self.best_ask - self.best_bid
+
+        @property
+        def best_ask_size(self):
+            return self.asks[0].size
+
+    quality = _evaluate_t2_market_quality(
+        config=make_test_config(t2_max_spread_bps=80.0, t2_min_top_depth=100.0, t2_max_complement_error_bps=150.0),
+        snap=_Snapshot(0.30, 0.40, 500, 50),
+        no_snap=_Snapshot(0.59, 0.60, 500, 90),
+    )
+
+    assert quality["passes"] is False
+    assert "spread_too_wide" in quality["reasons"]
+    assert "top_depth_too_low" in quality["reasons"]
 
 
 def test_collect_maker_strategy_signals_use_snapshot_tick_size():

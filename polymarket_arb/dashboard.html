@@ -308,9 +308,13 @@
     <h2>Backtest Report</h2>
     <div class="metric"><span class="label">状态</span><span class="value" id="backtestEnabled">-</span></div>
     <div class="metric"><span class="label">策略</span><span class="value mono-sm" id="backtestStrategy">-</span></div>
+    <div class="metric"><span class="label">执行模型</span><span class="value mono-sm" id="backtestExecutionModel">-</span></div>
     <div class="metric"><span class="label">数据集</span><span class="value mono-sm" id="backtestDataset">-</span></div>
     <div class="metric"><span class="label">净盈亏</span><span class="value" id="backtestNetPnl">-</span></div>
     <div class="metric"><span class="label">命中率</span><span class="value" id="backtestWinRate">-</span></div>
+    <div class="metric"><span class="label">成交率</span><span class="value" id="backtestFillRate">-</span></div>
+    <div class="metric"><span class="label">跳过信号</span><span class="value" id="backtestSkippedSignals">-</span></div>
+    <div class="metric"><span class="label">Profit Factor</span><span class="value" id="backtestProfitFactor">-</span></div>
     <div id="backtestTradePreview"></div>
   </div>
 
@@ -611,6 +615,7 @@ function renderBacktestReport(report) {
     ? '<span class="badge badge-green">可用</span>'
     : '<span class="badge badge-yellow">无报告</span>';
   $('backtestStrategy').textContent = report && report.strategy_name ? report.strategy_name : '-';
+  $('backtestExecutionModel').textContent = report && report.execution_model ? report.execution_model : '-';
   $('backtestDataset').textContent = report && report.dataset_name ? report.dataset_name : '-';
   const pnl = report && report.net_pnl != null ? report.net_pnl : null;
   const pnlEl = $('backtestNetPnl');
@@ -619,6 +624,15 @@ function renderBacktestReport(report) {
   $('backtestWinRate').textContent = report && report.win_rate != null
     ? (Number(report.win_rate) * 100).toFixed(1) + '%'
     : '-';
+  $('backtestFillRate').textContent = report && report.fill_rate != null
+    ? (Number(report.fill_rate) * 100).toFixed(1) + '%'
+    : '-';
+  $('backtestSkippedSignals').textContent = report && report.skipped_signals != null
+    ? String(report.skipped_signals)
+    : '-';
+  $('backtestProfitFactor').textContent = report && report.profit_factor_infinite
+    ? '∞'
+    : (report && report.profit_factor != null ? fmtNum(report.profit_factor, 3) : '-');
   const previewEl = $('backtestTradePreview');
   const rows = report && report.recent_trade_rows ? report.recent_trade_rows : [];
   if (!rows.length) {

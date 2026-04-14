@@ -87,6 +87,8 @@ class MarketInfo:
     liquidity: float = 0.0
     event_id: str = ""
     event_slug: str = ""
+    event_title: str = ""
+    event_ticker: str = ""
     outcomes: list[str] = field(default_factory=list)
     outcome_prices: list[float] = field(default_factory=list)
     neg_risk: bool = False
@@ -397,11 +399,20 @@ class BacktestReport:
     total_signals: int = 0
     total_trades: int = 0
     filled_trades: int = 0
+    skipped_signals: int = 0
+    execution_model: str = ""
     gross_pnl: float = 0.0
     net_pnl: float = 0.0
     max_drawdown: float = 0.0
     win_rate: float = 0.0
+    fill_rate: float = 0.0
     avg_slippage_bps: float = 0.0
+    avg_latency_ms: float = 0.0
+    avg_signal_edge_bps: float = 0.0
+    total_fees_paid: float = 0.0
+    total_notional_usdc: float = 0.0
+    profit_factor: float | None = None
+    profit_factor_infinite: bool = False
     notes: list[str] = field(default_factory=list)
     generated_at: float = field(default_factory=time.time)
 
@@ -412,11 +423,20 @@ class BacktestReport:
             "total_signals": self.total_signals,
             "total_trades": self.total_trades,
             "filled_trades": self.filled_trades,
+            "skipped_signals": self.skipped_signals,
+            "execution_model": self.execution_model,
             "gross_pnl": round(self.gross_pnl, 4),
             "net_pnl": round(self.net_pnl, 4),
             "max_drawdown": round(self.max_drawdown, 4),
             "win_rate": round(self.win_rate, 4),
+            "fill_rate": round(self.fill_rate, 4),
             "avg_slippage_bps": round(self.avg_slippage_bps, 2),
+            "avg_latency_ms": round(self.avg_latency_ms, 2),
+            "avg_signal_edge_bps": round(self.avg_signal_edge_bps, 2),
+            "total_fees_paid": round(self.total_fees_paid, 4),
+            "total_notional_usdc": round(self.total_notional_usdc, 4),
+            "profit_factor": round(self.profit_factor, 4) if self.profit_factor is not None else None,
+            "profit_factor_infinite": self.profit_factor_infinite,
             "notes": list(self.notes),
             "generated_at": self.generated_at,
         }

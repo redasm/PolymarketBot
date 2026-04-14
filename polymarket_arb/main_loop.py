@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 import importlib
 import json
 import logging
@@ -64,6 +66,13 @@ LOG = logging.getLogger("main_loop")
 _SHUTDOWN_EVENT = threading.Event()
 _AI_EVAL_TIMEOUT_SEC = 20.0
 _TELEMETRY_HEARTBEAT_SEC = 60.0
+_RESEARCH_RESUBMIT_COOLDOWN_SEC = 30.0
+_FOCUS_ALIASES = {
+    "btc": ("btc", "bitcoin"),
+    "eth": ("eth", "ethereum"),
+    "sol": ("sol", "solana"),
+    "arb": ("arb", "arbitrum"),
+}
 
 
 def _signal_handler(sig: int, frame: Any) -> None:
@@ -148,6 +157,21 @@ def _parse_extra_rss_feeds(raw: str) -> list[tuple[str, str]]:
     return feeds
 
 
+def _parse_http_json_sources(raw: str) -> list[dict]:
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as e:
+        LOG.error("HTTP JSON sources 配置解析失败: %s", e)
+        return []
+    if not isinstance(payload, list):
+        LOG.error("HTTP JSON sources 配置必须是 JSON list")
+        return []
+    return [item for item in payload if isinstance(item, dict)]
+
+
 def _create_research_signal_service(config: ArbConfig) -> Optional["ResearchSignalService"]:
     if not config.research_signal_enabled:
         return None
@@ -165,6 +189,13 @@ def _create_research_signal_service(config: ArbConfig) -> Optional["ResearchSign
             cache_ttl_sec=config.research_signal_cache_ttl_sec,
             cache_dir=config.research_signal_cache_dir,
             extra_rss_feeds=_parse_extra_rss_feeds(config.research_signal_extra_rss_feeds),
+            http_json_sources=_parse_http_json_sources(config.research_signal_http_json_sources),
+            surf_enabled=config.research_signal_surf_enabled,
+            surf_api_key=config.research_signal_surf_api_key,
+            surf_api_base=config.research_signal_surf_api_base,
+            surf_model=config.research_signal_surf_model,
+            surf_timeout_sec=config.research_signal_surf_timeout_sec,
+            surf_cache_ttl_sec=config.research_signal_surf_cache_ttl_sec,
             knowledge_base_dir=config.research_signal_knowledge_dir,
             knowledge_base_enabled=config.research_signal_knowledge_enabled,
             knowledge_max_matches=config.research_signal_knowledge_max_matches,
@@ -216,6 +247,9 @@ def _market_focus_text(market: MarketInfo) -> str:
         market.question,
         market.slug,
         market.event_slug,
+        getattr(market, "event_title", ""),
+        getattr(market, "event_ticker", ""),
+        str((market.raw or {}).get("description") or ""),
         " ".join(market.outcomes or []),
         " ".join((token.outcome or "") for token in market.tokens),
     ]
@@ -238,11 +272,19 @@ def _matches_focus(text: str, keywords: list[str]) -> bool:
         for token in re.split(r"[^a-z0-9]+", text.lower())
         if token
     ]
-    return any(
-        token == keyword or token.startswith(keyword)
-        for keyword in keywords
-        for token in normalized_tokens
-    )
+    for keyword in keywords:
+        aliases = _FOCUS_ALIASES.get(keyword)
+        if aliases is not None:
+            if any(token == alias or token.startswith(f"{alias}-") for alias in aliases for token in normalized_tokens):
+                return True
+            continue
+        if len(keyword) <= 3:
+            if keyword in normalized_tokens:
+                return True
+            continue
+        if any(token == keyword or token.startswith(keyword) for token in normalized_tokens):
+            return True
+    return False
 
 
 def _collect_cross_platform_strategy_signals(
@@ -293,8 +335,13 @@ def _collect_statistical_strategy_signals(
             continue
 
         yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
+        no_token = next((t for t in market.tokens if (t.outcome or "").lower() == "no"), market.tokens[-1])
         snap = ob_analyzer.get_snapshot(yes_token.token_id)
-        if snap is None or snap.mid is None:
+        no_snap = ob_analyzer.get_snapshot(no_token.token_id)
+        if snap is None or no_snap is None or snap.mid is None or no_snap.mid is None:
+            continue
+        quality = _evaluate_t2_market_quality(config=config, snap=snap, no_snap=no_snap)
+        if quality["passes"] is False:
             continue
 
         bids_total_size = sum(level.size for level in snap.bids[:5])
@@ -328,10 +375,55 @@ def _collect_statistical_strategy_signals(
                     "deviation": estimate.deviation,
                     "deviation_pct": estimate.deviation_pct,
                     "signals": dict(estimate.signals),
+                    "quality": quality,
                 },
             )
         )
     return signals
+
+
+def _evaluate_t2_market_quality(*, config: ArbConfig, snap: Any, no_snap: Any) -> dict[str, Any]:
+    yes_spread_bps = _spread_bps_from_snapshot(snap)
+    no_spread_bps = _spread_bps_from_snapshot(no_snap)
+    complement_error_bps = None
+    if snap.mid is not None and no_snap.mid is not None:
+        complement_error_bps = abs(1.0 - (float(snap.mid) + float(no_snap.mid))) * 10_000.0
+    yes_top_depth = float(getattr(snap, "best_ask_size", 0.0) or 0.0)
+    no_top_depth = float(getattr(no_snap, "best_ask_size", 0.0) or 0.0)
+
+    reasons: list[str] = []
+    if yes_spread_bps is None or no_spread_bps is None:
+        reasons.append("missing_spread")
+    elif max(float(yes_spread_bps), float(no_spread_bps)) > config.t2_max_spread_bps:
+        reasons.append("spread_too_wide")
+    if min(yes_top_depth, no_top_depth) < config.t2_min_top_depth:
+        reasons.append("top_depth_too_low")
+    if complement_error_bps is None:
+        reasons.append("missing_complement_error")
+    elif float(complement_error_bps) > config.t2_max_complement_error_bps:
+        reasons.append("complement_error_too_high")
+
+    return {
+        "passes": not reasons,
+        "reasons": reasons,
+        "yes_spread_bps": round(float(yes_spread_bps), 2) if yes_spread_bps is not None else None,
+        "no_spread_bps": round(float(no_spread_bps), 2) if no_spread_bps is not None else None,
+        "yes_top_depth": round(yes_top_depth, 4),
+        "no_top_depth": round(no_top_depth, 4),
+        "complement_error_bps": round(float(complement_error_bps), 2) if complement_error_bps is not None else None,
+    }
+
+
+def _spread_bps_from_snapshot(snap: Any) -> float | None:
+    if snap is None or getattr(snap, "best_bid", None) is None or getattr(snap, "best_ask", None) is None:
+        return None
+    mid = getattr(snap, "mid", None)
+    spread = getattr(snap, "spread", None)
+    if spread is None and getattr(snap, "best_bid", None) is not None and getattr(snap, "best_ask", None) is not None:
+        spread = float(snap.best_ask) - float(snap.best_bid)
+    if mid is None or spread is None or float(mid) <= 0:
+        return None
+    return (float(spread) / float(mid)) * 10_000.0
 
 
 def _collect_maker_strategy_signals(
@@ -442,6 +534,251 @@ def _select_event_candidates(events: list[Any], max_count: int, *, focus_keyword
     return active[:max_count]
 
 
+def _merge_focus_event_markets(
+    markets: list[MarketInfo],
+    events: list[Any],
+    max_count: int,
+    *,
+    focus_keywords: list[str] | None = None,
+) -> list[MarketInfo]:
+    merged: dict[str, MarketInfo] = {
+        market.condition_id: market
+        for market in markets
+        if market.active and not market.closed
+    }
+
+    for event in events:
+        for market in getattr(event, "markets", []) or []:
+            if not market.active or market.closed or len(market.tokens) != 2:
+                continue
+            if not market.event_id:
+                market.event_id = getattr(event, "event_id", "")
+            if not market.event_slug:
+                market.event_slug = getattr(event, "slug", "")
+            if not getattr(market, "event_title", ""):
+                market.event_title = getattr(event, "title", "")
+            if focus_keywords and not _matches_focus(_market_focus_text(market), focus_keywords):
+                continue
+            merged.setdefault(market.condition_id, market)
+
+    ranked = list(merged.values())
+    ranked.sort(key=_market_priority_score, reverse=True)
+    return ranked[:max_count]
+
+
+def _prime_candidate_orderbooks(
+    *,
+    candidate_markets: list[MarketInfo],
+    candidate_events: list[Any],
+    ob_analyzer: OrderBookAnalyzer,
+) -> dict[str, Any]:
+    token_ids: list[str] = []
+    for market in candidate_markets:
+        if len(market.tokens) == 2 and market.active and not market.closed:
+            token_ids.extend(token.token_id for token in market.tokens if token.token_id)
+    for event in candidate_events:
+        for market in getattr(event, "markets", []) or []:
+            if market.closed or not market.active:
+                continue
+            token_ids.extend(token.token_id for token in market.tokens if token.token_id)
+    if not token_ids:
+        return {}
+    return ob_analyzer.batch_get_snapshots(list(dict.fromkeys(token_ids)), delay=0.0)
+
+
+def _round_timing(value: float) -> float:
+    return round(max(0.0, float(value or 0.0)), 4)
+
+
+def _build_cycle_summary_payload(
+    *,
+    run_id: str,
+    cycle: int,
+    markets_scanned: int,
+    universe_market_count: int,
+    selected_event_count: int,
+    arbs_found_total: int,
+    arbs_executed_total: int,
+    ws_status: dict[str, Any],
+    research_count: int,
+    daily_pnl: float,
+    open_positions: int,
+    focus_keywords: list[str],
+    book_stats: dict[str, int],
+    timing_stats: dict[str, float],
+    cycle_status: str = "ok",
+) -> dict[str, Any]:
+    return {
+        "event": "cycle_summary",
+        "cycle_status": cycle_status,
+        "run_id": run_id,
+        "cycle": cycle,
+        "markets_scanned": markets_scanned,
+        "universe_market_count": universe_market_count,
+        "selected_event_count": selected_event_count,
+        "arbs_found_total": arbs_found_total,
+        "arbs_executed_total": arbs_executed_total,
+        "ws_connected": ws_status.get("connected", False),
+        "ws_tokens": ws_status.get("subscribed_tokens", 0),
+        "research_count": research_count,
+        "daily_pnl": daily_pnl,
+        "open_positions": open_positions,
+        "focus_keywords": focus_keywords,
+        "book_stats": {
+            key: int(book_stats.get(key, 0))
+            for key in (
+                "requests",
+                "ws_hit",
+                "cache_hit",
+                "rest_fallback",
+                "rest_success",
+                "rest_error",
+                "missing_orderbook",
+                "cooldown_skip",
+            )
+        },
+        "timing": {
+            key: _round_timing(value)
+            for key, value in timing_stats.items()
+        },
+    }
+
+
+def _emit_cycle_metrics(
+    *,
+    event_recorder: EventRecorder,
+    ob_analyzer: OrderBookAnalyzer,
+    cycle_perf_start: float,
+    cycle_timing: dict[str, float],
+    run_id: str,
+    cycle: int,
+    markets_scanned: int,
+    universe_market_count: int,
+    selected_event_count: int,
+    arbs_found_total: int,
+    arbs_executed_total: int,
+    ws_status: dict[str, Any],
+    research_count: int,
+    daily_pnl: float,
+    open_positions: int,
+    focus_keywords: list[str],
+    cycle_status: str = "ok",
+) -> dict[str, Any]:
+    cycle_book_stats = ob_analyzer.snapshot_stats(reset=True)
+    timing_stats = dict(cycle_timing)
+    timing_stats["total_cycle_sec"] = time.perf_counter() - cycle_perf_start
+    payload = _build_cycle_summary_payload(
+        run_id=run_id,
+        cycle=cycle,
+        markets_scanned=markets_scanned,
+        universe_market_count=universe_market_count,
+        selected_event_count=selected_event_count,
+        arbs_found_total=arbs_found_total,
+        arbs_executed_total=arbs_executed_total,
+        ws_status=ws_status,
+        research_count=research_count,
+        daily_pnl=daily_pnl,
+        open_positions=open_positions,
+        focus_keywords=focus_keywords,
+        book_stats=cycle_book_stats,
+        timing_stats=timing_stats,
+        cycle_status=cycle_status,
+    )
+    if event_recorder.is_enabled:
+        event_recorder.write_event("cycle_metrics", payload)
+    return payload
+
+
+@dataclass
+class _ResearchRefreshState:
+    last_report: ResearchSignalReport | None = None
+    last_report_signature: tuple[str, ...] = ()
+    pending_future: Future | None = None
+    pending_signature: tuple[str, ...] = ()
+    last_submit_ts: float = 0.0
+
+
+def _research_market_sample(
+    *,
+    universe_markets: list[MarketInfo],
+    scanned_markets: list[MarketInfo],
+    max_items: int,
+) -> list[MarketInfo]:
+    source_markets = universe_markets if universe_markets else scanned_markets
+    if max_items <= 0:
+        return list(source_markets)
+    return list(source_markets[:max_items])
+
+
+def _research_market_signature(markets: list[MarketInfo]) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            f"{market.event_id}:{market.condition_id}:{(market.question or '').strip().lower()[:80]}"
+            for market in markets
+        )
+    )
+
+
+def _advance_research_refresh(
+    *,
+    research_signal_service: "ResearchSignalService" | None,
+    research_executor: ThreadPoolExecutor | None,
+    state: _ResearchRefreshState,
+    universe_markets: list[MarketInfo],
+    scanned_markets: list[MarketInfo],
+    max_items: int,
+    window_sec: int,
+    refresh_interval_sec: float,
+    now_ts: float | None = None,
+) -> ResearchSignalReport | None:
+    now_ts = float(now_ts if now_ts is not None else time.time())
+    if state.pending_future is not None and state.pending_future.done():
+        try:
+            result = state.pending_future.result()
+        except Exception as e:
+            LOG.error("Research signal 刷新失败: %s", e, exc_info=True)
+        else:
+            state.last_report = result
+            state.last_report_signature = state.pending_signature
+        state.pending_future = None
+        state.pending_signature = ()
+
+    sample_markets = _research_market_sample(
+        universe_markets=universe_markets,
+        scanned_markets=scanned_markets,
+        max_items=max_items,
+    )
+    current_signature = _research_market_signature(sample_markets)
+    if (
+        research_signal_service is not None
+        and research_executor is not None
+        and sample_markets
+        and state.pending_future is None
+    ):
+        signature_changed = current_signature != state.last_report_signature
+        periodic_refresh_due = (
+            state.last_report is not None
+            and not signature_changed
+            and (now_ts - state.last_submit_ts) >= max(1.0, float(refresh_interval_sec))
+        )
+        initial_refresh_due = (
+            state.last_report is None
+            and (state.last_submit_ts <= 0 or (now_ts - state.last_submit_ts) >= _RESEARCH_RESUBMIT_COOLDOWN_SEC)
+        )
+        if signature_changed or periodic_refresh_due or initial_refresh_due:
+            state.pending_future = research_executor.submit(
+                research_signal_service.collect_report,
+                sample_markets,
+                window_sec,
+            )
+            state.pending_signature = current_signature
+            state.last_submit_ts = now_ts
+
+    if state.last_report is None or state.last_report_signature != current_signature:
+        return None
+    return state.last_report
+
+
 def _refresh_market_universe(
     *,
     scanner: MarketScanner,
@@ -479,6 +816,7 @@ def _start_ws_feed(
     """
     mirror = OrderBookMirror()
     if tick_recorder is not None and tick_recorder.is_enabled:
+        tick_recorder.register_markets(targets)
         mirror.register_callback(tick_recorder.on_book_update)
 
     primary = targets[0]
@@ -524,6 +862,7 @@ def main(dotenv_path: str | None = None) -> None:
     ob_analyzer = OrderBookAnalyzer(
         ro_client,
         snapshot_ttl_sec=config.orderbook_snapshot_ttl_sec,
+        ws_snapshot_max_age_sec=config.orderbook_ws_snapshot_max_age_sec,
         retry_count=config.orderbook_retry_count,
         retry_delay_sec=config.orderbook_retry_delay_sec,
         missing_orderbook_cooldown_sec=config.orderbook_missing_cooldown_sec,
@@ -612,6 +951,13 @@ def main(dotenv_path: str | None = None) -> None:
     ctx_builder = MarketContextBuilder()
     research_signal_service: Optional["ResearchSignalService"] = _create_research_signal_service(config)
     research_signal_enabled = bool(config.research_signal_enabled and research_signal_service is not None)
+    research_executor: ThreadPoolExecutor | None = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="research-signal")
+        if research_signal_service is not None
+        else None
+    )
+    research_refresh_state = _ResearchRefreshState()
+    research_refresh_interval_sec = max(5.0, float(config.research_signal_cache_ttl_sec))
 
     ai_advisor: Optional[AIAdvisor] = None
     if config.ai_enabled:
@@ -658,7 +1004,21 @@ def main(dotenv_path: str | None = None) -> None:
     while not _SHUTDOWN_EVENT.is_set():
         cycle += 1
         cycle_start = time.time()
+        cycle_perf_start = time.perf_counter()
+        cycle_timing: dict[str, float] = {
+            "universe_refresh_sec": 0.0,
+            "candidate_select_sec": 0.0,
+            "ws_refresh_sec": 0.0,
+            "prewarm_sec": 0.0,
+            "scan_cycle_sec": 0.0,
+            "research_sec": 0.0,
+            "strategy_sec": 0.0,
+            "execution_sec": 0.0,
+            "ai_sec": 0.0,
+        }
+        ob_analyzer.snapshot_stats(reset=True)
         scanned_markets: list[MarketInfo] = []
+        event_candidates: list[Any] = []
         universe_markets: list[MarketInfo] = []
         if data_janitor.should_run():
             for cleanup_stats in data_janitor.run_once():
@@ -689,6 +1049,7 @@ def main(dotenv_path: str | None = None) -> None:
         )
 
         try:
+            phase_start = time.perf_counter()
             cached_universe_markets, cached_universe_events, last_universe_refresh_ts, universe_refreshed = _refresh_market_universe(
                 scanner=scanner,
                 config=config,
@@ -696,6 +1057,9 @@ def main(dotenv_path: str | None = None) -> None:
                 cached_events=cached_universe_events,
                 last_refresh_ts=last_universe_refresh_ts,
             )
+            cycle_timing["universe_refresh_sec"] += time.perf_counter() - phase_start
+
+            phase_start = time.perf_counter()
             scanned_markets = _select_scan_candidates(
                 cached_universe_markets,
                 config.hot_market_pool_size,
@@ -706,7 +1070,44 @@ def main(dotenv_path: str | None = None) -> None:
                 config.hot_event_pool_size,
                 focus_keywords=focus_keywords,
             )
+            scanned_markets = _merge_focus_event_markets(
+                scanned_markets,
+                event_candidates,
+                config.hot_market_pool_size,
+                focus_keywords=focus_keywords,
+            )
+            cycle_timing["candidate_select_sec"] += time.perf_counter() - phase_start
+
+            if config.ws_enabled and scanned_markets:
+                phase_start = time.perf_counter()
+                need_refresh = (
+                    ws_feed is None
+                    or cycle % config.ws_refresh_cycles == 0
+                )
+                if need_refresh:
+                    targets = _select_ws_targets(scanned_markets, config.ws_max_markets)
+                    if targets:
+                        new_ids = sorted(t.token_id for m in targets for t in m.tokens)
+                        if new_ids != ws_target_ids:
+                            if ws_feed is not None:
+                                ws_feed.stop()
+                                LOG.info("旧 WebSocket feed 已停止，切换到新目标市场")
+                            ws_feed, ws_mirror = _start_ws_feed(targets, enhanced_store, tick_recorder)
+                            ws_target_ids = new_ids
+                    elif cycle == 1 or cycle % 20 == 0:
+                        LOG.warning("未选出可订阅的 WS 市场，可能是市场 token 解析为空或筛选结果为空")
+                cycle_timing["ws_refresh_sec"] += time.perf_counter() - phase_start
+            ob_analyzer.set_live_mirror(ws_mirror)
+            phase_start = time.perf_counter()
+            _prime_candidate_orderbooks(
+                candidate_markets=scanned_markets,
+                candidate_events=event_candidates,
+                ob_analyzer=ob_analyzer,
+            )
+            cycle_timing["prewarm_sec"] += time.perf_counter() - phase_start
+
             universe_markets = list(cached_universe_markets)
+            phase_start = time.perf_counter()
             opportunities = _scan_cycle(
                 detector=detector,
                 config=config,
@@ -727,6 +1128,7 @@ def main(dotenv_path: str | None = None) -> None:
                     ),
                 ),
             )
+            cycle_timing["scan_cycle_sec"] += time.perf_counter() - phase_start
             consecutive_api_errors = 0
             dash_state.update(
                 markets_scanned=len(scanned_markets),
@@ -756,6 +1158,30 @@ def main(dotenv_path: str | None = None) -> None:
                     phase_hint="scan_error",
                 ),
             )
+            _emit_cycle_metrics(
+                event_recorder=event_recorder,
+                ob_analyzer=ob_analyzer,
+                cycle_perf_start=cycle_perf_start,
+                cycle_timing=cycle_timing,
+                run_id=run_id,
+                cycle=cycle,
+                markets_scanned=len(scanned_markets),
+                universe_market_count=len(cached_universe_markets),
+                selected_event_count=len(event_candidates),
+                arbs_found_total=total_arbs_found,
+                arbs_executed_total=total_arbs_executed,
+                ws_status=_build_ws_status(
+                    config=config,
+                    enhanced_store=enhanced_store,
+                    ws_target_ids=ws_target_ids,
+                    phase_hint="scan_error",
+                ),
+                research_count=0,
+                daily_pnl=risk_mgr.state.daily_pnl,
+                open_positions=risk_mgr.state.open_positions,
+                focus_keywords=focus_keywords,
+                cycle_status="error",
+            )
             if consecutive_api_errors >= 10:
                 LOG.error("连续 %d 次 API 错误，暂停 60 秒", consecutive_api_errors)
                 notifier.notify_error(f"连续 {consecutive_api_errors} 次 API 错误")
@@ -763,25 +1189,6 @@ def main(dotenv_path: str | None = None) -> None:
             else:
                 time.sleep(config.scan_interval_sec)
             continue
-
-        # --- WebSocket 启动 / 刷新 ---
-        if config.ws_enabled and scanned_markets:
-            need_refresh = (
-                ws_feed is None
-                or cycle % config.ws_refresh_cycles == 0
-            )
-            if need_refresh:
-                targets = _select_ws_targets(scanned_markets, config.ws_max_markets)
-                if targets:
-                    new_ids = sorted(t.token_id for m in targets for t in m.tokens)
-                    if new_ids != ws_target_ids:
-                        if ws_feed is not None:
-                            ws_feed.stop()
-                            LOG.info("旧 WebSocket feed 已停止，切换到新目标市场")
-                        ws_feed, ws_mirror = _start_ws_feed(targets, enhanced_store, tick_recorder)
-                        ws_target_ids = new_ids
-                elif cycle == 1 or cycle % 20 == 0:
-                    LOG.warning("未选出可订阅的 WS 市场，可能是市场 token 解析为空或筛选结果为空")
 
         # --- VolEstimator 喂入 mid price ---
         now = time.time()
@@ -818,18 +1225,34 @@ def main(dotenv_path: str | None = None) -> None:
 
         research_signals = []
         research_report: ResearchSignalReport | None = None
+        phase_start = time.perf_counter()
         if research_signal_service is not None:
-            research_report = research_signal_service.collect_report(
-                universe_markets[: config.research_signal_max_items] if universe_markets else scanned_markets[: config.research_signal_max_items],
-                config.research_signal_window_sec,
+            research_report = _advance_research_refresh(
+                research_signal_service=research_signal_service,
+                research_executor=research_executor,
+                state=research_refresh_state,
+                universe_markets=universe_markets,
+                scanned_markets=scanned_markets,
+                max_items=config.research_signal_max_items,
+                window_sec=config.research_signal_window_sec,
+                refresh_interval_sec=research_refresh_interval_sec,
             )
-            research_signals = research_report.signals
+            if research_report is not None:
+                research_signals = research_report.signals
+        if research_report is not None:
             scanner.enrich_markets_with_research(
                 universe_markets if universe_markets else scanned_markets,
                 research_signal_service,
                 window_sec=config.research_signal_window_sec,
                 report=research_report,
             )
+        elif research_signal_service is not None:
+            scanner.enrich_markets_with_research(
+                universe_markets if universe_markets else scanned_markets,
+                research_signal_service,
+                signals=[],
+            )
+        cycle_timing["research_sec"] += time.perf_counter() - phase_start
 
         edge_decision = edge_engine.evaluate(enhanced_store, vol_estimator)
         if edge_decision.direction != "NONE":
@@ -845,6 +1268,7 @@ def main(dotenv_path: str | None = None) -> None:
                 "timestamp": time.time(),
             })
 
+        phase_start = time.perf_counter()
         strategy_signals = _collect_cross_platform_strategy_signals(
             config=config,
             scanner=cross_platform_scanner,
@@ -901,7 +1325,9 @@ def main(dotenv_path: str | None = None) -> None:
 
         for processed_signal in orchestrator.process_signals():
             orchestrator.record_processed(processed_signal)
+        cycle_timing["strategy_sec"] += time.perf_counter() - phase_start
 
+        phase_start = time.perf_counter()
         for opp in opportunities:
             if _SHUTDOWN_EVENT.is_set():
                 break
@@ -981,8 +1407,10 @@ def main(dotenv_path: str | None = None) -> None:
                     f"事件: {opp.event_title}\n"
                     f"已成交腿数: {len(filled)}/{len(opp.legs)}"
                 )
+        cycle_timing["execution_sec"] += time.perf_counter() - phase_start
 
         if ai_advisor and ai_advisor.should_evaluate():
+            phase_start = time.perf_counter()
             _run_ai_cycle(
                 ai_advisor=ai_advisor,
                 ctx_builder=ctx_builder,
@@ -999,6 +1427,7 @@ def main(dotenv_path: str | None = None) -> None:
                 research_signals=research_signals,
                 event_recorder=event_recorder,
             )
+            cycle_timing["ai_sec"] += time.perf_counter() - phase_start
 
         risk_s = risk_mgr.state
         vol_snap = vol_estimator.snapshot()
@@ -1054,24 +1483,29 @@ def main(dotenv_path: str | None = None) -> None:
             "cumulative_pnl": risk_s.daily_pnl,
         })
 
+        cycle_summary_payload = _emit_cycle_metrics(
+            event_recorder=event_recorder,
+            ob_analyzer=ob_analyzer,
+            cycle_perf_start=cycle_perf_start,
+            cycle_timing=cycle_timing,
+            run_id=run_id,
+            cycle=cycle,
+            markets_scanned=len(scanned_markets),
+            universe_market_count=len(cached_universe_markets),
+            selected_event_count=len(event_candidates),
+            arbs_found_total=total_arbs_found,
+            arbs_executed_total=total_arbs_executed,
+            ws_status=ws_status,
+            research_count=len(research_signals),
+            daily_pnl=risk_s.daily_pnl,
+            open_positions=risk_s.open_positions,
+            focus_keywords=focus_keywords,
+            cycle_status="ok",
+        )
+
         now_ts = time.time()
         if event_recorder.is_enabled and (now_ts - last_telemetry_heartbeat_ts) >= _TELEMETRY_HEARTBEAT_SEC:
-            event_recorder.write_event("risk_events", {
-                "event": "cycle_summary",
-                "run_id": run_id,
-                "cycle": cycle,
-                "markets_scanned": len(scanned_markets),
-                "universe_market_count": len(cached_universe_markets),
-                "selected_event_count": len(event_candidates),
-                "arbs_found_total": total_arbs_found,
-                "arbs_executed_total": total_arbs_executed,
-                "ws_connected": ws_status.get("connected", False),
-                "ws_tokens": ws_status.get("subscribed_tokens", 0),
-                "research_count": len(research_signals),
-                "daily_pnl": risk_s.daily_pnl,
-                "open_positions": risk_s.open_positions,
-                "focus_keywords": focus_keywords,
-            })
+            event_recorder.write_event("risk_events", cycle_summary_payload)
             last_telemetry_heartbeat_ts = now_ts
 
         elapsed = time.time() - cycle_start
@@ -1093,6 +1527,10 @@ def main(dotenv_path: str | None = None) -> None:
     if ws_feed is not None:
         ws_feed.stop()
         LOG.info("WebSocket feed 已停止")
+    if research_refresh_state.pending_future is not None:
+        research_refresh_state.pending_future.cancel()
+    if research_executor is not None:
+        research_executor.shutdown(wait=False, cancel_futures=True)
     if event_recorder.is_enabled:
         event_recorder.write_event("risk_events", {
             "event": "shutdown",

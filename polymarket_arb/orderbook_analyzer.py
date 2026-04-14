@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Any, Optional
 
 from polymarket_arb.models import OrderBookLevel, OrderBookSnapshot
 
 LOG = logging.getLogger(__name__)
+_ORDERBOOK_STAT_KEYS = (
+    "requests",
+    "ws_hit",
+    "cache_hit",
+    "rest_fallback",
+    "rest_success",
+    "rest_error",
+    "missing_orderbook",
+    "cooldown_skip",
+)
 
 
 def _parse_level(raw: Any) -> Optional[OrderBookLevel]:
@@ -47,27 +58,65 @@ class OrderBookAnalyzer:
         clob_client: Any,
         snapshot_ttl_sec: float = 0.5,
         *,
+        live_mirror: Any | None = None,
+        ws_snapshot_max_age_sec: float = 10.0,
         retry_count: int = 2,
         retry_delay_sec: float = 0.15,
         missing_orderbook_cooldown_sec: float = 300.0,
     ):
         self._client = clob_client
+        self._live_mirror = live_mirror
         self._snapshot_ttl_sec = max(0.0, snapshot_ttl_sec)
+        self._ws_snapshot_max_age_sec = max(0.0, float(ws_snapshot_max_age_sec))
         self._retry_count = max(0, int(retry_count))
         self._retry_delay_sec = max(0.0, float(retry_delay_sec))
         self._missing_orderbook_cooldown_sec = max(0.0, float(missing_orderbook_cooldown_sec))
         self._snapshot_cache: dict[str, OrderBookSnapshot] = {}
+        self._snapshot_cache_source: dict[str, str] = {}
         self._missing_orderbook_until: dict[str, float] = {}
+        self._stats_lock = threading.Lock()
+        self._stats: dict[str, int] = {key: 0 for key in _ORDERBOOK_STAT_KEYS}
 
-    def get_snapshot(self, token_id: str) -> Optional[OrderBookSnapshot]:
+    def set_live_mirror(self, live_mirror: Any | None) -> None:
+        self._live_mirror = live_mirror
+
+    def snapshot_stats(self, *, reset: bool = False) -> dict[str, int]:
+        with self._stats_lock:
+            snap = dict(self._stats)
+            if reset:
+                self._stats = {key: 0 for key in _ORDERBOOK_STAT_KEYS}
+            return snap
+
+    def get_snapshot(
+        self,
+        token_id: str,
+        *,
+        allow_rest_fallback: bool = True,
+        count_request: bool = True,
+    ) -> Optional[OrderBookSnapshot]:
         """获取单个 token 的订单簿快照."""
-        cached = self._snapshot_cache.get(token_id)
+        if count_request:
+            self._record_stat("requests")
         now = time.time()
-        if cached is not None and self._snapshot_ttl_sec > 0 and (now - cached.timestamp) <= self._snapshot_ttl_sec:
-            return cached
+        live = self._get_live_snapshot(token_id, now=now)
+        if live is not None:
+            return live
+
+        cached = self._snapshot_cache.get(token_id)
+        if cached is not None:
+            cache_source = self._snapshot_cache_source.get(token_id, "rest")
+            max_age = self._ws_snapshot_max_age_sec if cache_source == "ws" else self._snapshot_ttl_sec
+            if max_age > 0 and (now - cached.timestamp) <= max_age:
+                self._record_stat("cache_hit")
+                return cached
+            self._evict_cached_snapshot(token_id)
+        if not allow_rest_fallback:
+            return None
+        self._record_stat("rest_fallback")
         missing_until = self._missing_orderbook_until.get(token_id)
         if missing_until is not None:
             if now < missing_until:
+                self._record_stat("cooldown_skip")
                 return None
             self._missing_orderbook_until.pop(token_id, None)
 
@@ -80,6 +129,7 @@ class OrderBookAnalyzer:
             except Exception as e:
                 if _is_missing_orderbook_error(e):
                     self._missing_orderbook_until[token_id] = time.time() + self._missing_orderbook_cooldown_sec
+                    self._record_stat("missing_orderbook")
                     LOG.warning(
                         "[cid=%s] token=%s… 暂无 orderbook，进入 %.0fs 冷却",
                         correlation_id,
@@ -99,10 +149,12 @@ class OrderBookAnalyzer:
                     if self._retry_delay_sec > 0:
                         time.sleep(self._retry_delay_sec)
                     continue
+                self._record_stat("rest_error")
                 LOG.error("[cid=%s] get_order_book 失败 token=%s…: %s", correlation_id, token_id[:20], e)
                 return None
 
         if book is None:
+            self._record_stat("rest_error")
             return None
 
         raw_bids = getattr(book, "bids", None) or []
@@ -130,8 +182,40 @@ class OrderBookAnalyzer:
             asks=asks,
             timestamp=now,
         )
-        self._snapshot_cache[token_id] = snapshot
+        self._set_cached_snapshot(token_id, snapshot, source="rest")
+        self._record_stat("rest_success")
         return snapshot
+
+    def _get_live_snapshot(self, token_id: str, *, now: float) -> Optional[OrderBookSnapshot]:
+        if self._live_mirror is None:
+            return None
+        try:
+            snap = self._live_mirror.get(token_id)
+        except Exception as e:
+            LOG.debug("读取 WS 订单簿镜像失败 token=%s…: %s", token_id[:20], e)
+            return None
+        if snap is None:
+            return None
+        snap_ts = float(getattr(snap, "timestamp", 0.0) or 0.0)
+        if self._ws_snapshot_max_age_sec > 0 and snap_ts > 0 and (now - snap_ts) > self._ws_snapshot_max_age_sec:
+            return None
+        self._set_cached_snapshot(token_id, snap, source="ws")
+        self._record_stat("ws_hit")
+        return snap
+
+    def _set_cached_snapshot(self, token_id: str, snapshot: OrderBookSnapshot, *, source: str) -> None:
+        self._snapshot_cache[token_id] = snapshot
+        self._snapshot_cache_source[token_id] = source
+
+    def _evict_cached_snapshot(self, token_id: str) -> None:
+        self._snapshot_cache.pop(token_id, None)
+        self._snapshot_cache_source.pop(token_id, None)
+
+    def _record_stat(self, key: str, amount: int = 1) -> None:
+        if key not in _ORDERBOOK_STAT_KEYS:
+            return
+        with self._stats_lock:
+            self._stats[key] += int(amount)
 
     def get_best_ask_with_depth(
         self, token_id: str, min_size: float = 0.0
@@ -207,15 +291,32 @@ class OrderBookAnalyzer:
         return (vwap, filled)
 
     def batch_get_snapshots(
-        self, token_ids: list[str], delay: float = 0.05
+        self,
+        token_ids: list[str],
+        delay: float = 0.05,
+        *,
+        allow_rest_fallback: bool = True,
     ) -> dict[str, OrderBookSnapshot]:
         """批量获取多个 token 的订单簿快照."""
         result: dict[str, OrderBookSnapshot] = {}
-        for tid in token_ids:
-            snap = self.get_snapshot(tid)
+        missing: list[str] = []
+        deduped = list(dict.fromkeys(token_ids))
+        self._record_stat("requests", len(deduped))
+
+        for tid in deduped:
+            snap = self.get_snapshot(tid, allow_rest_fallback=False, count_request=False)
             if snap is not None:
                 result[tid] = snap
-            if delay > 0 and tid != token_ids[-1]:
+            else:
+                missing.append(tid)
+        if not allow_rest_fallback:
+            return result
+
+        for idx, tid in enumerate(missing):
+            snap = self.get_snapshot(tid, allow_rest_fallback=True, count_request=False)
+            if snap is not None:
+                result[tid] = snap
+            if delay > 0 and idx != len(missing) - 1:
                 time.sleep(delay)
         return result
 

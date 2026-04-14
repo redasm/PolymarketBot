@@ -70,6 +70,31 @@ def _parse_market(raw: dict) -> Optional[MarketInfo]:
     if not condition_id:
         return None
 
+    events_raw = raw.get("events") or []
+    primary_event = events_raw[0] if isinstance(events_raw, list) and events_raw else {}
+    if not isinstance(primary_event, dict):
+        primary_event = {}
+
+    event_id = raw.get("event_id") or raw.get("eventId") or primary_event.get("id") or ""
+    event_slug = _normalize_text(
+        raw.get("event_slug")
+        or raw.get("eventSlug")
+        or primary_event.get("slug")
+        or ""
+    )
+    event_title = _normalize_text(
+        raw.get("event_title")
+        or raw.get("eventTitle")
+        or primary_event.get("title")
+        or ""
+    )
+    event_ticker = _normalize_text(
+        raw.get("event_ticker")
+        or raw.get("eventTicker")
+        or primary_event.get("ticker")
+        or ""
+    )
+
     outcomes = raw.get("outcomes") or []
     if isinstance(outcomes, str):
         try:
@@ -126,8 +151,10 @@ def _parse_market(raw: dict) -> Optional[MarketInfo]:
         closed=bool(raw.get("closed", False)),
         volume_24h=float(raw.get("volume_num_24hr") or raw.get("volume24hr") or 0),
         liquidity=float(raw.get("liquidity") or 0),
-        event_id=raw.get("event_id") or raw.get("eventId") or "",
-        event_slug=_normalize_text(raw.get("event_slug") or ""),
+        event_id=str(event_id),
+        event_slug=event_slug,
+        event_title=event_title,
+        event_ticker=event_ticker,
         outcomes=[_normalize_text(outcome) for outcome in outcomes],
         outcome_prices=outcome_prices,
         neg_risk=bool(neg_risk),
@@ -142,17 +169,26 @@ def _parse_event(raw: dict) -> Optional[EventInfo]:
     if not event_id:
         return None
 
+    event_slug = _normalize_text(raw.get("slug") or "")
+    event_title = _normalize_text(raw.get("title") or "")
+
     markets_raw = raw.get("markets") or []
     markets: list[MarketInfo] = []
     for m in markets_raw:
         parsed = _parse_market(m)
         if parsed:
+            if not parsed.event_id:
+                parsed.event_id = event_id
+            if not parsed.event_slug:
+                parsed.event_slug = event_slug
+            if not parsed.event_title:
+                parsed.event_title = event_title
             markets.append(parsed)
 
     return EventInfo(
         event_id=event_id,
-        slug=_normalize_text(raw.get("slug") or ""),
-        title=_normalize_text(raw.get("title") or ""),
+        slug=event_slug,
+        title=event_title,
         markets=markets,
         active=bool(raw.get("active", True)),
         closed=bool(raw.get("closed", False)),

@@ -74,6 +74,7 @@ class ArbConfig:
     min_liquidity: float
     min_volume_24h: float
     orderbook_snapshot_ttl_sec: float
+    orderbook_ws_snapshot_max_age_sec: float
     orderbook_retry_count: int
     orderbook_retry_delay_sec: float
     orderbook_missing_cooldown_sec: float
@@ -115,6 +116,9 @@ class ArbConfig:
     edge_volatility_spike_penalty: float
     edge_volatility_calm_ratio: float
     edge_volatility_calm_boost: float
+    t2_max_spread_bps: float
+    t2_min_top_depth: float
+    t2_max_complement_error_bps: float
 
     # Tick 录制
     tick_record_enabled: bool
@@ -167,6 +171,13 @@ class ArbConfig:
     research_signal_cache_ttl_sec: int
     research_signal_cache_dir: str
     research_signal_extra_rss_feeds: str
+    research_signal_http_json_sources: str
+    research_signal_surf_enabled: bool
+    research_signal_surf_api_key: str
+    research_signal_surf_api_base: str
+    research_signal_surf_model: str
+    research_signal_surf_timeout_sec: float
+    research_signal_surf_cache_ttl_sec: float
     research_signal_knowledge_enabled: bool
     research_signal_knowledge_dir: str
     research_signal_knowledge_max_matches: int
@@ -196,6 +207,8 @@ class ArbConfig:
             raise ValueError("ARB_SCAN_INTERVAL_SEC 必须大于 0")
         if self.orderbook_retry_count < 0:
             raise ValueError("ORDERBOOK_RETRY_COUNT 不能为负数")
+        if self.orderbook_ws_snapshot_max_age_sec < 0:
+            raise ValueError("ORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC 不能为负数")
         if self.orderbook_retry_delay_sec < 0:
             raise ValueError("ORDERBOOK_RETRY_DELAY_SEC 不能为负数")
         if self.orderbook_missing_cooldown_sec < 0:
@@ -238,6 +251,12 @@ class ArbConfig:
             raise ValueError("波动率比率阈值必须大于 0")
         if self.edge_volatility_spike_penalty <= 0 or self.edge_volatility_calm_boost <= 0:
             raise ValueError("波动率置信度调整因子必须大于 0")
+        if self.t2_max_spread_bps < 0:
+            raise ValueError("T2_MAX_SPREAD_BPS 不能为负数")
+        if self.t2_min_top_depth < 0:
+            raise ValueError("T2_MIN_TOP_DEPTH 不能为负数")
+        if self.t2_max_complement_error_bps < 0:
+            raise ValueError("T2_MAX_COMPLEMENT_ERROR_BPS 不能为负数")
 
     @classmethod
     def from_env(
@@ -284,6 +303,7 @@ class ArbConfig:
             min_liquidity=_env_float("ARB_MIN_LIQUIDITY", 1000.0),
             min_volume_24h=_env_float("ARB_MIN_VOLUME_24H", 500.0),
             orderbook_snapshot_ttl_sec=_env_float("ORDERBOOK_SNAPSHOT_TTL_SEC", 0.5),
+            orderbook_ws_snapshot_max_age_sec=_env_float("ORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC", 10.0),
             orderbook_retry_count=_env_int("ORDERBOOK_RETRY_COUNT", 2),
             orderbook_retry_delay_sec=_env_float("ORDERBOOK_RETRY_DELAY_SEC", 0.15),
             orderbook_missing_cooldown_sec=_env_float("ORDERBOOK_MISSING_COOLDOWN_SEC", 300.0),
@@ -317,6 +337,9 @@ class ArbConfig:
             edge_volatility_spike_penalty=_env_float("EDGE_VOLATILITY_SPIKE_PENALTY", 0.7),
             edge_volatility_calm_ratio=_env_float("EDGE_VOLATILITY_CALM_RATIO", 0.8),
             edge_volatility_calm_boost=_env_float("EDGE_VOLATILITY_CALM_BOOST", 1.1),
+            t2_max_spread_bps=_env_float("T2_MAX_SPREAD_BPS", 80.0),
+            t2_min_top_depth=_env_float("T2_MIN_TOP_DEPTH", 100.0),
+            t2_max_complement_error_bps=_env_float("T2_MAX_COMPLEMENT_ERROR_BPS", 150.0),
             tick_record_enabled=_env_bool("TICK_RECORD_ENABLED", False),
             tick_record_dir=_env("TICK_RECORD_DIR", "data/ticks"),
             telemetry_record_enabled=_env_bool("TELEMETRY_RECORD_ENABLED", False),
@@ -355,6 +378,13 @@ class ArbConfig:
             research_signal_cache_ttl_sec=_env_int("RESEARCH_SIGNAL_CACHE_TTL_SEC", 300),
             research_signal_cache_dir=_env("RESEARCH_SIGNAL_CACHE_DIR", "data/research_signal"),
             research_signal_extra_rss_feeds=_env("RESEARCH_SIGNAL_EXTRA_RSS_FEEDS", ""),
+            research_signal_http_json_sources=_env("RESEARCH_SIGNAL_HTTP_JSON_SOURCES", ""),
+            research_signal_surf_enabled=_env_bool("RESEARCH_SIGNAL_SURF_ENABLED", False),
+            research_signal_surf_api_key=_env("RESEARCH_SIGNAL_SURF_API_KEY", ""),
+            research_signal_surf_api_base=_env("RESEARCH_SIGNAL_SURF_API_BASE", "https://api.asksurf.ai/surf-ai"),
+            research_signal_surf_model=_env("RESEARCH_SIGNAL_SURF_MODEL", "surf-1.5-instant"),
+            research_signal_surf_timeout_sec=_env_float("RESEARCH_SIGNAL_SURF_TIMEOUT_SEC", 8.0),
+            research_signal_surf_cache_ttl_sec=_env_float("RESEARCH_SIGNAL_SURF_CACHE_TTL_SEC", 1800.0),
             research_signal_knowledge_enabled=_env_bool("RESEARCH_SIGNAL_KNOWLEDGE_ENABLED", False),
             research_signal_knowledge_dir=_env("RESEARCH_SIGNAL_KNOWLEDGE_DIR", "data/research_signal/knowledge"),
             research_signal_knowledge_max_matches=_env_int("RESEARCH_SIGNAL_KNOWLEDGE_MAX_MATCHES", 3),

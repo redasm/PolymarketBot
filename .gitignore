@@ -13,3 +13,5 @@ arb_state.json
 positions_snapshot.json
 *.log
 data/
+.tmp_selftest*/
+research/backtest/output/

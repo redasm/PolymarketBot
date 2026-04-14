@@ -14,8 +14,12 @@ from tests.conftest import make_test_config, write_test_env
         ("market_fetch_limit", 0, "ARB_MARKET_FETCH_LIMIT"),
         ("scan_interval_sec", 0.0, "ARB_SCAN_INTERVAL_SEC"),
         ("orderbook_retry_count", -1, "ORDERBOOK_RETRY_COUNT"),
+        ("orderbook_ws_snapshot_max_age_sec", -0.1, "ORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC"),
         ("orderbook_retry_delay_sec", -0.1, "ORDERBOOK_RETRY_DELAY_SEC"),
         ("orderbook_missing_cooldown_sec", -1.0, "ORDERBOOK_MISSING_COOLDOWN_SEC"),
+        ("t2_max_spread_bps", -1.0, "T2_MAX_SPREAD_BPS"),
+        ("t2_min_top_depth", -1.0, "T2_MIN_TOP_DEPTH"),
+        ("t2_max_complement_error_bps", -1.0, "T2_MAX_COMPLEMENT_ERROR_BPS"),
         ("max_multi_outcome_legs", 1, "ARB_MAX_MULTI_OUTCOME_LEGS"),
         ("risk_event_cooldown_sec", -1.0, "RISK_EVENT_COOLDOWN_SEC"),
         ("risk_pending_reservation_ttl_sec", -1.0, "RISK_PENDING_RESERVATION_TTL_SEC"),
@@ -30,18 +34,34 @@ def test_config_validate_rejects_invalid_values(field_name, value, expected_msg)
         make_test_config(**kwargs)
 
 
-def test_from_env_loads_new_edge_and_cooldown_config(tmp_path):
+def test_from_env_loads_new_edge_and_cooldown_config(tmp_path, monkeypatch):
     env_path = write_test_env(tmp_path)
     env_path.write_text(
         env_path.read_text(encoding="utf-8")
-        + "\nEDGE_CONFIDENCE_FULL_BPS=650\nEDGE_CONFIDENCE_IMBALANCE_WEIGHT=0.2\nORDERBOOK_MISSING_COOLDOWN_SEC=120\nCROSS_PLATFORM_PAIRS_JSON=[]\nRISK_PENDING_RESERVATION_TTL_SEC=300\n",
+        + "\nEDGE_CONFIDENCE_FULL_BPS=650\nEDGE_CONFIDENCE_IMBALANCE_WEIGHT=0.2\nORDERBOOK_MISSING_COOLDOWN_SEC=120\nORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC=15\nT2_MAX_SPREAD_BPS=90\nT2_MIN_TOP_DEPTH=150\nT2_MAX_COMPLEMENT_ERROR_BPS=120\nCROSS_PLATFORM_PAIRS_JSON=[]\nRISK_PENDING_RESERVATION_TTL_SEC=300\n",
         encoding="utf-8",
     )
+    for key in (
+        "EDGE_CONFIDENCE_FULL_BPS",
+        "EDGE_CONFIDENCE_IMBALANCE_WEIGHT",
+        "ORDERBOOK_MISSING_COOLDOWN_SEC",
+        "ORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC",
+        "T2_MAX_SPREAD_BPS",
+        "T2_MIN_TOP_DEPTH",
+        "T2_MAX_COMPLEMENT_ERROR_BPS",
+        "CROSS_PLATFORM_PAIRS_JSON",
+        "RISK_PENDING_RESERVATION_TTL_SEC",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
     cfg = ArbConfig.from_env(env_path)
 
     assert cfg.risk_event_cooldown_sec == 60.0
     assert cfg.orderbook_missing_cooldown_sec == 120.0
+    assert cfg.orderbook_ws_snapshot_max_age_sec == 15.0
+    assert cfg.t2_max_spread_bps == 90.0
+    assert cfg.t2_min_top_depth == 150.0
+    assert cfg.t2_max_complement_error_bps == 120.0
     assert cfg.cross_platform_pairs_json == "[]"
     assert cfg.risk_pending_reservation_ttl_sec == 300.0
     assert cfg.edge_confidence_full_bps == 650.0
@@ -72,3 +92,26 @@ def test_dump_safe_masks_funder_address():
     assert dumped["funder_address"].startswith("0xEC2e")
     assert dumped["funder_address"].endswith("0AF")
     assert "***" in dumped["funder_address"]
+
+
+def test_from_env_preserves_existing_environment_values(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env.precedence"
+    env_path.write_text(
+        "\n".join(
+            [
+                "PRIVATE_KEY=dotenv-key",
+                "POLYMARKET_FUNDER=dotenv-funder",
+                "ARB_SCAN_INTERVAL_SEC=7",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PRIVATE_KEY", "env-key")
+    monkeypatch.setenv("POLYMARKET_FUNDER", "env-funder")
+    monkeypatch.setenv("ARB_SCAN_INTERVAL_SEC", "9")
+
+    cfg = ArbConfig.from_env(env_path)
+
+    assert cfg.private_key == "env-key"
+    assert cfg.funder_address == "env-funder"
+    assert cfg.scan_interval_sec == 9.0

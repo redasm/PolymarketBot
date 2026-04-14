@@ -66,19 +66,23 @@ class T0BacktestAdapter:
     def from_rows(cls, config: Any, row: dict[str, Any]) -> tuple["T0BacktestAdapter", MarketInfo]:
         yes_token_id = row.get("yes_token_id", "yes")
         no_token_id = row.get("no_token_id", "no")
+        yes_bid_levels = _levels_from_row(row.get("yes_bid_levels"), row.get("yes_best_bid"), row.get("yes_bid_size"))
+        yes_ask_levels = _levels_from_row(row.get("yes_ask_levels"), row.get("yes_best_ask"), row.get("yes_ask_size"))
         yes_snapshot = OrderBookSnapshot(
             token_id=yes_token_id,
             best_bid=row.get("yes_best_bid"),
             best_ask=row.get("yes_best_ask"),
-            bids=[OrderBookLevel(row.get("yes_best_bid"), row.get("yes_bid_size", 0.0))] if row.get("yes_best_bid") is not None else [],
-            asks=[OrderBookLevel(row.get("yes_best_ask"), row.get("yes_ask_size", 0.0))] if row.get("yes_best_ask") is not None else [],
+            bids=yes_bid_levels,
+            asks=yes_ask_levels,
         )
+        no_bid_levels = _levels_from_row(row.get("no_bid_levels"), row.get("no_best_bid"), row.get("no_bid_size"))
+        no_ask_levels = _levels_from_row(row.get("no_ask_levels"), row.get("no_best_ask"), row.get("no_ask_size"))
         no_snapshot = OrderBookSnapshot(
             token_id=no_token_id,
             best_bid=row.get("no_best_bid"),
             best_ask=row.get("no_best_ask"),
-            bids=[OrderBookLevel(row.get("no_best_bid"), row.get("no_bid_size", 0.0))] if row.get("no_best_bid") is not None else [],
-            asks=[OrderBookLevel(row.get("no_best_ask"), row.get("no_ask_size", 0.0))] if row.get("no_best_ask") is not None else [],
+            bids=no_bid_levels,
+            asks=no_ask_levels,
         )
         detector = ArbitrageDetector(
             config,
@@ -114,3 +118,17 @@ class T0BacktestAdapter:
             "available_size": sum(size for _, size in ask_levels) if ask_levels else opp.max_executable_size,
             "best_ask": ask_levels[0][0] if ask_levels else first_leg.execution_price,
         }
+
+
+def _levels_from_row(levels: Any, best_price: Any, best_size: Any) -> list[OrderBookLevel]:
+    parsed: list[OrderBookLevel] = []
+    if isinstance(levels, list):
+        for item in levels:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            parsed.append(OrderBookLevel(float(item[0]), float(item[1])))
+    if parsed:
+        return parsed
+    if best_price is None:
+        return []
+    return [OrderBookLevel(float(best_price), float(best_size or 0.0))]

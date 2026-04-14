@@ -38,6 +38,34 @@ def test_parse_market_falls_back_to_clob_token_ids():
     assert [token.outcome for token in market.tokens] == ["Yes", "No"]
 
 
+def test_parse_market_inherits_primary_event_metadata():
+    market = _parse_market(
+        {
+            "conditionId": "c3",
+            "question": "Will it happen by Friday?",
+            "slug": "happen-by-friday",
+            "tokens": [
+                {"tokenId": "yes-token", "outcome": "Yes", "price": "0.44"},
+                {"tokenId": "no-token", "outcome": "No", "price": "0.55"},
+            ],
+            "events": [
+                {
+                    "id": "evt-1",
+                    "slug": "bitcoin-halving-2026",
+                    "title": "Bitcoin halving event",
+                    "ticker": "BTC-HALVING-2026",
+                }
+            ],
+        }
+    )
+
+    assert market is not None
+    assert market.event_id == "evt-1"
+    assert market.event_slug == "bitcoin-halving-2026"
+    assert market.event_title == "Bitcoin halving event"
+    assert market.event_ticker == "BTC-HALVING-2026"
+
+
 def test_normalize_text_repairs_common_mojibake_and_whitespace():
     assert _normalize_text("Claude 5 released byâ¦?") == "Claude 5 released by…?"
     assert _normalize_text("  Mike   Johnson out as Speaker by...?   ") == "Mike Johnson out as Speaker by...?"
@@ -65,6 +93,9 @@ def test_parse_event_normalizes_titles_and_market_questions():
     assert event is not None
     assert event.title == "Claude 5 released by…?"
     assert event.markets[0].question == "Claude 5 released by…?"
+    assert event.markets[0].event_id == "e1"
+    assert event.markets[0].event_slug == "claude-5"
+    assert event.markets[0].event_title == "Claude 5 released by…?"
 
 
 def test_fetch_active_markets_ignores_invalid_response_shape(monkeypatch):
