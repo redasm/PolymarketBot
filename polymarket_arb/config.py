@@ -270,9 +270,9 @@ class ArbConfig:
     ) -> ArbConfig:
         """从 .env 文件和环境变量构建配置."""
         if dotenv_path:
-            load_dotenv(dotenv_path)
+            load_dotenv(dotenv_path, override=True)
         else:
-            load_dotenv()
+            load_dotenv(override=True)
 
         private_key = _env("PRIVATE_KEY") or _env("POLYMARKET_PRIVATE_KEY")
         funder = _env("POLYMARKET_FUNDER")

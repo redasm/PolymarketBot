@@ -115,6 +115,6 @@ def test_from_env_preserves_existing_environment_values(tmp_path, monkeypatch):
 
     cfg = ArbConfig.from_env(env_path)
 
-    assert cfg.private_key == "env-key"
-    assert cfg.funder_address == "env-funder"
-    assert cfg.scan_interval_sec == 9.0
+    assert cfg.private_key == "dotenv-key"
+    assert cfg.funder_address == "dotenv-funder"
+    assert cfg.scan_interval_sec == 7.0
