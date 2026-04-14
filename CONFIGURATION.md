@@ -208,6 +208,7 @@ sigma_blend = 0.7 × sigma_fast + 0.3 × sigma_slow
 | `EDGE_MIN_BPS` | float | `100` | 最小 edge 阈值（基点）。低于此值不触发信号 |
 | `EDGE_MAX_SPREAD_BPS` | float | `500` | 最大可接受 spread（基点）。超过则 veto |
 | `EDGE_MIN_CONFIDENCE` | float | `0.4` | 最小置信度。低于此值不触发信号 |
+| `T2_MIN_DEVIATION` | float | `0.02` | T2 统计套利最小绝对概率偏差（如 `0.01` = 1%） |
 
 **Edge 引擎信号源：**
 
@@ -224,6 +225,17 @@ sigma_blend = 0.7 × sigma_fast + 0.3 × sigma_slow
 - spread > `EDGE_MAX_SPREAD_BPS`
 - depth < `ARB_MIN_LIQUIDITY × 0.05`
 - confidence < `EDGE_MIN_CONFIDENCE`
+
+**T2 统计套利额外质量过滤：**
+
+- spread > `T2_MAX_SPREAD_BPS`
+- top depth < `T2_MIN_TOP_DEPTH`
+- complement error > `T2_MAX_COMPLEMENT_ERROR_BPS`
+
+补充说明：
+
+- `T2_MIN_DEVIATION` 独立于 `EDGE_MIN_BPS`，这样可以单独调 T2 的灵敏度，而不必为了让统计套利更敏感去误伤 Edge 引擎的方向信号阈值。
+- 如果你在观测期连续数天都看不到 T2 信号，优先检查的通常不是模型代码，而是 `T2_MAX_SPREAD_BPS` / `T2_MIN_TOP_DEPTH` / `ARB_MARKET_FOCUS_KEYWORDS` 是否把样本压得过少。
 
 ### Tick 录制
 

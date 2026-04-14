@@ -34,16 +34,22 @@ class _FakeClient:
     def __init__(self):
         self.last_order_type = None
         self.cancelled: list[str] = []
+        self.last_post_only = None
+        self.balance_response = {"balance": "100.0", "allowance": "100.0"}
 
     def create_order(self, order_args, options):
         return {"order": order_args, "options": options}
 
-    def post_order(self, signed_order, orderType):
+    def post_order(self, signed_order, orderType, post_only=False):
         self.last_order_type = orderType
+        self.last_post_only = post_only
         return {"orderID": "oid-123"}
 
     def cancel(self, order_id):
         self.cancelled.append(order_id)
+
+    def get_balance_allowance(self, params=None):
+        return self.balance_response
 
 
 def _install_fake_clob_modules(monkeypatch, order_type=None):
@@ -79,14 +85,16 @@ def test_submit_order_uses_fok(monkeypatch):
     assert result.order_id == "oid-123"
     assert result.trade_status == TradeStatus.PENDING
     assert client.last_order_type == "FOK"
+    assert client.last_post_only is False
 
 
 def test_submit_order_non_gtc_without_fill_status_stays_pending(monkeypatch):
     _install_fake_clob_modules(monkeypatch)
 
     class _PendingClient(_FakeClient):
-        def post_order(self, signed_order, orderType):
+        def post_order(self, signed_order, orderType, post_only=False):
             self.last_order_type = orderType
+            self.last_post_only = post_only
             return {"orderID": "oid-123", "success": True, "status": "accepted"}
 
     client = _PendingClient()
@@ -101,8 +109,9 @@ def test_submit_order_non_gtc_partial_status_maps_to_partial(monkeypatch):
     _install_fake_clob_modules(monkeypatch)
 
     class _PartialClient(_FakeClient):
-        def post_order(self, signed_order, orderType):
+        def post_order(self, signed_order, orderType, post_only=False):
             self.last_order_type = orderType
+            self.last_post_only = post_only
             return {"orderID": "oid-123", "success": True, "status": "partial"}
 
     client = _PartialClient()
@@ -117,8 +126,9 @@ def test_submit_order_extracts_partial_fill_details(monkeypatch):
     _install_fake_clob_modules(monkeypatch)
 
     class _PartialClient(_FakeClient):
-        def post_order(self, signed_order, orderType):
+        def post_order(self, signed_order, orderType, post_only=False):
             self.last_order_type = orderType
+            self.last_post_only = post_only
             return {
                 "orderID": "oid-123",
                 "success": True,
@@ -251,6 +261,70 @@ def test_dry_run_marks_records_as_simulated():
     assert all(trade.simulated is True for trade in trades)
     assert all(trade.status == TradeStatus.FILLED for trade in trades)
     assert engine.trade_history == []
+
+
+def test_submit_limit_order_uses_post_only_gtc(monkeypatch):
+    _install_fake_clob_modules(monkeypatch)
+    client = _FakeClient()
+    engine = ExecutionEngine(make_test_config(dry_run=False), client)
+
+    trade = engine.submit_limit_order(
+        token_id="token-1",
+        condition_id="cond-1",
+        outcome="Yes",
+        side=OrderSide.BUY,
+        price=0.41,
+        size=3,
+        post_only=True,
+        order_type_name="GTC",
+    )
+
+    assert trade.status == TradeStatus.PENDING
+    assert client.last_order_type == "GTC"
+    assert client.last_post_only is True
+
+
+def test_submit_limit_order_dry_run_post_only_stays_pending():
+    engine = ExecutionEngine(make_test_config(dry_run=True), _FakeClient())
+
+    trade = engine.submit_limit_order(
+        token_id="token-1",
+        condition_id="cond-1",
+        outcome="Yes",
+        side=OrderSide.BUY,
+        price=0.41,
+        size=3,
+        post_only=True,
+    )
+
+    assert trade.simulated is True
+    assert trade.status == TradeStatus.PENDING
+
+
+def test_ensure_sufficient_collateral_uses_balance_allowance(monkeypatch):
+    _install_fake_clob_modules(monkeypatch)
+    client = _FakeClient()
+    client.balance_response = {"balance": "25.0", "allowance": "20.0"}
+    engine = ExecutionEngine(make_test_config(dry_run=False), client)
+
+    ok, reason, available = engine.ensure_sufficient_collateral(15.0)
+
+    assert ok is True
+    assert reason == ""
+    assert available == 20.0
+
+
+def test_ensure_sufficient_collateral_rejects_when_balance_too_low(monkeypatch):
+    _install_fake_clob_modules(monkeypatch)
+    client = _FakeClient()
+    client.balance_response = {"balance": "5.0", "allowance": "4.0"}
+    engine = ExecutionEngine(make_test_config(dry_run=False), client)
+
+    ok, reason, available = engine.ensure_sufficient_collateral(10.0)
+
+    assert ok is False
+    assert "insufficient_balance" in reason
+    assert available == 4.0
 
 
 def test_get_pnl_summary_excludes_simulated_trades_by_default():

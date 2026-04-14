@@ -110,7 +110,14 @@ class RiskManager:
 
         return True, "", max_affordable_size
 
-    def record_execution(self, opp: ArbOpportunity, trades: list[TradeRecord]) -> None:
+    def record_execution(
+        self,
+        opp: ArbOpportunity,
+        trades: list[TradeRecord],
+        *,
+        realized_pnl: float | None = None,
+        count_pending_as_failure: bool = True,
+    ) -> None:
         """记录交易执行结果，更新风险状态."""
         filled_trades = [t for t in trades if t.status == TradeStatus.FILLED]
         partially_filled_trades = [t for t in trades if t.status == TradeStatus.PARTIAL]
@@ -124,9 +131,15 @@ class RiskManager:
         )
         event_should_cooldown = bool(actual_exposure_trades or pending_trades)
 
+        only_pending_submission = (
+            bool(pending_trades)
+            and not actual_exposure_trades
+            and not failed_trades
+        )
+
         if execution_success:
             self._state.consecutive_failures = 0
-        elif trades:
+        elif trades and not (only_pending_submission and not count_pending_as_failure):
             self._state.consecutive_failures += 1
             if self._state.consecutive_failures >= self._config.max_consecutive_failures > 0:
                 self._state.is_halted = True
@@ -168,9 +181,8 @@ class RiskManager:
         if event_should_cooldown:
             self._recent_arb_markets[opp.event_id] = time.time()
 
-        if execution_success and filled_trades:
-            expected_profit = opp.net_edge * min(_resolved_execution_size(t) for t in filled_trades)
-            self._state.daily_pnl += expected_profit
+        if realized_pnl is not None:
+            self._state.daily_pnl += float(realized_pnl)
 
         LOG.info(
             "风控状态: 持仓=%d, 总敞口=$%.2f, 日盈亏=$%.2f, 连续失败=%d",

@@ -116,6 +116,7 @@ class ArbConfig:
     edge_volatility_spike_penalty: float
     edge_volatility_calm_ratio: float
     edge_volatility_calm_boost: float
+    t2_min_deviation: float
     t2_max_spread_bps: float
     t2_min_top_depth: float
     t2_max_complement_error_bps: float
@@ -251,6 +252,8 @@ class ArbConfig:
             raise ValueError("波动率比率阈值必须大于 0")
         if self.edge_volatility_spike_penalty <= 0 or self.edge_volatility_calm_boost <= 0:
             raise ValueError("波动率置信度调整因子必须大于 0")
+        if self.t2_min_deviation < 0:
+            raise ValueError("T2_MIN_DEVIATION 不能为负数")
         if self.t2_max_spread_bps < 0:
             raise ValueError("T2_MAX_SPREAD_BPS 不能为负数")
         if self.t2_min_top_depth < 0:
@@ -337,6 +340,7 @@ class ArbConfig:
             edge_volatility_spike_penalty=_env_float("EDGE_VOLATILITY_SPIKE_PENALTY", 0.7),
             edge_volatility_calm_ratio=_env_float("EDGE_VOLATILITY_CALM_RATIO", 0.8),
             edge_volatility_calm_boost=_env_float("EDGE_VOLATILITY_CALM_BOOST", 1.1),
+            t2_min_deviation=_env_float("T2_MIN_DEVIATION", 0.02),
             t2_max_spread_bps=_env_float("T2_MAX_SPREAD_BPS", 80.0),
             t2_min_top_depth=_env_float("T2_MIN_TOP_DEPTH", 100.0),
             t2_max_complement_error_bps=_env_float("T2_MAX_COMPLEMENT_ERROR_BPS", 150.0),

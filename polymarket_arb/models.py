@@ -13,6 +13,8 @@ class ArbType(str, Enum):
 
     BINARY = "binary"  # 二元市场 Yes+No < 1
     MULTI_OUTCOME = "multi_outcome"  # 多结果市场 sum(asks) < 1
+    DIRECTIONAL = "directional"  # 单腿方向性交易（T2 / AI）
+    MARKET_MAKING = "market_making"  # 做市挂单
 
 
 class OrderSide(str, Enum):

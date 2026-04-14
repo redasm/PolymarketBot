@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 import importlib
 import json
 import logging
@@ -24,6 +25,7 @@ import re
 import signal
 import threading
 import time
+import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
 from polymarket_arb.ai_advisor import AIAdvisor, create_ai_advisor
@@ -42,7 +44,15 @@ from polymarket_arb.event_recorder import EventRecorder
 from polymarket_arb.execution_engine import ExecutionEngine
 from polymarket_arb.logger_setup import setup_logging
 from polymarket_arb.market_scanner import MarketScanner
-from polymarket_arb.models import ArbOpportunity, ArbType, MarketInfo, ResearchSignalReport
+from polymarket_arb.models import (
+    ArbLeg,
+    ArbOpportunity,
+    ArbType,
+    MarketInfo,
+    ResearchSignalReport,
+    TradeRecord,
+    TradeStatus,
+)
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
 from polymarket_arb.risk_manager import RiskManager
 from polymarket_arb.strategies.cross_platform import CrossPlatformScanner, KalshiClient
@@ -73,6 +83,26 @@ _FOCUS_ALIASES = {
     "sol": ("sol", "solana"),
     "arb": ("arb", "arbitrum"),
 }
+_MONTHS = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+_DEADLINE_RE = re.compile(
+    r"\b(?:by|before)\s+"
+    r"(january|february|march|april|may|june|july|august|september|october|november|december)"
+    r"\s+(\d{1,2}),\s*(\d{4})",
+    re.IGNORECASE,
+)
 
 
 def _signal_handler(sig: int, frame: Any) -> None:
@@ -330,6 +360,7 @@ def _collect_statistical_strategy_signals(
     detector: StatisticalMispricingDetector,
 )-> list[StrategySignal]:
     signals: list[StrategySignal] = []
+    related_market_context = _build_t2_related_market_context(candidate_markets, ob_analyzer)
     for market in candidate_markets:
         if len(market.tokens) != 2 or market.closed or not market.active:
             continue
@@ -353,6 +384,7 @@ def _collect_statistical_strategy_signals(
             bids_total_size=bids_total_size,
             asks_total_size=asks_total_size,
             mid_price=float(snap.mid),
+            related_market_prices=related_market_context.get(market.condition_id),
         )
         if estimate is None:
             continue
@@ -376,10 +408,86 @@ def _collect_statistical_strategy_signals(
                     "deviation_pct": estimate.deviation_pct,
                     "signals": dict(estimate.signals),
                     "quality": quality,
+                    "related_context_count": len(related_market_context.get(market.condition_id, {})),
                 },
             )
         )
     return signals
+
+
+def _extract_market_temporal_stem(question: str) -> str:
+    normalized = re.sub(r"\s+", " ", (question or "")).strip().rstrip("?").strip().lower()
+    normalized = re.sub(r"\bwill\s+", "", normalized)
+    normalized = re.sub(r"\s+(?:by|before)\s+.+$", "", normalized)
+    return normalized.strip(" .!?")
+
+
+def _extract_market_deadline(question: str) -> datetime | None:
+    match = _DEADLINE_RE.search(question or "")
+    if not match:
+        return None
+    month = _MONTHS.get(match.group(1).lower())
+    day = int(match.group(2))
+    year = int(match.group(3))
+    if month is None:
+        return None
+    try:
+        return datetime(year, month, day)
+    except ValueError:
+        return None
+
+
+def _build_t2_related_market_context(
+    candidate_markets: list[MarketInfo],
+    ob_analyzer: OrderBookAnalyzer,
+) -> dict[str, dict[str, Any]]:
+    yes_mid_by_market: dict[str, float] = {}
+    for market in candidate_markets:
+        if len(market.tokens) != 2 or market.closed or not market.active:
+            continue
+        yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
+        snap = ob_analyzer.get_snapshot(yes_token.token_id)
+        if snap is None or snap.mid is None:
+            continue
+        yes_mid_by_market[market.condition_id] = float(snap.mid)
+
+    contexts: dict[str, dict[str, Any]] = {cid: {} for cid in yes_mid_by_market}
+    ladder_groups: dict[tuple[str, str], list[tuple[datetime, MarketInfo]]] = {}
+
+    for market in candidate_markets:
+        if market.condition_id not in yes_mid_by_market:
+            continue
+        stem = _extract_market_temporal_stem(market.question)
+        deadline = _extract_market_deadline(market.question)
+        if not stem or deadline is None:
+            continue
+        group_key = (market.event_id or market.event_slug or stem, stem)
+        ladder_groups.setdefault(group_key, []).append((deadline, market))
+
+    for ladder in ladder_groups.values():
+        ladder.sort(key=lambda item: item[0])
+        for idx, (_, market) in enumerate(ladder):
+            current = contexts.setdefault(market.condition_id, {})
+            if idx > 0:
+                prev_market = ladder[idx - 1][1]
+                prev_price = yes_mid_by_market.get(prev_market.condition_id)
+                if prev_price is not None:
+                    current[prev_market.condition_id] = {
+                        "price": prev_price,
+                        "relation": "lower_bound",
+                        "weight": 1.35,
+                    }
+            if idx + 1 < len(ladder):
+                next_market = ladder[idx + 1][1]
+                next_price = yes_mid_by_market.get(next_market.condition_id)
+                if next_price is not None:
+                    current[next_market.condition_id] = {
+                        "price": next_price,
+                        "relation": "upper_bound",
+                        "weight": 1.35,
+                    }
+
+    return {cid: ctx for cid, ctx in contexts.items() if ctx}
 
 
 def _evaluate_t2_market_quality(*, config: ArbConfig, snap: Any, no_snap: Any) -> dict[str, Any]:
@@ -492,6 +600,325 @@ def _collect_maker_strategy_signals(
             )
         )
     return signals
+
+
+def _resolve_strategy_signal_action(signal: StrategySignal) -> str:
+    payload_action = str(signal.payload.get("action", "")).upper()
+    if payload_action:
+        return payload_action
+    signal_type = signal.signal_type.upper()
+    if "BUY_YES" in signal_type:
+        return "BUY_YES"
+    if "BUY_NO" in signal_type:
+        return "BUY_NO"
+    if "SELL_YES" in signal_type:
+        return "SELL_YES"
+    if "SELL_NO" in signal_type:
+        return "SELL_NO"
+    if signal_type.endswith("BUY_YES"):
+        return "BUY_YES"
+    if signal_type.endswith("BUY_NO"):
+        return "BUY_NO"
+    return ""
+
+
+def _find_market_for_signal(signal_market_id: str, markets: list[MarketInfo]) -> MarketInfo | None:
+    for market in markets:
+        if market.condition_id == signal_market_id:
+            return market
+        if (
+            signal_market_id
+            and len(signal_market_id) >= 8
+            and (market.condition_id.startswith(signal_market_id) or signal_market_id.startswith(market.condition_id))
+        ):
+            return market
+    return None
+
+
+def _build_directional_opportunity_from_signal(
+    *,
+    config: ArbConfig,
+    signal: StrategySignal,
+    market: MarketInfo,
+    ob_analyzer: OrderBookAnalyzer,
+) -> tuple[ArbOpportunity | None, float, str]:
+    action = _resolve_strategy_signal_action(signal)
+    if action not in {"BUY_YES", "BUY_NO"}:
+        return None, 0.0, "unsupported_direction"
+
+    if len(market.tokens) < 2:
+        return None, 0.0, "non_binary_market"
+
+    yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
+    no_token = next((t for t in market.tokens if (t.outcome or "").lower() == "no"), market.tokens[-1])
+    target_token = yes_token if action == "BUY_YES" else no_token
+    outcome_label = "Yes" if action == "BUY_YES" else "No"
+
+    snap = ob_analyzer.get_snapshot(target_token.token_id)
+    if snap is None or snap.best_ask is None or snap.best_ask <= 0:
+        return None, 0.0, "missing_best_ask"
+
+    target_notional = max(0.0, float(signal.recommended_size_usdc))
+    if target_notional <= 0:
+        return None, 0.0, "non_positive_notional"
+    target_size = target_notional / float(snap.best_ask)
+    executable = ob_analyzer.get_executable_ask_price(target_token.token_id, target_size)
+    if executable is None:
+        return None, 0.0, "insufficient_depth"
+    execution_price, fillable_size = executable
+    if fillable_size <= 0:
+        return None, 0.0, "zero_fillable_size"
+
+    gross_edge = abs(float(signal.payload.get("deviation", 0.0) or (signal.expected_edge / 10_000.0)))
+    fee_estimate = float(config.polymarket_taker_fee_rate) * float(execution_price)
+    net_edge = gross_edge - fee_estimate
+    if net_edge <= 0:
+        return None, 0.0, "edge_below_fee"
+
+    opportunity = ArbOpportunity(
+        arb_type=ArbType.DIRECTIONAL,
+        event_id=market.event_id or market.condition_id,
+        event_title=market.question,
+        markets=[market],
+        total_cost=float(execution_price),
+        guaranteed_payout=1.0,
+        gross_edge=gross_edge,
+        net_edge=net_edge,
+        edge_pct=(net_edge / float(execution_price)) * 100.0 if execution_price > 0 else 0.0,
+        legs=[
+            ArbLeg(
+                token_id=target_token.token_id,
+                condition_id=market.condition_id,
+                outcome=outcome_label,
+                side=OrderSide.BUY,
+                price=float(execution_price),
+                size=float(target_size),
+                available_size=float(fillable_size),
+                execution_price=float(execution_price),
+                economic_cost=float(execution_price),
+            )
+        ],
+        max_executable_size=float(fillable_size),
+        confidence=float(signal.confidence),
+    )
+    return opportunity, float(target_size), ""
+
+
+def _sum_trade_exposure(trades: list[Any]) -> float:
+    total = 0.0
+    for trade in trades:
+        leg_cost = getattr(trade, "economic_cost", None)
+        if leg_cost is None:
+            leg_cost = getattr(trade, "price", 0.0)
+        fill_size = getattr(trade, "fill_size", None)
+        size = float(fill_size if fill_size is not None else getattr(trade, "size", 0.0) or 0.0)
+        total += float(leg_cost or 0.0) * size
+    return total
+
+
+def _execute_strategy_signal(
+    *,
+    signal: StrategySignal,
+    config: ArbConfig,
+    active_markets: list[MarketInfo],
+    ob_analyzer: OrderBookAnalyzer,
+    executor: ExecutionEngine,
+    risk_mgr: RiskManager,
+    orchestrator: StrategyOrchestrator,
+    dash_state: DashboardState,
+    event_recorder: EventRecorder,
+    maker_strategy: MakerStrategy,
+) -> tuple[bool, str]:
+    market = _find_market_for_signal(signal.market_id, active_markets)
+    if signal.tier == StrategyTier.CROSS_PLATFORM:
+        if not config.dry_run:
+            return False, "cross_platform_live_requires_external_executor"
+        pair_cost = max(float(signal.payload.get("total_cost", 0.0) or 0.0), 1e-9)
+        bundle_size = max(0.0, float(signal.recommended_size_usdc)) / pair_cost
+        trades = [
+            TradeRecord(
+                trade_id=str(uuid.uuid4())[:12],
+                arb_id=str(uuid.uuid4())[:12],
+                token_id=str(signal.payload.get("pair_id", "poly")),
+                condition_id=signal.market_id,
+                side=OrderSide.BUY,
+                price=float(signal.payload.get("poly_cost", 0.0) or 0.0),
+                size=bundle_size,
+                status=TradeStatus.FILLED,
+                fill_price=float(signal.payload.get("poly_cost", 0.0) or 0.0),
+                fill_size=bundle_size,
+                economic_cost=float(signal.payload.get("poly_cost", 0.0) or 0.0),
+                simulated=True,
+            ),
+            TradeRecord(
+                trade_id=str(uuid.uuid4())[:12],
+                arb_id=str(uuid.uuid4())[:12],
+                token_id=f"kalshi:{signal.payload.get('pair_id', 'pair')}",
+                condition_id=f"kalshi:{signal.market_id}",
+                side=OrderSide.BUY,
+                price=float(signal.payload.get("kalshi_cost", 0.0) or 0.0),
+                size=bundle_size,
+                status=TradeStatus.FILLED,
+                fill_price=float(signal.payload.get("kalshi_cost", 0.0) or 0.0),
+                fill_size=bundle_size,
+                economic_cost=float(signal.payload.get("kalshi_cost", 0.0) or 0.0),
+                simulated=True,
+            ),
+        ]
+        if event_recorder.is_enabled:
+            event_recorder.write_event("strategy_executions", {
+                "tier": signal.tier.name,
+                "signal_type": signal.signal_type,
+                "market_id": signal.market_id,
+                "status": "simulated",
+                "trade_count": len(trades),
+            })
+        return True, ""
+
+    if signal.tier == StrategyTier.STATISTICAL_ARB:
+        if market is None:
+            return False, "market_not_found"
+        opportunity, target_size, build_reason = _build_directional_opportunity_from_signal(
+            config=config,
+            signal=signal,
+            market=market,
+            ob_analyzer=ob_analyzer,
+        )
+        if opportunity is None:
+            return False, build_reason
+        can_trade, reason, adj_size = risk_mgr.pre_trade_check(opportunity, target_size)
+        if not can_trade:
+            return False, reason
+        balance_ok, balance_reason, _ = executor.ensure_sufficient_collateral(opportunity.total_cost * adj_size)
+        if not balance_ok:
+            return False, balance_reason
+        trades = executor.execute_arbitrage(opportunity, adj_size)
+        execution_success = executor.is_successful_execution(opportunity, trades)
+        if not config.dry_run:
+            risk_mgr.record_execution(opportunity, trades)
+            orchestrator.record_execution(
+                signal,
+                success=execution_success,
+                exposure_amount_usdc=_sum_trade_exposure(trades),
+            )
+        else:
+            orchestrator.record_processed(signal)
+        if event_recorder.is_enabled:
+            event_recorder.write_event("strategy_executions", {
+                "tier": signal.tier.name,
+                "signal_type": signal.signal_type,
+                "market_id": signal.market_id,
+                "status": "executed" if execution_success else "attempted",
+                "trade_count": len(trades),
+                "arb_type": opportunity.arb_type.value,
+            })
+        for trade in trades:
+            dash_state.append_trade({
+                "trade_id": trade.trade_id,
+                "arb_id": trade.arb_id,
+                "side": trade.side.value,
+                "price": trade.price,
+                "size": trade.size,
+                "status": trade.status.value,
+                "token_id": trade.token_id[:20],
+                "timestamp": trade.timestamp,
+                "simulated": trade.simulated,
+            })
+        return True, ""
+
+    if signal.tier == StrategyTier.MARKET_MAKING:
+        if market is None:
+            return False, "market_not_found"
+        if len(market.tokens) < 2:
+            return False, "non_binary_market"
+        quote = signal.payload.get("quote", {}) if isinstance(signal.payload.get("quote", {}), dict) else {}
+        bid_price = float(quote.get("bid_price") or 0.0)
+        bid_size = float(quote.get("bid_size") or 0.0)
+        if bid_price <= 0 or bid_size <= 0:
+            return False, "maker_bid_missing"
+        yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
+        maker_opp = ArbOpportunity(
+            arb_type=ArbType.MARKET_MAKING,
+            event_id=market.event_id or market.condition_id,
+            event_title=market.question,
+            markets=[market],
+            total_cost=bid_price,
+            guaranteed_payout=1.0,
+            gross_edge=max(0.0, float(quote.get("spread") or 0.0)),
+            net_edge=max(0.0, float(quote.get("spread") or 0.0)),
+            edge_pct=((float(quote.get("spread") or 0.0) / bid_price) * 100.0) if bid_price > 0 else 0.0,
+            legs=[
+                ArbLeg(
+                    token_id=yes_token.token_id,
+                    condition_id=market.condition_id,
+                    outcome="Yes",
+                    side=OrderSide.BUY,
+                    price=bid_price,
+                    size=bid_size,
+                    available_size=bid_size,
+                    execution_price=bid_price,
+                    economic_cost=bid_price,
+                )
+            ],
+            max_executable_size=bid_size,
+            confidence=float(signal.confidence),
+        )
+        can_trade, reason, adj_size = risk_mgr.pre_trade_check(maker_opp, bid_size)
+        if not can_trade:
+            return False, reason
+        balance_ok, balance_reason, _ = executor.ensure_sufficient_collateral(bid_price * adj_size)
+        if not balance_ok:
+            return False, balance_reason
+        trade = executor.submit_limit_order(
+            token_id=yes_token.token_id,
+            condition_id=market.condition_id,
+            outcome="Yes",
+            side=OrderSide.BUY,
+            price=bid_price,
+            size=adj_size,
+            post_only=True,
+            order_type_name="GTC",
+        )
+        submission_success = trade.status in {TradeStatus.PENDING, TradeStatus.PARTIAL, TradeStatus.FILLED}
+        if not config.dry_run:
+            risk_mgr.record_execution(
+                maker_opp,
+                [trade],
+                count_pending_as_failure=False,
+            )
+            orchestrator.record_execution(
+                signal,
+                success=submission_success,
+                exposure_amount_usdc=_sum_trade_exposure([trade]),
+            )
+            if trade.status == TradeStatus.FILLED and trade.fill_size:
+                maker_strategy.update_inventory(yes_token.token_id, "BUY", float(trade.fill_size))
+        else:
+            orchestrator.record_processed(signal)
+        dash_state.append_trade({
+            "trade_id": trade.trade_id,
+            "arb_id": trade.arb_id,
+            "side": trade.side.value,
+            "price": trade.price,
+            "size": trade.size,
+            "status": trade.status.value,
+            "token_id": trade.token_id[:20],
+            "timestamp": trade.timestamp,
+            "simulated": trade.simulated,
+            "post_only": True,
+        })
+        if event_recorder.is_enabled:
+            event_recorder.write_event("strategy_executions", {
+                "tier": signal.tier.name,
+                "signal_type": signal.signal_type,
+                "market_id": signal.market_id,
+                "status": "submitted" if submission_success else "failed",
+                "trade_status": trade.status.value,
+                "post_only": True,
+            })
+        return submission_success, ""
+
+    return False, "unsupported_strategy_tier"
 
 
 def _market_priority_score(market: MarketInfo) -> tuple[float, float, float]:
@@ -891,7 +1318,7 @@ def main(dotenv_path: str | None = None) -> None:
         volatility_calm_boost=config.edge_volatility_calm_boost,
     )
     statistical_detector = StatisticalMispricingDetector(
-        min_deviation=max(0.02, config.edge_min_bps / 10_000.0),
+        min_deviation=config.t2_min_deviation,
         min_confidence=config.edge_min_confidence,
     )
     maker_strategy = MakerStrategy(
@@ -1323,8 +1750,6 @@ def main(dotenv_path: str | None = None) -> None:
                     _serialize_strategy_signal(signal_for_record, submitted=submitted, research_overlay=overlay_payload),
                 )
 
-        for processed_signal in orchestrator.process_signals():
-            orchestrator.record_processed(processed_signal)
         cycle_timing["strategy_sec"] += time.perf_counter() - phase_start
 
         phase_start = time.perf_counter()
@@ -1362,6 +1787,18 @@ def main(dotenv_path: str | None = None) -> None:
                     "arb_type": verified.arb_type.value,
                     "reason": reason,
                     "target_size": target_size,
+                    "adjusted_size": adj_size,
+                })
+                continue
+
+            balance_ok, balance_reason, _ = executor.ensure_sufficient_collateral(verified.total_cost * adj_size)
+            if not balance_ok:
+                LOG.info("余额校验拒绝: %s", balance_reason)
+                event_recorder.write_event("risk_events", {
+                    "event": "balance_reject",
+                    "event_id": verified.event_id,
+                    "arb_type": verified.arb_type.value,
+                    "reason": balance_reason,
                     "adjusted_size": adj_size,
                 })
                 continue
@@ -1428,6 +1865,33 @@ def main(dotenv_path: str | None = None) -> None:
                 event_recorder=event_recorder,
             )
             cycle_timing["ai_sec"] += time.perf_counter() - phase_start
+
+        phase_start = time.perf_counter()
+        for processed_signal in orchestrator.process_signals():
+            executed, reason = _execute_strategy_signal(
+                signal=processed_signal,
+                config=config,
+                active_markets=active_markets_for_overlay,
+                ob_analyzer=ob_analyzer,
+                executor=executor,
+                risk_mgr=risk_mgr,
+                orchestrator=orchestrator,
+                dash_state=dash_state,
+                event_recorder=event_recorder,
+                maker_strategy=maker_strategy,
+            )
+            if executed:
+                continue
+            orchestrator.record_processed(processed_signal)
+            if event_recorder.is_enabled:
+                event_recorder.write_event("strategy_executions", {
+                    "tier": processed_signal.tier.name,
+                    "signal_type": processed_signal.signal_type,
+                    "market_id": processed_signal.market_id,
+                    "status": "skipped",
+                    "reason": reason,
+                })
+        cycle_timing["strategy_execution_sec"] = time.perf_counter() - phase_start
 
         risk_s = risk_mgr.state
         vol_snap = vol_estimator.snapshot()
@@ -1691,9 +2155,6 @@ def _run_ai_cycle(
                 "submitted": submitted,
                 "research_overlay": overlay_payload,
             })
-
-    for signal in orchestrator.process_signals():
-        orchestrator.record_processed(signal)
 
     if config.ai_override_risk:
         try:

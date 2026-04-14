@@ -47,7 +47,7 @@ def _make_opp() -> ArbOpportunity:
     )
 
 
-def test_record_execution_only_books_pnl_on_full_success():
+def test_record_execution_only_updates_failure_state_on_full_success():
     mgr = RiskManager(make_test_config())
     opp = _make_opp()
     trades = [
@@ -57,7 +57,7 @@ def test_record_execution_only_books_pnl_on_full_success():
 
     mgr.record_execution(opp, trades)
 
-    assert mgr.state.daily_pnl > 0
+    assert mgr.state.daily_pnl == 0
     assert mgr.state.consecutive_failures == 0
 
 
@@ -198,7 +198,7 @@ def test_partial_fill_without_fill_size_does_not_assume_requested_size():
     assert mgr.state.open_positions == 0
 
 
-def test_full_success_daily_pnl_uses_fill_size_when_present():
+def test_full_success_does_not_book_expected_profit_without_realized_pnl():
     mgr = RiskManager(make_test_config())
     opp = _make_opp()
     trades = [
@@ -208,7 +208,15 @@ def test_full_success_daily_pnl_uses_fill_size_when_present():
 
     mgr.record_execution(opp, trades)
 
-    assert mgr.state.daily_pnl == opp.net_edge * 2
+    assert mgr.state.daily_pnl == 0
+
+
+def test_record_settlement_books_realized_pnl():
+    mgr = RiskManager(make_test_config())
+
+    mgr.record_settlement("c1", 1.25)
+
+    assert mgr.state.daily_pnl == 1.25
 
 
 def test_partial_or_pending_execution_counts_as_failure():

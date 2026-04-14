@@ -180,7 +180,7 @@ class BacktestRunner:
             gross_pnl=gross_pnl,
             net_pnl=gross_pnl,
             max_drawdown=max_drawdown,
-            win_rate=(filled_trades / total_trades) if total_trades else 0.0,
+            win_rate=(sum(1 for row in trade_rows if row.get("realized_pnl", 0.0) > 0) / filled_trades) if filled_trades else 0.0,
             fill_rate=(filled_trades / total_signals) if total_signals else 0.0,
             avg_slippage_bps=(total_slippage / filled_trades) if filled_trades else 0.0,
             avg_latency_ms=(total_latency / total_trades) if total_trades else 0.0,

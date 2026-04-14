@@ -33,7 +33,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from polymarket_arb.confidence import confidence_from_signal_strength
 from polymarket_arb.fair_value_model import compute_general_fair_value
@@ -190,10 +190,12 @@ class BayesianPriceModel:
         Returns:
             模型估计的概率 (0-1)
         """
+        # 极端概率市场（长尾/高确定性）对盘口压力更敏感。
+        regime_multiplier = 1.0 + min(1.5, abs(market_price - 0.5) * 3.0)
         return compute_general_fair_value(
             market_price,
-            obi_score=obi_score,
-            momentum_score=momentum_score,
+            obi_score=obi_score * regime_multiplier,
+            momentum_score=momentum_score * regime_multiplier,
             cross_market_deviation=cross_market_deviation,
             spot_fair=spot_fair,
             obi_weight=self._obi_weight,
@@ -232,7 +234,7 @@ class StatisticalMispricingDetector:
         bids_total_size: float,
         asks_total_size: float,
         mid_price: Optional[float] = None,
-        related_market_prices: Optional[dict[str, float]] = None,
+        related_market_prices: Optional[dict[str, Any]] = None,
     ) -> Optional[ProbabilityEstimate]:
         """分析单个市场是否存在 mispricing.
 
@@ -267,7 +269,7 @@ class StatisticalMispricingDetector:
         bids_total_size: float,
         asks_total_size: float,
         mid_price: Optional[float] = None,
-        related_market_prices: Optional[dict[str, float]] = None,
+        related_market_prices: Optional[dict[str, Any]] = None,
     ) -> ProbabilityEstimate:
         if mid_price is not None:
             self._momentum.record(market_id, mid_price)
@@ -286,12 +288,15 @@ class StatisticalMispricingDetector:
         deviation = model_prob - market_price
         deviation_pct = deviation / market_price if market_price > 0 else 0
 
-        signal_strength = (
-            self._normalize_signal_strength(obi)
-            + self._normalize_signal_strength(momentum)
-            + self._normalize_signal_strength(cross_dev)
-        ) / 3.0
-        confidence = confidence_from_signal_strength(signal_strength, scale=2.0)
+        components = [
+            self._normalize_signal_strength(obi),
+            self._normalize_signal_strength(momentum),
+        ]
+        if abs(cross_dev) > 0:
+            components.append(min(1.0, abs(cross_dev) * 4.0))
+        active = [value for value in components if value > 0]
+        signal_strength = (sum(active) / len(active)) if active else 0.0
+        confidence = confidence_from_signal_strength(signal_strength, scale=1.2)
 
         return ProbabilityEstimate(
             market_id=market_id,
@@ -312,7 +317,7 @@ class StatisticalMispricingDetector:
         self,
         market_id: str,
         market_price: float,
-        related: Optional[dict[str, float]],
+        related: Optional[dict[str, Any]],
     ) -> float:
         """从相关市场价格计算偏差信号.
 
@@ -323,15 +328,42 @@ class StatisticalMispricingDetector:
         if not related:
             return 0.0
 
-        deviations = []
-        for related_id, related_price in related.items():
-            dev = market_price - related_price
-            deviations.append(dev)
+        deviations: list[float] = []
+        for related_id, raw in related.items():
+            if isinstance(raw, dict):
+                related_price = float(raw.get("price", 0.0) or 0.0)
+                relation = str(raw.get("relation", "peer")).lower()
+                weight = float(raw.get("weight", 1.0) or 1.0)
+            else:
+                related_price = float(raw or 0.0)
+                relation = "peer"
+                weight = 1.0
+
+            if related_id == market_id or related_price <= 0 or related_price >= 1:
+                continue
+
+            # peer: 同主题市场价格更高 => 当前市场更可能被低估（正信号）
+            if relation == "peer":
+                deviations.append((related_price - market_price) * weight)
+                continue
+
+            # upper_bound: 当前概率应 <= 相关市场价格（例如更早 deadline <= 更晚 deadline）
+            if relation == "upper_bound":
+                if market_price > related_price:
+                    deviations.append((related_price - market_price) * weight)
+                continue
+
+            # lower_bound: 当前概率应 >= 相关市场价格（例如更晚 deadline >= 更早 deadline）
+            if relation == "lower_bound":
+                if market_price < related_price:
+                    deviations.append((related_price - market_price) * weight)
+                continue
 
         if not deviations:
             return 0.0
 
-        return sum(deviations) / len(deviations)
+        avg = sum(deviations) / len(deviations)
+        return max(-0.35, min(0.35, avg))
 
 
 def format_mispricing_zh(est: ProbabilityEstimate) -> str:

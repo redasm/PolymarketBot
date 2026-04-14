@@ -245,6 +245,7 @@ cp .env.example .env
 | `VOL_SLOW_MINUTES` | 慢速波动率窗口 | 360 分钟 |
 | `EDGE_MIN_BPS` | Edge 引擎最小触发阈值 | 100 bps |
 | `EDGE_MAX_SPREAD_BPS` | 最大可接受 spread | 500 bps |
+| `T2_MIN_DEVIATION` | T2 最小绝对概率偏差 | 0.02 |
 | `AI_AUTO_RECOVER_SEC` | AI 降级后自动恢复等待时间 | 1800s |
 | `RESEARCH_SIGNAL_ENABLED` | 启用研究信号摘要 | false |
 | `BACKTEST_ENABLED` | 启用回测状态展示 | false |
@@ -269,6 +270,25 @@ cp .env.example .env
 - T0 结构性套利继续进入 `opportunities` / `trades`
 - T1/T2/T3 的信号会额外写入 `data/telemetry/*.strategy_signals.ndjson`
 - 因此以后看到 “0 arbs” 时，要同时检查 `strategy_signals`，不要再把它误解成“整套策略都没有信号”
+
+如果你处在“先跑 3-7 天，看 bot 到底能不能看到机会”的观测期，建议把配置切到更偏探索的档位：
+
+- `ARB_MARKET_FOCUS_KEYWORDS=`：先放开全市场，不要只盯 crypto 关键词
+- `ARB_HOT_MARKET_POOL_SIZE=150~200`
+- `ARB_HOT_EVENT_POOL_SIZE=50~80`
+- `ARB_MIN_LIQUIDITY=300~800`
+- `ARB_MIN_VOLUME_24H=200~500`
+- `WS_MAX_MARKETS=8~15`
+- `T2_MIN_DEVIATION=0.01`：让 T2 至少能看到 1% 级别的模型偏差
+- `T2_MAX_SPREAD_BPS=800~1500`
+- `T2_MIN_TOP_DEPTH=20~50`
+- `T2_MAX_COMPLEMENT_ERROR_BPS=200~300`
+
+更激进的观测档并不等于直接实盘。更合适的做法是：
+
+- 继续保持 `ARB_DRY_RUN=true`
+- 继续保持小仓位和较低风险上限
+- 用更宽的扫描和 T2 门槛先确认“有没有信号”，再决定是否收紧成实盘档
 
 ## 运行
 

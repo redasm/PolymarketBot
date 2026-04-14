@@ -20,6 +20,9 @@ from polymarket_arb.main_loop import (
     main,
     _estimate_ai_trade_outcome,
     _build_run_instance_id,
+    _build_t2_related_market_context,
+    _extract_market_deadline,
+    _extract_market_temporal_stem,
     _focus_keywords,
     _find_pending_signal,
     _find_pending_signal_overlay,
@@ -939,6 +942,136 @@ def test_collect_statistical_strategy_signals_filters_poor_quality_markets():
     )
 
     assert signals == []
+
+
+def test_extract_market_temporal_stem_and_deadline_for_ladder_questions():
+    question = "Will Bitcoin hit $150k by December 31, 2026?"
+
+    stem = _extract_market_temporal_stem(question)
+    deadline = _extract_market_deadline(question)
+
+    assert stem == "bitcoin hit $150k"
+    assert deadline is not None
+    assert (deadline.year, deadline.month, deadline.day) == (2026, 12, 31)
+
+
+def test_build_t2_related_market_context_adds_time_ladder_bounds():
+    markets = [
+        MarketInfo(
+            condition_id="cond-early",
+            question="Will Bitcoin hit $150k by June 30, 2026?",
+            slug="btc-150k-june",
+            event_id="event-btc-150k",
+            tokens=[TokenInfo("yes-1", "Yes"), TokenInfo("no-1", "No")],
+        ),
+        MarketInfo(
+            condition_id="cond-late",
+            question="Will Bitcoin hit $150k by December 31, 2026?",
+            slug="btc-150k-dec",
+            event_id="event-btc-150k",
+            tokens=[TokenInfo("yes-2", "Yes"), TokenInfo("no-2", "No")],
+        ),
+    ]
+
+    class _StubOrderBookAnalyzer:
+        def __init__(self, snapshots):
+            self.snapshots = snapshots
+
+        def get_snapshot(self, token_id):
+            return self.snapshots.get(token_id)
+
+    class _Snapshot:
+        def __init__(self, best_bid, best_ask):
+            self.best_bid = best_bid
+            self.best_ask = best_ask
+
+        @property
+        def mid(self):
+            return (self.best_bid + self.best_ask) / 2.0
+
+    context = _build_t2_related_market_context(
+        markets,
+        _StubOrderBookAnalyzer(
+            {
+                "yes-1": _Snapshot(0.39, 0.41),
+                "yes-2": _Snapshot(0.59, 0.61),
+            }
+        ),
+    )
+
+    assert context["cond-early"]["cond-late"]["relation"] == "upper_bound"
+    assert context["cond-late"]["cond-early"]["relation"] == "lower_bound"
+
+
+def test_collect_statistical_strategy_signals_detects_ladder_inconsistency():
+    markets = [
+        MarketInfo(
+            condition_id="cond-early",
+            question="Will Bitcoin hit $150k by June 30, 2026?",
+            slug="btc-150k-june",
+            event_id="event-btc-150k",
+            tokens=[TokenInfo("yes-1", "Yes"), TokenInfo("no-1", "No")],
+        ),
+        MarketInfo(
+            condition_id="cond-late",
+            question="Will Bitcoin hit $150k by December 31, 2026?",
+            slug="btc-150k-dec",
+            event_id="event-btc-150k",
+            tokens=[TokenInfo("yes-2", "Yes"), TokenInfo("no-2", "No")],
+        ),
+    ]
+
+    class _StubOrderBookAnalyzer:
+        def __init__(self, snapshots):
+            self.snapshots = snapshots
+
+        def get_snapshot(self, token_id):
+            return self.snapshots.get(token_id)
+
+    class _Snapshot:
+        def __init__(self, best_bid, best_ask, bid_size, ask_size, tick_size=0.01):
+            self.best_bid = best_bid
+            self.best_ask = best_ask
+            self.tick_size = tick_size
+            self.bids = [type("Level", (), {"price": best_bid, "size": bid_size})()]
+            self.asks = [type("Level", (), {"price": best_ask, "size": ask_size})()]
+
+        @property
+        def mid(self):
+            return (self.best_bid + self.best_ask) / 2.0
+
+        @property
+        def spread(self):
+            return self.best_ask - self.best_bid
+
+        @property
+        def best_bid_size(self):
+            return self.bids[0].size
+
+        @property
+        def best_ask_size(self):
+            return self.asks[0].size
+
+    ob_analyzer = _StubOrderBookAnalyzer(
+        {
+            "yes-1": _Snapshot(0.93, 0.95, 500, 500),
+            "no-1": _Snapshot(0.05, 0.07, 500, 500),
+            "yes-2": _Snapshot(0.53, 0.55, 500, 500),
+            "no-2": _Snapshot(0.45, 0.47, 500, 500),
+        }
+    )
+    detector = StatisticalMispricingDetector(min_deviation=0.01, min_confidence=0.1)
+
+    signals = _collect_statistical_strategy_signals(
+        config=make_test_config(default_order_size_usdc=7.5, t2_max_spread_bps=1000.0, t2_min_top_depth=100.0),
+        candidate_markets=markets,
+        ob_analyzer=ob_analyzer,
+        detector=detector,
+    )
+
+    signal_types = {signal.signal_type for signal in signals}
+    assert "statistical_buy_yes" in signal_types
+    assert any(signal.payload["related_context_count"] > 0 for signal in signals)
 
 
 def test_evaluate_t2_market_quality_reports_reasons():

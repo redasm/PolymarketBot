@@ -229,7 +229,6 @@
 - `polymarket_arb/dashboard.html`
 - `polymarket_arb/models.py`
 - `.env.example`
-- `.env.server-observe.example`
 
 
 ## 8. 明确不在第一轮做的事情

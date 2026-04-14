@@ -110,33 +110,8 @@ class ExecutionEngine:
         )
 
         if self._config.dry_run:
-            LOG.info("=== DRY RUN 模式 === 不实际下单")
-            for leg in opp.legs:
-                record = TradeRecord(
-                    trade_id=str(uuid.uuid4())[:12],
-                    arb_id=arb_id,
-                    token_id=leg.token_id,
-                    condition_id=leg.condition_id,
-                    side=leg.side,
-                    price=leg.execution_price if leg.execution_price is not None else leg.price,
-                    size=actual_size,
-                    status=TradeStatus.FILLED,
-                    fill_price=leg.execution_price if leg.execution_price is not None else leg.price,
-                    fill_size=actual_size,
-                    economic_cost=leg.economic_cost if leg.economic_cost is not None else leg.price,
-                    simulated=True,
-                )
-                records.append(record)
-                self._append_trade_record(record, simulated=True)
-                LOG.info(
-                    "  [DRY] %s %s @ $%.4f x %.2f (token=%s…)",
-                    leg.side.value,
-                    leg.outcome,
-                    record.price,
-                    actual_size,
-                    leg.token_id[:16],
-                )
-            return records
+            LOG.info("=== DRY RUN 模式 === 使用盘口深度模拟成交")
+            return self._simulate_dry_run_arbitrage(opp, arb_id, actual_size)
 
         records = self._submit_legs_parallel(opp, arb_id, actual_size)
         all_success = len(records) == len(opp.legs) and all(r.status == TradeStatus.FILLED for r in records)
@@ -192,6 +167,9 @@ class ExecutionEngine:
         side: OrderSide,
         price: float,
         size: float,
+        *,
+        order_type: Any | None = None,
+        post_only: bool = False,
     ) -> OrderSubmissionResult:
         """提交单笔订单到 CLOB."""
         from py_clob_client.clob_types import (
@@ -211,10 +189,10 @@ class ExecutionEngine:
         signed_order = self._client.create_order(
             order_args, PartialCreateOrderOptions()
         )
-        execution_type = self._execution_order_type
+        execution_type = order_type if order_type is not None else self._execution_order_type
         LOG.debug("提交套利腿使用订单类型: %s", execution_type)
         resp = self._client.post_order(
-            signed_order, orderType=execution_type
+            signed_order, orderType=execution_type, post_only=post_only
         )
 
         order_id = ""
@@ -289,6 +267,111 @@ class ExecutionEngine:
             except (AttributeError, RuntimeError, ValueError) as e:
                 LOG.error("回滚: 撤销订单 %s 失败: %s", oid[:16], e)
         return cancelled
+
+    def submit_limit_order(
+        self,
+        *,
+        token_id: str,
+        condition_id: str,
+        outcome: str,
+        side: OrderSide,
+        price: float,
+        size: float,
+        arb_id: str | None = None,
+        post_only: bool = False,
+        order_type_name: str = "GTC",
+    ) -> TradeRecord:
+        """提交单笔限价单，供做市/单腿策略复用."""
+        arb_ref = arb_id or str(uuid.uuid4())[:12]
+        trade = TradeRecord(
+            trade_id=str(uuid.uuid4())[:12],
+            arb_id=arb_ref,
+            token_id=token_id,
+            condition_id=condition_id,
+            side=side,
+            price=float(price),
+            size=float(size),
+            economic_cost=float(price),
+        )
+
+        if size <= 0 or price <= 0:
+            trade.status = TradeStatus.FAILED
+            trade.error = "invalid_order_args"
+            self._append_trade_record(trade, simulated=self._config.dry_run)
+            return trade
+
+        if self._config.dry_run:
+            trade.status = TradeStatus.PENDING if post_only else TradeStatus.FILLED
+            trade.simulated = True
+            if trade.status == TradeStatus.FILLED:
+                trade.fill_price = float(price)
+                trade.fill_size = float(size)
+            self._append_trade_record(trade, simulated=True)
+            return trade
+
+        try:
+            submission = self._submit_order(
+                token_id,
+                side,
+                float(price),
+                float(size),
+                order_type=self._resolve_named_order_type(order_type_name),
+                post_only=post_only,
+            )
+            trade.order_id = submission.order_id
+            trade.status = submission.trade_status
+            trade.error = submission.error or ""
+            if submission.fill_price is not None:
+                trade.fill_price = submission.fill_price
+            if submission.fill_size is not None:
+                trade.fill_size = submission.fill_size
+            if trade.status == TradeStatus.FILLED and trade.fill_price is None:
+                trade.fill_price = float(price)
+            if trade.status == TradeStatus.FILLED and trade.fill_size is None:
+                trade.fill_size = float(size)
+        except Exception as exc:  # pragma: no cover - defensive around client transport
+            trade.status = TradeStatus.FAILED
+            trade.error = str(exc)
+        self._append_trade_record(trade)
+        return trade
+
+    def ensure_sufficient_collateral(self, required_notional: float) -> tuple[bool, str, float | None]:
+        """在 live 模式下检查可用 collateral 是否足够."""
+        if self._config.dry_run:
+            return True, "", None
+        if required_notional <= 0:
+            return False, "required_notional_invalid", None
+
+        available = self.get_available_collateral_balance()
+        if available is None:
+            return False, "balance_check_unavailable", None
+        if available + 1e-9 < required_notional:
+            return False, f"insufficient_balance available={available:.4f} required={required_notional:.4f}", available
+        return True, "", available
+
+    def get_available_collateral_balance(self) -> float | None:
+        """读取可用 USDC 余额（余额与 allowance 的较小值）."""
+        try:
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        except Exception:
+            return self._parse_balance_response(
+                getattr(self._client, "get_balance_allowance", lambda *args, **kwargs: None)()
+            )
+
+        try:
+            response = self._client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+        except TypeError:
+            try:
+                response = self._client.get_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=-1)
+                )
+            except Exception:
+                return None
+        except Exception:
+            return None
+        return self._parse_balance_response(response)
 
     def get_recent_trades(self, limit: int = 20, *, include_simulated: bool = False) -> list[TradeRecord]:
         history = self._trade_history if not include_simulated else self._trade_history + self._simulated_trade_history
@@ -418,6 +501,90 @@ class ExecutionEngine:
         target.append(record)
         if len(target) > self._max_history:
             del target[:-self._max_history]
+
+    def _simulate_dry_run_arbitrage(
+        self,
+        opp: ArbOpportunity,
+        arb_id: str,
+        actual_size: float,
+    ) -> list[TradeRecord]:
+        records: list[TradeRecord] = []
+        for leg in opp.legs:
+            fill_size = max(0.0, min(actual_size, float(leg.available_size or 0.0)))
+            if fill_size >= actual_size - 1e-9:
+                status = TradeStatus.FILLED
+            elif fill_size > 0:
+                status = TradeStatus.PARTIAL
+            else:
+                status = TradeStatus.FAILED
+
+            record = TradeRecord(
+                trade_id=str(uuid.uuid4())[:12],
+                arb_id=arb_id,
+                token_id=leg.token_id,
+                condition_id=leg.condition_id,
+                side=leg.side,
+                price=leg.execution_price if leg.execution_price is not None else leg.price,
+                size=actual_size,
+                status=status,
+                fill_price=(leg.execution_price if leg.execution_price is not None else leg.price) if fill_size > 0 else None,
+                fill_size=fill_size if fill_size > 0 else None,
+                economic_cost=leg.economic_cost if leg.economic_cost is not None else leg.price,
+                simulated=True,
+                error="simulated_insufficient_depth" if status != TradeStatus.FILLED else None,
+            )
+            records.append(record)
+            self._append_trade_record(record, simulated=True)
+            LOG.info(
+                "  [DRY] %s %s @ $%.4f target=%.2f filled=%.2f status=%s (token=%s…)",
+                leg.side.value,
+                leg.outcome,
+                record.price,
+                actual_size,
+                fill_size,
+                record.status.value,
+                leg.token_id[:16],
+            )
+        return records
+
+    def _parse_balance_response(self, response: Any) -> float | None:
+        if response is None:
+            return None
+        if isinstance(response, (int, float)):
+            return float(response)
+        if not isinstance(response, dict):
+            return None
+
+        payload = response
+        for key in ("balanceAllowance", "data", "result"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                payload = nested
+                break
+
+        direct_available = _coerce_fill_field(
+            payload.get("available")
+            or payload.get("available_balance")
+            or payload.get("availableBalance")
+            or payload.get("buying_power")
+            or payload.get("buyingPower")
+        )
+        if direct_available is not None:
+            return direct_available
+
+        balance = _coerce_fill_field(
+            payload.get("balance")
+            or payload.get("balance_decimal")
+            or payload.get("balanceDecimal")
+        )
+        allowance = _coerce_fill_field(
+            payload.get("allowance")
+            or payload.get("allowance_decimal")
+            or payload.get("allowanceDecimal")
+        )
+        if balance is not None and allowance is not None:
+            return min(balance, allowance)
+        return balance if balance is not None else allowance
 
 
 def _coerce_fill_field(value: Any) -> float | None:

@@ -84,7 +84,7 @@ Get-Content data/telemetry/*.risk_events.ndjson | Select-Object -Last 20
 
 ## 推荐参数组合
 
-建议直接从 [.env.server-observe.example](/abs/c:/AppProject/PolymarketBot/.env.server-observe.example) 起步，当前模板偏向：
+建议直接从 [.env.example](/abs/e:/AppProject/PolymarketBot/.env.example) 起步。当前统一模板已经合并了原 `.env.server-observe.example` 的说明，偏向：
 
 - 先观察 T0/T2/T3 信号质量，不急着启用 T1
 - 先聚焦 crypto 主题，而不是一开始就全市场铺开
