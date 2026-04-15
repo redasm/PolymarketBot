@@ -49,6 +49,7 @@ from polymarket_arb.models import (
     ArbOpportunity,
     ArbType,
     MarketInfo,
+    OrderSide,
     ResearchSignalReport,
     TradeRecord,
     TradeStatus,
