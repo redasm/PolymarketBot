@@ -168,10 +168,13 @@
   <!-- 核心指标 -->
   <div class="card">
     <h2>核心指标</h2>
-    <div class="metric"><span class="label">发现套利</span><span class="value" id="arbsFound">0</span></div>
-    <div class="metric"><span class="label">已执行</span><span class="value" id="arbsExecuted">0</span></div>
+    <div class="metric"><span class="label">理论机会</span><span class="value" id="arbsFound">0</span></div>
+    <div class="metric"><span class="label">模拟成功</span><span class="value" id="simulatedExecs">0</span></div>
+    <div class="metric"><span class="label">实盘成功</span><span class="value" id="arbsExecuted">0</span></div>
     <div class="metric"><span class="label">扫描市场数</span><span class="value" id="marketsScanned">0</span></div>
-    <div class="metric"><span class="label">执行率</span><span class="value" id="execRate">-</span></div>
+    <div class="metric"><span class="label">模拟预期收益</span><span class="value" id="simProfit">-</span></div>
+    <div class="metric"><span class="label">实盘预期收益</span><span class="value" id="liveProfit">-</span></div>
+    <div class="metric"><span class="label">实盘执行率</span><span class="value" id="execRate">-</span></div>
   </div>
 
   <!-- 风控状态 -->
@@ -401,11 +404,24 @@ function renderStatus(d) {
   $('cycleCount').textContent = d.cycle_count;
   $('lastUpdate').textContent = new Date().toLocaleTimeString();
 
-  $('arbsFound').textContent = d.arbs_found;
-  $('arbsExecuted').textContent = d.arbs_executed;
+  const summary = d.execution_summary || {};
+  const theoretical = summary.theoretical_opportunities != null ? summary.theoretical_opportunities : d.arbs_found;
+  const liveExecs = summary.live_successes != null ? summary.live_successes : d.arbs_executed;
+  const simulatedExecs = summary.simulated_successes || 0;
+  $('arbsFound').textContent = theoretical || 0;
+  $('simulatedExecs').textContent = simulatedExecs;
+  $('arbsExecuted').textContent = liveExecs || 0;
   $('marketsScanned').textContent = d.markets_scanned;
-  const rate = d.arbs_found > 0 ? ((d.arbs_executed / d.arbs_found) * 100).toFixed(1) + '%' : '-';
+  const rate = theoretical > 0 ? ((liveExecs / theoretical) * 100).toFixed(1) + '%' : '-';
   $('execRate').textContent = rate;
+  const simProfit = Number(summary.simulated_profit_total || 0);
+  const liveProfit = Number(summary.live_profit_total || 0);
+  const simProfitEl = $('simProfit');
+  simProfitEl.textContent = formatPnl(simProfit);
+  simProfitEl.className = 'value ' + pnlClass(simProfit);
+  const liveProfitEl = $('liveProfit');
+  liveProfitEl.textContent = formatPnl(liveProfit);
+  liveProfitEl.className = 'value ' + pnlClass(liveProfit);
 
   const r = d.risk_state || {};
   const halted = r.is_halted || false;
@@ -666,8 +682,11 @@ function renderStrategies(s) {
     const used = data.current_exposure || 0;
     const budget = data.budget || 0;
     const fillPct = budget > 0 ? Math.min(100, (used / budget) * 100) : 0;
+    const allocationText = pct > 0 ? (pct * 100).toFixed(0) + '%' : '关闭';
+    const budgetText = budget > 0 ? '$' + Number(budget).toFixed(2) : '$0.00';
     html += `<div class="metric"><span class="label">${t.key} ${t.name}</span>
-      <span class="value">${pct > 0 ? (pct * 100).toFixed(0) + '%' : '-'}</span></div>
+      <span class="value">${allocationText}</span></div>
+      <div class="mono-sm muted" style="padding:2px 0 6px 0;">预算 ${budgetText} / 已用 $${Number(used).toFixed(2)}</div>
       <div class="bar-track"><div class="bar-fill ${t.color}" style="width:${fillPct}%"></div></div>`;
   }
   container.innerHTML = html;
@@ -676,15 +695,15 @@ function renderStrategies(s) {
 function renderOpportunities(opps) {
   const el = $('oppTable');
   if (!opps.length) { el.innerHTML = '<div class="empty-state">暂无套利机会</div>'; return; }
-  let html = '<table><tr><th>时间</th><th>类型</th><th>事件</th><th>成本</th><th>净利</th><th>利润率</th><th>置信度</th></tr>';
+  let html = '<table><tr><th>时间</th><th>模式</th><th>阶段</th><th>类型</th><th>事件</th><th>成本</th><th>净利</th><th>利润率</th><th>置信度</th></tr>';
   for (const o of opps.slice(-15).reverse()) {
     const t = o.timestamp ? new Date(o.timestamp * 1000).toLocaleTimeString() : '-';
-    let type;
-    if (o.arb_type === 'binary') type = '<span class="badge badge-blue">二元</span>';
-    else if (o.arb_type === 'edge_engine') type = '<span class="badge badge-cyan">Edge</span>';
-    else type = '<span class="badge badge-purple">多结果</span>';
-    html += `<tr><td>${t}</td><td>${type}</td><td>${(o.event_title || '').slice(0, 40)}</td>
-      <td>$${(o.total_cost || 0).toFixed(4)}</td>
+    const type = renderOpportunityTypeBadge(o.arb_type);
+    const mode = renderModeBadge(o.mode || 'signal');
+    const stage = renderStageBadge(o.stage || 'signal');
+    const totalCost = o.total_cost == null ? '-' : ('$' + Number(o.total_cost).toFixed(4));
+    html += `<tr><td>${t}</td><td>${mode}</td><td>${stage}</td><td>${type}</td><td>${(o.event_title || '').slice(0, 40)}</td>
+      <td>${totalCost}</td>
       <td class="${pnlClass(o.net_edge || 0)}">${formatPnl(o.net_edge || 0)}</td>
       <td>${(o.edge_pct || 0).toFixed(2)}%</td>
       <td>${((o.confidence || 0) * 100).toFixed(0)}%</td></tr>`;
@@ -695,9 +714,10 @@ function renderOpportunities(opps) {
 function renderTrades(trades) {
   const el = $('tradeTable');
   if (!trades.length) { el.innerHTML = '<div class="empty-state">暂无交易记录</div>'; return; }
-  let html = '<table><tr><th>时间</th><th>方向</th><th>结果</th><th>价格</th><th>数量</th><th>状态</th></tr>';
+  let html = '<table><tr><th>时间</th><th>模式</th><th>事件</th><th>方向</th><th>结果</th><th>价格</th><th>数量</th><th>状态</th><th>预期收益</th></tr>';
   for (const t of trades.slice(-15).reverse()) {
     const ts = t.timestamp ? new Date(t.timestamp * 1000).toLocaleTimeString() : '-';
+    const mode = renderModeBadge(t.mode || 'live');
     const side = t.side === 'BUY'
       ? '<span class="badge badge-green">BUY</span>'
       : '<span class="badge badge-red">SELL</span>';
@@ -706,10 +726,33 @@ function renderTrades(trades) {
       : t.status === 'failed'
         ? '<span class="badge badge-red">失败</span>'
         : `<span class="badge badge-yellow">${t.status}</span>`;
-    html += `<tr><td>${ts}</td><td>${side}</td><td>${(t.outcome || t.token_id || '').slice(0, 24)}</td>
-      <td>$${(t.price || 0).toFixed(4)}</td><td>${(t.size || 0).toFixed(2)}</td><td>${status}</td></tr>`;
+    const expectedProfit = t.expected_profit == null ? '-' : formatPnl(Number(t.expected_profit || 0));
+    html += `<tr><td>${ts}</td><td>${mode}</td><td>${(t.event_title || '').slice(0, 36)}</td><td>${side}</td><td>${(t.outcome || t.token_id || '').slice(0, 24)}</td>
+      <td>$${(t.price || 0).toFixed(4)}</td><td>${(t.size || 0).toFixed(2)}</td><td>${status}</td><td class="${pnlClass(Number(t.expected_profit || 0))}">${expectedProfit}</td></tr>`;
   }
   el.innerHTML = html + '</table>';
+}
+
+function renderModeBadge(mode) {
+  if (mode === 'theoretical') return '<span class="badge badge-blue">理论</span>';
+  if (mode === 'simulated') return '<span class="badge badge-yellow">模拟</span>';
+  if (mode === 'live') return '<span class="badge badge-green">实盘</span>';
+  return '<span class="badge badge-purple">信号</span>';
+}
+
+function renderStageBadge(stage) {
+  if (stage === 'detected') return '<span class="badge badge-blue">发现</span>';
+  if (stage === 'verified') return '<span class="badge badge-green">验证</span>';
+  return '<span class="badge badge-purple">信号</span>';
+}
+
+function renderOpportunityTypeBadge(arbType) {
+  if (arbType === 'binary') return '<span class="badge badge-blue">二元</span>';
+  if (arbType === 'multi_outcome') return '<span class="badge badge-purple">多结果</span>';
+  if (arbType === 'edge_engine') return '<span class="badge badge-cyan">Edge</span>';
+  if ((arbType || '').includes('maker')) return '<span class="badge badge-yellow">做市</span>';
+  if ((arbType || '').includes('statistical')) return '<span class="badge badge-cyan">统计</span>';
+  return '<span class="badge badge-purple">' + (arbType || '机会') + '</span>';
 }
 
 function renderErrors(errors) {

@@ -1426,6 +1426,9 @@ def main(dotenv_path: str | None = None) -> None:
     cycle = 0
     total_arbs_found = 0
     total_arbs_executed = 0
+    total_simulated_executed = 0
+    total_live_expected_profit = 0.0
+    total_simulated_expected_profit = 0.0
     consecutive_api_errors = 0
 
     while not _SHUTDOWN_EVENT.is_set():
@@ -1640,6 +1643,8 @@ def main(dotenv_path: str | None = None) -> None:
                 event_recorder.write_event("opportunities", _serialize_opportunity_event(opp, stage="detected"))
                 dash_state.append_opportunity({
                     "arb_type": opp.arb_type.value,
+                    "mode": "theoretical",
+                    "stage": "detected",
                     "event_title": opp.event_title,
                     "total_cost": opp.total_cost,
                     "net_edge": opp.net_edge,
@@ -1685,6 +1690,8 @@ def main(dotenv_path: str | None = None) -> None:
         if edge_decision.direction != "NONE":
             dash_state.append_opportunity({
                 "arb_type": "edge_engine",
+                "mode": "signal",
+                "stage": "signal",
                 "event_title": f"[Edge] {edge_decision.market_id or 'active_market'}",
                 "total_cost": edge_decision.market_price,
                 "net_edge": edge_decision.edge_bps / 10000.0,
@@ -1733,6 +1740,8 @@ def main(dotenv_path: str | None = None) -> None:
             overlay_payload = _find_pending_signal_overlay(orchestrator, strategy_signal)
             dash_state.append_opportunity({
                 "arb_type": signal_for_record.signal_type,
+                "mode": "signal",
+                "stage": "signal",
                 "event_title": signal_for_record.description,
                 "total_cost": None,
                 "net_edge": signal_for_record.expected_edge / 10_000.0,
@@ -1777,6 +1786,19 @@ def main(dotenv_path: str | None = None) -> None:
                 })
                 continue
             event_recorder.write_event("opportunities", _serialize_opportunity_event(verified, stage="verified"))
+            dash_state.append_opportunity({
+                "arb_type": verified.arb_type.value,
+                "mode": "theoretical",
+                "stage": "verified",
+                "event_title": verified.event_title,
+                "total_cost": verified.total_cost,
+                "net_edge": verified.net_edge,
+                "edge_pct": verified.edge_pct,
+                "confidence": verified.confidence,
+                "max_size": verified.max_executable_size,
+                "legs": len(verified.legs),
+                "timestamp": time.time(),
+            })
 
             can_trade, reason, adj_size = risk_mgr.pre_trade_check(verified, target_size)
             if not can_trade:
@@ -1806,30 +1828,31 @@ def main(dotenv_path: str | None = None) -> None:
             trades = executor.execute_arbitrage(verified, adj_size)
             if not config.dry_run:
                 risk_mgr.record_execution(verified, trades)
-            arb_success = _is_live_execution_success(config, executor, verified, trades)
-            event_recorder.write_event("trades", _serialize_trade_execution(verified, trades, arb_success, adj_size))
-            if arb_success:
+            live_execution_success = _is_live_execution_success(config, executor, verified, trades)
+            trade_payload = _serialize_trade_execution(verified, trades, live_execution_success, adj_size)
+            event_recorder.write_event("trades", trade_payload)
+            dashboard_execution_success = bool(trade_payload.get("arb_success", False))
+            if live_execution_success:
                 total_arbs_executed += 1
+                total_live_expected_profit += float(trade_payload.get("trade_outcome_estimate") or 0.0)
+            elif bool(trade_payload.get("simulated", False)) and dashboard_execution_success:
+                total_simulated_executed += 1
+                total_simulated_expected_profit += float(trade_payload.get("trade_outcome_estimate") or 0.0)
 
-            if not config.dry_run:
-                for t in trades:
-                    dash_state.append_trade({
-                        "trade_id": t.trade_id,
-                        "arb_id": t.arb_id,
-                        "side": t.side.value,
-                        "price": t.price,
-                        "size": t.size,
-                        "status": t.status.value,
-                        "token_id": t.token_id[:20],
-                        "timestamp": t.timestamp,
-                    })
+            for trade_row in _build_dashboard_trade_rows(
+                opp=verified,
+                trades=trades,
+                live_execution_success=live_execution_success,
+                dashboard_execution_success=dashboard_execution_success,
+            ):
+                dash_state.append_trade(trade_row)
 
             filled = [t for t in trades if t.status.value == "filled"]
             if ai_advisor is not None and not config.dry_run:
                 ai_advisor.record_trade_outcome(
-                    _estimate_ai_trade_outcome(verified, trades, arb_success, adj_size)
+                    _estimate_ai_trade_outcome(verified, trades, live_execution_success, adj_size)
                 )
-            if arb_success and filled:
+            if live_execution_success and filled:
                 trade_msg = (
                     f"✅ 套利已执行\n"
                     f"事件: {opp.event_title}\n"
@@ -1931,6 +1954,13 @@ def main(dotenv_path: str | None = None) -> None:
             ws_status=ws_status,
             market_catalog=_summarize_market_catalog(universe_markets if universe_markets else scanned_markets),
             strategy_status=orchestrator.get_status(),
+            execution_summary={
+                "theoretical_opportunities": total_arbs_found,
+                "live_successes": total_arbs_executed,
+                "simulated_successes": total_simulated_executed,
+                "live_profit_total": round(total_live_expected_profit, 6),
+                "simulated_profit_total": round(total_simulated_expected_profit, 6),
+            },
             research_signal_status={
                 "enabled": research_signal_enabled,
                 "count": len(research_signals),
@@ -2205,6 +2235,20 @@ def _estimate_ai_trade_outcome(verified: ArbOpportunity, trades: list[Any], arb_
     return -verified.total_cost * adj_size
 
 
+def _has_simulated_trades(trades: list[Any]) -> bool:
+    return any(bool(getattr(trade, "simulated", False)) for trade in trades)
+
+
+def _reported_execution_success(*, live_execution_success: bool, trades: list[Any]) -> bool:
+    if _has_simulated_trades(trades):
+        filled = [
+            trade for trade in trades
+            if getattr(getattr(trade, "status", None), "value", "") == "filled"
+        ]
+        return bool(trades) and len(filled) == len(trades)
+    return live_execution_success
+
+
 def _find_pending_signal_overlay(orchestrator: StrategyOrchestrator, signal: StrategySignal) -> dict[str, Any]:
     pending = _find_pending_signal(orchestrator, signal)
     if pending is not None:
@@ -2252,15 +2296,22 @@ def _serialize_opportunity_event(opp: ArbOpportunity, *, stage: str) -> dict[str
 
 
 def _serialize_trade_execution(opp: ArbOpportunity, trades: list[Any], arb_success: bool, adj_size: float) -> dict[str, Any]:
+    simulated = _has_simulated_trades(trades)
+    reported_success = _reported_execution_success(
+        live_execution_success=arb_success,
+        trades=trades,
+    )
     return {
         "arb_type": opp.arb_type.value,
         "event_id": opp.event_id,
         "event_title": opp.event_title,
-        "arb_success": arb_success,
+        "arb_success": reported_success,
+        "live_execution_success": arb_success,
+        "simulated": simulated,
         "requested_size": adj_size,
         "expected_net_edge": opp.net_edge,
         "expected_total_cost": opp.total_cost,
-        "trade_outcome_estimate": _estimate_ai_trade_outcome(opp, trades, arb_success, adj_size),
+        "trade_outcome_estimate": _estimate_ai_trade_outcome(opp, trades, reported_success, adj_size),
         "trades": [
             {
                 "trade_id": getattr(trade, "trade_id", ""),
@@ -2280,6 +2331,44 @@ def _serialize_trade_execution(opp: ArbOpportunity, trades: list[Any], arb_succe
             for trade in trades
         ],
     }
+
+
+def _build_dashboard_trade_rows(
+    *,
+    opp: ArbOpportunity,
+    trades: list[Any],
+    live_execution_success: bool,
+    dashboard_execution_success: bool,
+) -> list[dict[str, Any]]:
+    mode = "simulated" if _has_simulated_trades(trades) else "live"
+    expected_profit = _estimate_ai_trade_outcome(
+        opp,
+        trades,
+        dashboard_execution_success,
+        min(
+            [float(getattr(trade, "size", 0.0) or 0.0) for trade in trades] or [0.0]
+        ),
+    )
+    rows: list[dict[str, Any]] = []
+    for trade in trades:
+        rows.append({
+            "trade_id": getattr(trade, "trade_id", ""),
+            "arb_id": getattr(trade, "arb_id", ""),
+            "event_title": opp.event_title,
+            "arb_type": opp.arb_type.value,
+            "mode": mode,
+            "execution_success": dashboard_execution_success,
+            "live_execution_success": live_execution_success,
+            "side": getattr(getattr(trade, "side", None), "value", ""),
+            "price": getattr(trade, "price", None),
+            "size": getattr(trade, "size", None),
+            "status": getattr(getattr(trade, "status", None), "value", ""),
+            "token_id": getattr(trade, "token_id", "")[:20],
+            "outcome": getattr(trade, "outcome", None),
+            "timestamp": getattr(trade, "timestamp", time.time()),
+            "expected_profit": expected_profit,
+        })
+    return rows
 
 
 def _serialize_strategy_signal(

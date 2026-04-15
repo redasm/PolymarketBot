@@ -41,6 +41,7 @@ class DashboardState:
 
         self.risk_state: dict = {}
         self.strategy_status: dict = {}
+        self.execution_summary: dict = {}
 
         self.recent_opportunities: list[dict] = []
         self.recent_trades: list[dict] = []
@@ -113,6 +114,7 @@ class DashboardState:
                 "markets_scanned": self.markets_scanned,
                 "risk_state": dict(self.risk_state),
                 "strategy_status": dict(self.strategy_status),
+                "execution_summary": dict(self.execution_summary),
                 "recent_opportunities": list(self.recent_opportunities[-20:]),
                 "recent_trades": list(self.recent_trades[-20:]),
                 "recent_errors": list(self.recent_errors[-10:]),

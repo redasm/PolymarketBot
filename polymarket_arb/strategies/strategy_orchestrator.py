@@ -96,10 +96,10 @@ class StrategyOrchestrator:
     """策略编排器."""
 
     DEFAULT_ALLOCATIONS = {
-        StrategyTier.STRUCTURAL_ARB: 0.30,
-        StrategyTier.CROSS_PLATFORM: 0.20,
-        StrategyTier.STATISTICAL_ARB: 0.30,
-        StrategyTier.MARKET_MAKING: 0.20,
+        StrategyTier.STRUCTURAL_ARB: 0.45,
+        StrategyTier.CROSS_PLATFORM: 0.00,
+        StrategyTier.STATISTICAL_ARB: 0.40,
+        StrategyTier.MARKET_MAKING: 0.15,
     }
     _MAX_SIGNAL_HISTORY = 2000
 

@@ -9,6 +9,7 @@ from polymarket_arb.dashboard_api import _enrich_ai_decision
 from polymarket_arb.market_scanner import MarketScanner
 from polymarket_arb.main_loop import (
     _build_cycle_summary_payload,
+    _build_dashboard_trade_rows,
     _emit_cycle_metrics,
     _collect_cross_platform_strategy_signals,
     _collect_maker_strategy_signals,
@@ -348,6 +349,94 @@ def test_serialize_trade_execution_includes_trade_rows():
     assert payload["event_id"] == opp.event_id
     assert payload["trades"][0]["trade_id"] == "t1"
     assert payload["trades"][0]["fill_size"] == 5
+
+
+def test_serialize_trade_execution_marks_dry_run_fills_as_simulated_success():
+    opp = _make_opp()
+    trades = [
+        TradeRecord(
+            trade_id="t1",
+            arb_id="a1",
+            token_id="yes",
+            condition_id="c1",
+            side=OrderSide.BUY,
+            price=0.45,
+            size=5,
+            status=TradeStatus.FILLED,
+            fill_price=0.45,
+            fill_size=5,
+            economic_cost=0.45,
+            simulated=True,
+        ),
+        TradeRecord(
+            trade_id="t2",
+            arb_id="a1",
+            token_id="no",
+            condition_id="c1",
+            side=OrderSide.BUY,
+            price=0.50,
+            size=5,
+            status=TradeStatus.FILLED,
+            fill_price=0.50,
+            fill_size=5,
+            economic_cost=0.50,
+            simulated=True,
+        ),
+    ]
+
+    payload = _serialize_trade_execution(opp, trades, arb_success=False, adj_size=5)
+
+    assert payload["simulated"] is True
+    assert payload["live_execution_success"] is False
+    assert payload["arb_success"] is True
+    assert payload["trade_outcome_estimate"] == opp.net_edge * 5
+
+
+def test_build_dashboard_trade_rows_marks_simulated_execution_mode():
+    opp = _make_opp()
+    trades = [
+        TradeRecord(
+            trade_id="t1",
+            arb_id="a1",
+            token_id="yes",
+            condition_id="c1",
+            side=OrderSide.BUY,
+            price=0.45,
+            size=5,
+            status=TradeStatus.FILLED,
+            fill_price=0.45,
+            fill_size=5,
+            economic_cost=0.45,
+            simulated=True,
+        ),
+        TradeRecord(
+            trade_id="t2",
+            arb_id="a1",
+            token_id="no",
+            condition_id="c1",
+            side=OrderSide.BUY,
+            price=0.50,
+            size=5,
+            status=TradeStatus.FILLED,
+            fill_price=0.50,
+            fill_size=5,
+            economic_cost=0.50,
+            simulated=True,
+        ),
+    ]
+
+    rows = _build_dashboard_trade_rows(
+        opp=opp,
+        trades=trades,
+        live_execution_success=False,
+        dashboard_execution_success=True,
+    )
+
+    assert len(rows) == 2
+    assert rows[0]["mode"] == "simulated"
+    assert rows[0]["execution_success"] is True
+    assert rows[0]["event_title"] == opp.event_title
+    assert rows[0]["expected_profit"] == opp.net_edge * 5
 
 
 def test_select_scan_candidates_prefers_binary_liquid_markets():

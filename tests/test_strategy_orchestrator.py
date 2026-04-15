@@ -183,8 +183,10 @@ def test_strategy_status_exposes_tier_budgets_and_overlay_meta():
 
     status = orchestrator.get_status()
 
-    assert status["T0"]["budget"] == 150.0
-    assert status["T2"]["budget"] == 150.0
+    assert status["T0"]["budget"] == 225.0
+    assert status["T1"]["budget"] == 0.0
+    assert status["T2"]["budget"] == 200.0
+    assert status["T3"]["budget"] == 75.0
     assert status["meta"]["research_overlay"]["applied"] == 0
 
 
