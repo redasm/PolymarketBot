@@ -795,15 +795,14 @@ def _execute_strategy_signal(
             return False, balance_reason
         trades = executor.execute_arbitrage(opportunity, adj_size)
         execution_success = executor.is_successful_execution(opportunity, trades)
-        if not config.dry_run:
-            risk_mgr.record_execution(opportunity, trades)
-            orchestrator.record_execution(
-                signal,
-                success=execution_success,
-                exposure_amount_usdc=_sum_trade_exposure(trades),
-            )
-        else:
-            orchestrator.record_processed(signal)
+        # 无论 dry_run 与否都记录到 risk_mgr，保证持仓/敞口/冷却期追踪生效；
+        # dry_run 下 trades 均为 simulated，不会触发真实订单。
+        risk_mgr.record_execution(opportunity, trades)
+        orchestrator.record_execution(
+            signal,
+            success=execution_success,
+            exposure_amount_usdc=_sum_trade_exposure(trades),
+        )
         if event_recorder.is_enabled:
             event_recorder.write_event("strategy_executions", {
                 "tier": signal.tier.name,
@@ -1891,11 +1890,17 @@ def main(dotenv_path: str | None = None) -> None:
             cycle_timing["ai_sec"] += time.perf_counter() - phase_start
 
         phase_start = time.perf_counter()
+        # T2/T3 信号从 scanned_markets 生成（含 event markets），universe_markets 可能不含这些市场；
+        # 合并两个列表以确保 _find_market_for_signal 能找到信号对应的市场。
+        _scanned_ids = {m.condition_id for m in scanned_markets}
+        execution_markets = scanned_markets + [
+            m for m in active_markets_for_overlay if m.condition_id not in _scanned_ids
+        ]
         for processed_signal in orchestrator.process_signals():
             executed, reason = _execute_strategy_signal(
                 signal=processed_signal,
                 config=config,
-                active_markets=active_markets_for_overlay,
+                active_markets=execution_markets,
                 ob_analyzer=ob_analyzer,
                 executor=executor,
                 risk_mgr=risk_mgr,

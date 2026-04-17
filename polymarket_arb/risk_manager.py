@@ -38,6 +38,7 @@ class RiskManager:
         self._effective_max_total_exposure = config.max_total_exposure
         self._effective_max_daily_loss = config.max_daily_loss
         self._pending_reservation_ttl_sec = config.risk_pending_reservation_ttl_sec
+        self._halt_time: float | None = None
 
     @property
     def state(self) -> RiskState:
@@ -52,6 +53,18 @@ class RiskManager:
         """
         self._maybe_reset_daily()
         self._reconcile_pending_reservations()
+
+        if (
+            self._state.is_halted
+            and self._config.risk_halt_auto_recover_sec > 0
+            and self._halt_time is not None
+            and time.time() - self._halt_time >= self._config.risk_halt_auto_recover_sec
+        ):
+            self._state.is_halted = False
+            self._state.halt_reason = ""
+            self._state.consecutive_failures = 0
+            self._halt_time = None
+            LOG.info("风控熔断自动解除（无新失败超过 %.0f 秒）", self._config.risk_halt_auto_recover_sec)
 
         can, reason = self._state.check_can_trade(
             max_positions=self._config.max_open_positions,
@@ -137,12 +150,19 @@ class RiskManager:
             and not failed_trades
         )
 
+        has_any_fills = bool(actual_exposure_trades)
         if execution_success:
             self._state.consecutive_failures = 0
-        elif trades and not (only_pending_submission and not count_pending_as_failure):
+            self._halt_time = None
+        elif has_any_fills:
+            # 部分成交：小额衰减，不触发熔断
+            self._state.consecutive_failures = max(0, self._state.consecutive_failures - 1)
+        elif failed_trades and not (only_pending_submission and not count_pending_as_failure):
+            # 零成交且有失败腿：计入连续失败
             self._state.consecutive_failures += 1
             if self._state.consecutive_failures >= self._config.max_consecutive_failures > 0:
                 self._state.is_halted = True
+                self._halt_time = time.time()
                 self._state.halt_reason = f"连续失败 {self._state.consecutive_failures} 次"
                 LOG.error("风控熔断: %s", self._state.halt_reason)
 
@@ -236,6 +256,7 @@ class RiskManager:
         self._state.is_halted = False
         self._state.halt_reason = ""
         self._state.consecutive_failures = 0
+        self._halt_time = None
         LOG.info("风控熔断已手动解除")
 
     def _format_cooldown_label(self) -> str:

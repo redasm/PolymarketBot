@@ -82,6 +82,7 @@ class ArbConfig:
     polymarket_taker_fee_rate: float
     kalshi_taker_fee_rate: float
     max_multi_outcome_legs: int
+    t0_min_multi_outcome_median_leg_price: float
 
     # 风险管理
     max_open_positions: int
@@ -91,6 +92,7 @@ class ArbConfig:
     max_consecutive_failures: int
     risk_event_cooldown_sec: float
     risk_pending_reservation_ttl_sec: float
+    risk_halt_auto_recover_sec: float
 
     # Telegram
     telegram_enabled: bool
@@ -226,6 +228,8 @@ class ArbConfig:
             raise ValueError("RISK_EVENT_COOLDOWN_SEC 不能为负数")
         if self.risk_pending_reservation_ttl_sec < 0:
             raise ValueError("RISK_PENDING_RESERVATION_TTL_SEC 不能为负数")
+        if self.risk_halt_auto_recover_sec < 0:
+            raise ValueError("RISK_HALT_AUTO_RECOVER_SEC 不能为负数")
         if self.data_cleanup_enabled and self.data_cleanup_interval_sec <= 0:
             raise ValueError("DATA_CLEANUP_INTERVAL_SEC 必须大于 0")
         if min(
@@ -314,6 +318,7 @@ class ArbConfig:
             polymarket_taker_fee_rate=_env_float("POLYMARKET_TAKER_FEE_RATE", 0.02),
             kalshi_taker_fee_rate=_env_float("KALSHI_TAKER_FEE_RATE", 0.003),
             max_multi_outcome_legs=_env_int("ARB_MAX_MULTI_OUTCOME_LEGS", 20),
+            t0_min_multi_outcome_median_leg_price=_env_float("T0_MIN_MULTI_OUTCOME_MEDIAN_LEG_PRICE", 0.05),
             max_open_positions=_env_int("RISK_MAX_OPEN_POSITIONS", 10),
             max_exposure_per_market=_env_float("RISK_MAX_EXPOSURE_PER_MARKET", 100.0),
             max_total_exposure=_env_float("RISK_MAX_TOTAL_EXPOSURE", 500.0),
@@ -321,6 +326,7 @@ class ArbConfig:
             max_consecutive_failures=_env_int("RISK_MAX_CONSECUTIVE_FAILURES", 5),
             risk_event_cooldown_sec=_env_float("RISK_EVENT_COOLDOWN_SEC", 60.0),
             risk_pending_reservation_ttl_sec=_env_float("RISK_PENDING_RESERVATION_TTL_SEC", 30.0),
+            risk_halt_auto_recover_sec=_env_float("RISK_HALT_AUTO_RECOVER_SEC", 3600.0),
             telegram_enabled=_env_bool("TELEGRAM_ENABLED", False),
             telegram_bot_token=_env("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=_env("TELEGRAM_CHAT_ID"),

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
+import statistics
 from typing import Optional
 
 from polymarket_arb.config import ArbConfig
@@ -170,6 +171,20 @@ class ArbitrageDetector:
 
         if not legs:
             return None
+
+        # 过滤低流动性"假套利"：多结果市场中大量腿价格极低（<5%），
+        # 这类市场深度几乎为零，实际执行时无法成交，是假阳性信号。
+        leg_prices = [leg.economic_cost for leg in legs if leg.economic_cost is not None and leg.available_size > 0]
+        if leg_prices:
+            median_price = statistics.median(leg_prices)
+            if median_price < self._config.t0_min_multi_outcome_median_leg_price:
+                LOG.debug(
+                    "跳过低流动性多结果套利: %s, median_leg_price=%.4f < %.4f",
+                    event.title,
+                    median_price,
+                    self._config.t0_min_multi_outcome_median_leg_price,
+                )
+                return None
 
         gross_edge = PAYOUT_PER_SHARE - total_ask_cost
         fee = self._fees.estimate_fee(total_ask_cost, num_legs=len(legs))
