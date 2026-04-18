@@ -14,7 +14,6 @@ def test_notification_manager_sends_pnl_alert_only_once_per_risk_day(tmp_path):
     sent: list[tuple[str, str]] = []
     manager = NotificationManager(
         make_test_config(
-            notification_provider="none",
             notification_state_file=str(tmp_path / "notification_state.json"),
             pnl_profit_alert_usdc=20.0,
             pnl_loss_alert_usdc=10.0,
@@ -39,7 +38,6 @@ def test_notification_manager_daily_summary_uses_completed_day_stats_after_rollo
     sent: list[tuple[str, str]] = []
     manager = NotificationManager(
         make_test_config(
-            notification_provider="none",
             notification_state_file=str(tmp_path / "notification_state.json"),
             daily_summary_time_hhmm="08:05",
             daily_summary_timezone="Asia/Shanghai",
@@ -109,7 +107,6 @@ def test_notification_manager_formats_startup_and_shutdown_messages(tmp_path):
     sent: list[tuple[str, str]] = []
     manager = NotificationManager(
         make_test_config(
-            notification_provider="none",
             notification_state_file=str(tmp_path / "notification_state.json"),
         )
     )

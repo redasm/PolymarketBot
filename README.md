@@ -98,8 +98,7 @@ polymarket_arb/
 ├── websocket_feed.py                  # WebSocket 实时订单簿镜像 + 同步 EnhancedBookStore
 ├── execution_engine.py                # 交易执行（多腿原子提交 + 失败回滚）
 ├── risk_manager.py                    # 风控（敞口/止损/熔断/市场冷却）
-├── telegram_notifier.py               # Telegram 推送（兼容旧配置）
-├── feishu_notifier.py                 # 飞书机器人 webhook 推送
+├── feishu_notifier.py                 # 飞书应用机器人推送
 ├── notifier.py                        # 统一通知路由（成交/错误/盈亏/日报）
 ├── logger_setup.py                    # 日志（控制台 + 文件双输出）
 ├── dashboard_api.py                   # FastAPI 监控后端 + 波动率/Edge/BookStore 端点
@@ -188,7 +187,7 @@ T0 结构性套利检测 (毫秒级)
 StrategyOrchestrator 优先级排序 → 资金分配 → 逐个执行
          │
          ▼
-Dashboard 更新（volatility / edge / book_summary）+ 统一通知（Telegram / 飞书）
+Dashboard 更新（volatility / edge / book_summary）+ 飞书通知
 ```
 
 ## 风控机制
@@ -254,11 +253,13 @@ cp .env.example .env
 
 完整配置见 `.env.example`。
 
-如果你希望把成交、严重错误、盈亏阈值和日报推送到飞书机器人，优先关注这些新增配置：
+如果你希望把成交、严重错误、盈亏阈值和日报推送到飞书应用机器人，优先关注这些新增配置：
 
-- `NOTIFICATION_PROVIDER=feishu`
-- `FEISHU_WEBHOOK_URL=...`
-- `FEISHU_SIGN_SECRET=...`：如果飞书机器人安全设置启用了加签
+- `FEISHU_APP_ID=...`
+- `FEISHU_APP_SECRET=...`
+- `FEISHU_OPEN_ID=...`
+- `NOTIFICATION_COOLDOWN_SEC=30`
+- `NOTIFY_ON_ARB_FOUND=false`
 - `NOTIFY_ON_TRADE_SUCCESS=true`
 - `NOTIFY_ON_TRADE_FAILURE=true`
 - `NOTIFY_ON_FATAL_ERROR=true`
@@ -270,7 +271,7 @@ cp .env.example .env
 - `DAILY_SUMMARY_TIMEZONE=Asia/Shanghai`
 
 当前日报默认 `08:05 Asia/Shanghai` 发送，配合现有 `daily_pnl` / 风控日切口径做去重与归档。
-飞书渠道当前会优先使用结构化 `post` 消息发送启动、停止、成交、严重错误、盈亏提醒和日报，便于把它作为主要值守入口。
+飞书渠道当前会通过飞书应用机器人 OpenAPI 发送结构化 `post` 消息，包括启动、停止、成交、严重错误、盈亏提醒和日报，便于把它作为主要值守入口。
 
 如果你希望让 dashboard / 风控 / 盈亏提醒尽量接近账户真实状态，可以打开低频账户同步：
 

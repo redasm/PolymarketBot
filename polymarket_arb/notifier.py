@@ -1,4 +1,4 @@
-"""统一通知层：路由到 Telegram / 飞书，并封装业务告警逻辑."""
+"""统一通知层：路由到飞书，并封装业务告警逻辑."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from zoneinfo import ZoneInfo
 
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.feishu_notifier import FeishuNotifier
-from polymarket_arb.telegram_notifier import TelegramNotifier
 
 LOG = logging.getLogger(__name__)
 
@@ -372,18 +371,7 @@ class NotificationManager:
 
 
 def _build_backend(config: ArbConfig) -> _Backend:
-    provider = config.notification_provider.strip().lower()
-    if provider in {"", "auto"}:
-        if config.feishu_webhook_url:
-            provider = "feishu"
-        elif config.telegram_enabled:
-            provider = "telegram"
-        else:
-            provider = "none"
-
-    if provider == "telegram":
-        return TelegramNotifier(config)
-    if provider == "feishu":
+    if config.feishu_app_id and config.feishu_app_secret and config.feishu_open_id:
         return FeishuNotifier(config)
     return NullNotifier()
 

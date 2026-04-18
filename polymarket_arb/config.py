@@ -102,19 +102,13 @@ class ArbConfig:
     data_api_host: str
     portfolio_sync_user_address: str
 
-    # Telegram
-    telegram_enabled: bool
-    telegram_bot_token: str
-    telegram_chat_id: str
+    # 飞书应用机器人通知
+    feishu_app_id: str
+    feishu_app_secret: str
+    feishu_open_id: str
+    feishu_api_base: str
+    notification_cooldown_sec: float
     notify_on_arb_found: bool
-    notify_on_trade: bool
-    notify_on_error: bool
-    telegram_cooldown_sec: float
-
-    # 通知路由 / 飞书
-    notification_provider: str
-    feishu_webhook_url: str
-    feishu_sign_secret: str
     notify_on_trade_success: bool
     notify_on_trade_failure: bool
     notify_on_fatal_error: bool
@@ -260,8 +254,14 @@ class ArbConfig:
             raise ValueError("PORTFOLIO_SYNC_TIMEOUT_SEC 必须大于 0")
         if self.portfolio_sync_enabled and not self.data_api_host:
             raise ValueError("DATA_API_HOST 不能为空")
-        if self.notification_provider.lower() not in {"", "none", "telegram", "feishu", "auto"}:
-            raise ValueError("NOTIFICATION_PROVIDER 仅支持 none/telegram/feishu/auto")
+        if self.notification_cooldown_sec < 0:
+            raise ValueError("NOTIFICATION_COOLDOWN_SEC 不能为负数")
+        feishu_configured = bool(self.feishu_app_id or self.feishu_app_secret or self.feishu_open_id)
+        if feishu_configured:
+            if not self.feishu_app_id or not self.feishu_app_secret:
+                raise ValueError("启用飞书通知需要 FEISHU_APP_ID 和 FEISHU_APP_SECRET")
+            if not self.feishu_open_id:
+                raise ValueError("启用飞书通知需要 FEISHU_OPEN_ID")
         if self.pnl_profit_alert_usdc < 0 or self.pnl_loss_alert_usdc < 0:
             raise ValueError("PNL 告警阈值不能为负数")
         if self.fatal_error_cooldown_sec < 0:
@@ -383,19 +383,15 @@ class ArbConfig:
             portfolio_sync_timeout_sec=_env_float("PORTFOLIO_SYNC_TIMEOUT_SEC", 5.0),
             data_api_host=_env("DATA_API_HOST", "https://data-api.polymarket.com"),
             portfolio_sync_user_address=_env("PORTFOLIO_SYNC_USER_ADDRESS"),
-            telegram_enabled=_env_bool("TELEGRAM_ENABLED", False),
-            telegram_bot_token=_env("TELEGRAM_BOT_TOKEN"),
-            telegram_chat_id=_env("TELEGRAM_CHAT_ID"),
-            notify_on_arb_found=_env_bool("TELEGRAM_NOTIFY_ON_ARB_FOUND", False),
-            notify_on_trade=_env_bool("TELEGRAM_NOTIFY_ON_TRADE", True),
-            notify_on_error=_env_bool("TELEGRAM_NOTIFY_ON_ERROR", True),
-            telegram_cooldown_sec=_env_float("TELEGRAM_NOTIFY_COOLDOWN_SEC", 30.0),
-            notification_provider=_env("NOTIFICATION_PROVIDER", "auto"),
-            feishu_webhook_url=_env("FEISHU_WEBHOOK_URL"),
-            feishu_sign_secret=_env("FEISHU_SIGN_SECRET"),
-            notify_on_trade_success=_env_bool("NOTIFY_ON_TRADE_SUCCESS", _env_bool("TELEGRAM_NOTIFY_ON_TRADE", True)),
-            notify_on_trade_failure=_env_bool("NOTIFY_ON_TRADE_FAILURE", _env_bool("TELEGRAM_NOTIFY_ON_ERROR", True)),
-            notify_on_fatal_error=_env_bool("NOTIFY_ON_FATAL_ERROR", _env_bool("TELEGRAM_NOTIFY_ON_ERROR", True)),
+            feishu_app_id=_env("FEISHU_APP_ID"),
+            feishu_app_secret=_env("FEISHU_APP_SECRET"),
+            feishu_open_id=_env("FEISHU_OPEN_ID"),
+            feishu_api_base=_env("FEISHU_API_BASE", "https://open.feishu.cn/open-apis"),
+            notification_cooldown_sec=_env_float("NOTIFICATION_COOLDOWN_SEC", 30.0),
+            notify_on_arb_found=_env_bool("NOTIFY_ON_ARB_FOUND", False),
+            notify_on_trade_success=_env_bool("NOTIFY_ON_TRADE_SUCCESS", True),
+            notify_on_trade_failure=_env_bool("NOTIFY_ON_TRADE_FAILURE", True),
+            notify_on_fatal_error=_env_bool("NOTIFY_ON_FATAL_ERROR", True),
             notify_on_pnl_alert=_env_bool("NOTIFY_ON_PNL_ALERT", True),
             notify_on_daily_summary=_env_bool("NOTIFY_ON_DAILY_SUMMARY", True),
             pnl_profit_alert_usdc=_env_float("PNL_PROFIT_ALERT_USDC", 20.0),

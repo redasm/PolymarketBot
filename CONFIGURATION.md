@@ -10,7 +10,7 @@
   - [API 端点](#api-端点)
   - [套利参数](#套利参数)
   - [风险管理](#风险管理)
-  - [Telegram 通知](#telegram-通知)
+  - [飞书通知](#飞书通知)
   - [波动率估算](#波动率估算)
   - [Edge 引擎](#edge-引擎)
   - [Tick 录制](#tick-录制)
@@ -160,17 +160,27 @@ Polymarket 由三套独立 API 组成：
 - `RISK_PENDING_RESERVATION_TTL_SEC` 主要影响 `PENDING` 订单的预留敞口，不影响已经确认 `FILLED/PARTIAL` 的真实敞口。
 - 如果你的真实订单类型可能长时间停留在 `PENDING`，建议把它调高到 `120-300` 秒；如果长期只用 `FOK/FAK`，保持默认值通常即可。
 
-### Telegram 通知
+### 飞书通知
 
 | 环境变量 | 类型 | 默认值 | 说明 |
 |----------|------|--------|------|
-| `TELEGRAM_ENABLED` | bool | `false` | 是否启用 Telegram 通知 |
-| `TELEGRAM_BOT_TOKEN` | str | — | Bot Token（从 [@BotFather](https://t.me/BotFather) 获取） |
-| `TELEGRAM_CHAT_ID` | str | — | 目标聊天 ID（个人或群组） |
-| `TELEGRAM_NOTIFY_ON_ARB_FOUND` | bool | `true` | 发现套利机会时通知 |
-| `TELEGRAM_NOTIFY_ON_TRADE` | bool | `true` | 交易执行时通知（跳过冷却期，每笔必发） |
-| `TELEGRAM_NOTIFY_ON_ERROR` | bool | `true` | 错误告警通知 |
-| `TELEGRAM_NOTIFY_COOLDOWN_SEC` | float | `30` | 同类消息冷却时间（秒）。防止刷屏 |
+| `FEISHU_APP_ID` | str | — | 飞书应用机器人 `App ID` |
+| `FEISHU_APP_SECRET` | str | — | 飞书应用机器人 `App Secret` |
+| `FEISHU_OPEN_ID` | str | — | 唯一接收目标的 `open_id` |
+| `FEISHU_API_BASE` | str | `https://open.feishu.cn/open-apis` | 飞书开放平台 API 基础地址 |
+| `NOTIFICATION_COOLDOWN_SEC` | float | `30` | 同类通知冷却时间（秒） |
+| `NOTIFY_ON_ARB_FOUND` | bool | `false` | 发现套利机会时是否通知。默认关闭防止刷屏 |
+| `NOTIFY_ON_TRADE_SUCCESS` | bool | `true` | 成交成功提醒 |
+| `NOTIFY_ON_TRADE_FAILURE` | bool | `true` | 成交失败提醒 |
+| `NOTIFY_ON_FATAL_ERROR` | bool | `true` | 严重错误提醒 |
+| `NOTIFY_ON_PNL_ALERT` | bool | `true` | 盈亏阈值提醒 |
+| `NOTIFY_ON_DAILY_SUMMARY` | bool | `true` | 每日汇总提醒 |
+| `PNL_PROFIT_ALERT_USDC` | float | `20` | 日盈利提醒阈值 |
+| `PNL_LOSS_ALERT_USDC` | float | `10` | 日亏损提醒阈值 |
+| `FATAL_ERROR_COOLDOWN_SEC` | float | `300` | 同类严重错误的单独冷却时间 |
+| `DAILY_SUMMARY_TIME_HHMM` | str | `08:05` | 日报发送时间 |
+| `DAILY_SUMMARY_TIMEZONE` | str | `Asia/Shanghai` | 日报时区 |
+| `NOTIFICATION_STATE_FILE` | str | `data/telemetry/notification_state.json` | 通知状态持久化文件 |
 
 **通知消息类别：**
 
@@ -179,9 +189,11 @@ Polymarket 由三套独立 API 组成：
 | `startup` | 机器人启动 | 否（force） |
 | `shutdown` | 机器人停止 | 否（force） |
 | `arb_found` | 发现套利机会 | 是 |
-| `trade` | 交易执行完成 | 否（force） |
-| `error` | 错误告警 | 是 |
-| `status` | 定期状态报告（每 100 周期） | 是 |
+| `trade_success` | 成交成功 | 否（force） |
+| `trade_failure` | 成交失败 | 否（force） |
+| `fatal_error` | 严重错误 | 否（受单独 fatal cooldown 控制） |
+| `pnl_profit/pnl_loss` | 盈亏阈值提醒 | 否（每统计日单方向一次） |
+| `daily_summary` | 每日汇总 | 否（每天一次） |
 
 ### 波动率估算
 
@@ -430,7 +442,7 @@ ARB_DRY_RUN=true
 - 只读 CLOB 客户端，不派生 API 凭证
 - 正常扫描市场、检测套利、计算 Kelly 仓位
 - 交易结果全部标记为 `FILLED`（模拟成功）
-- Dashboard、Telegram、Tick 录制均正常工作
+- Dashboard、飞书通知、Tick 录制均正常工作
 
 ### Live（实盘）
 
