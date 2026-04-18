@@ -98,7 +98,9 @@ polymarket_arb/
 ├── websocket_feed.py                  # WebSocket 实时订单簿镜像 + 同步 EnhancedBookStore
 ├── execution_engine.py                # 交易执行（多腿原子提交 + 失败回滚）
 ├── risk_manager.py                    # 风控（敞口/止损/熔断/市场冷却）
-├── telegram_notifier.py               # Telegram 推送（套利发现/执行/错误）
+├── telegram_notifier.py               # Telegram 推送（兼容旧配置）
+├── feishu_notifier.py                 # 飞书机器人 webhook 推送
+├── notifier.py                        # 统一通知路由（成交/错误/盈亏/日报）
 ├── logger_setup.py                    # 日志（控制台 + 文件双输出）
 ├── dashboard_api.py                   # FastAPI 监控后端 + 波动率/Edge/BookStore 端点
 ├── dashboard.html                     # 前端仪表盘
@@ -186,7 +188,7 @@ T0 结构性套利检测 (毫秒级)
 StrategyOrchestrator 优先级排序 → 资金分配 → 逐个执行
          │
          ▼
-Dashboard 更新（volatility / edge / book_summary）+ Telegram 通知
+Dashboard 更新（volatility / edge / book_summary）+ 统一通知（Telegram / 飞书）
 ```
 
 ## 风控机制
@@ -251,6 +253,39 @@ cp .env.example .env
 | `BACKTEST_ENABLED` | 启用回测状态展示 | false |
 
 完整配置见 `.env.example`。
+
+如果你希望把成交、严重错误、盈亏阈值和日报推送到飞书机器人，优先关注这些新增配置：
+
+- `NOTIFICATION_PROVIDER=feishu`
+- `FEISHU_WEBHOOK_URL=...`
+- `FEISHU_SIGN_SECRET=...`：如果飞书机器人安全设置启用了加签
+- `NOTIFY_ON_TRADE_SUCCESS=true`
+- `NOTIFY_ON_TRADE_FAILURE=true`
+- `NOTIFY_ON_FATAL_ERROR=true`
+- `NOTIFY_ON_PNL_ALERT=true`
+- `NOTIFY_ON_DAILY_SUMMARY=true`
+- `PNL_PROFIT_ALERT_USDC=20`
+- `PNL_LOSS_ALERT_USDC=10`
+- `DAILY_SUMMARY_TIME_HHMM=08:05`
+- `DAILY_SUMMARY_TIMEZONE=Asia/Shanghai`
+
+当前日报默认 `08:05 Asia/Shanghai` 发送，配合现有 `daily_pnl` / 风控日切口径做去重与归档。
+飞书渠道当前会优先使用结构化 `post` 消息发送启动、停止、成交、严重错误、盈亏提醒和日报，便于把它作为主要值守入口。
+
+如果你希望让 dashboard / 风控 / 盈亏提醒尽量接近账户真实状态，可以打开低频账户同步：
+
+- `PORTFOLIO_SYNC_ENABLED=true`
+- `PORTFOLIO_SYNC_INTERVAL_SEC=60`
+- `PORTFOLIO_SYNC_TIMEOUT_SEC=5`
+- `DATA_API_HOST=https://data-api.polymarket.com`
+- `PORTFOLIO_SYNC_USER_ADDRESS=`：留空时默认使用 `POLYMARKET_FUNDER`
+
+第一版账户同步只做两件事：
+
+- 同步当前真实持仓到 dashboard / 风控状态
+- 同步当日已实现盈亏到 `daily_pnl`
+
+它不会进入高频盘口扫描或执行路径，只按低频周期刷新。
 
 几个新增参数建议保持保守默认值：
 

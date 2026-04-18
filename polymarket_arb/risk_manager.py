@@ -17,6 +17,7 @@ import time
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.models import (
     ArbOpportunity,
+    PositionSnapshot,
     RiskState,
     TradeRecord,
     TradeStatus,
@@ -223,6 +224,56 @@ class RiskManager:
             if value[0] != condition_id
         }
         self._state.open_positions = sum(1 for exp in self._market_exposure.values() if exp > 0)
+
+    def sync_portfolio_snapshot(
+        self,
+        positions: list[PositionSnapshot],
+        *,
+        realized_daily_pnl: float,
+        synced_at: float,
+    ) -> None:
+        """用账户真实状态刷新持仓和已实现日盈亏."""
+        self._reconcile_pending_reservations()
+
+        actual_market_exposure: dict[str, float] = {}
+        normalized_positions: list[PositionSnapshot] = []
+        for position in positions:
+            size = max(0.0, float(position.size))
+            if size <= 0:
+                continue
+            avg_price = max(0.0, float(position.avg_price))
+            normalized = PositionSnapshot(
+                token_id=position.token_id,
+                condition_id=position.condition_id,
+                outcome=position.outcome,
+                size=size,
+                avg_price=avg_price,
+                current_value=max(0.0, float(position.current_value)),
+                unrealized_pnl=float(position.unrealized_pnl),
+            )
+            normalized_positions.append(normalized)
+            actual_market_exposure[normalized.condition_id] = (
+                actual_market_exposure.get(normalized.condition_id, 0.0) + (normalized.avg_price * normalized.size)
+            )
+
+        self._state.positions = normalized_positions
+        self._state.daily_pnl = float(realized_daily_pnl)
+        self._state.last_portfolio_sync_ts = float(synced_at)
+        self._state.portfolio_sync_ok = True
+        self._state.portfolio_sync_error = ""
+
+        merged_exposure = dict(actual_market_exposure)
+        for condition_id, exposure, _ in self._pending_reservations.values():
+            merged_exposure[condition_id] = merged_exposure.get(condition_id, 0.0) + exposure
+        self._market_exposure = merged_exposure
+        self._state.total_exposure = sum(merged_exposure.values())
+        self._state.open_positions = sum(1 for exposure in merged_exposure.values() if exposure > 0)
+
+    def mark_portfolio_sync_error(self, message: str, *, synced_at: float | None = None) -> None:
+        self._state.portfolio_sync_ok = False
+        self._state.portfolio_sync_error = message
+        if synced_at is not None:
+            self._state.last_portfolio_sync_ts = float(synced_at)
 
     def apply_ai_adjustment(self, adjustments: dict) -> None:
         """应用 AI 建议的风控参数调整（受硬上限约束）.

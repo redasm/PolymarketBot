@@ -54,7 +54,9 @@ from polymarket_arb.models import (
     TradeRecord,
     TradeStatus,
 )
+from polymarket_arb.notifier import NotificationManager
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
+from polymarket_arb.portfolio_sync import PortfolioSync
 from polymarket_arb.risk_manager import RiskManager
 from polymarket_arb.strategies.cross_platform import CrossPlatformScanner, KalshiClient
 from polymarket_arb.strategies.maker_strategy import DynamicSpreadCalculator, MakerStrategy
@@ -64,7 +66,6 @@ from polymarket_arb.strategies.strategy_orchestrator import (
     StrategySignal,
     StrategyTier,
 )
-from polymarket_arb.telegram_notifier import TelegramNotifier
 from polymarket_arb.tick_recorder import TickRecorder
 from polymarket_arb.volatility_estimator import VolEstimator
 from polymarket_arb.websocket_feed import OrderBookMirror, WebSocketFeed
@@ -152,12 +153,14 @@ def _log_startup_summary(config: ArbConfig, run_id: str) -> None:
         config.risk_event_cooldown_sec,
     )
     LOG.info(
-        "数据: ws=%s ws_markets=%d tick_record=%s telemetry=%s cleanup=%s",
+        "数据: ws=%s ws_markets=%d tick_record=%s telemetry=%s cleanup=%s portfolio_sync=%s/%.0fs",
         config.ws_enabled,
         config.ws_max_markets,
         config.tick_record_enabled,
         config.telemetry_record_enabled,
         config.data_cleanup_enabled,
+        config.portfolio_sync_enabled,
+        config.portfolio_sync_interval_sec,
     )
     LOG.info(
         "研究/AI: research=%s knowledge=%s ai=%s provider=%s model=%s",
@@ -880,21 +883,18 @@ def _execute_strategy_signal(
             order_type_name="GTC",
         )
         submission_success = trade.status in {TradeStatus.PENDING, TradeStatus.PARTIAL, TradeStatus.FILLED}
-        if not config.dry_run:
-            risk_mgr.record_execution(
-                maker_opp,
-                [trade],
-                count_pending_as_failure=False,
-            )
-            orchestrator.record_execution(
-                signal,
-                success=submission_success,
-                exposure_amount_usdc=_sum_trade_exposure([trade]),
-            )
-            if trade.status == TradeStatus.FILLED and trade.fill_size:
-                maker_strategy.update_inventory(yes_token.token_id, "BUY", float(trade.fill_size))
-        else:
-            orchestrator.record_processed(signal)
+        risk_mgr.record_execution(
+            maker_opp,
+            [trade],
+            count_pending_as_failure=False,
+        )
+        orchestrator.record_execution(
+            signal,
+            success=submission_success,
+            exposure_amount_usdc=_sum_trade_exposure([trade]),
+        )
+        if trade.status == TradeStatus.FILLED and trade.fill_size:
+            maker_strategy.update_inventory(yes_token.token_id, "BUY", float(trade.fill_size))
         dash_state.append_trade({
             "trade_id": trade.trade_id,
             "arb_id": trade.arb_id,
@@ -1297,7 +1297,7 @@ def main(dotenv_path: str | None = None) -> None:
     detector = ArbitrageDetector(config, ob_analyzer)
     executor = ExecutionEngine(config, trading_client or ro_client)
     risk_mgr = RiskManager(config)
-    notifier = TelegramNotifier(config)
+    notifier = NotificationManager(config)
 
     enhanced_store = EnhancedBookStore()
     vol_estimator = VolEstimator(
@@ -1385,6 +1385,14 @@ def main(dotenv_path: str | None = None) -> None:
     )
     research_refresh_state = _ResearchRefreshState()
     research_refresh_interval_sec = max(5.0, float(config.research_signal_cache_ttl_sec))
+    portfolio_sync = PortfolioSync(config) if config.portfolio_sync_enabled else None
+    if portfolio_sync is not None:
+        LOG.info(
+            "账户同步已启用: interval=%.0fs timeout=%.1fs address=%s",
+            config.portfolio_sync_interval_sec,
+            config.portfolio_sync_timeout_sec,
+            (portfolio_sync.source_address[:10] + "…") if portfolio_sync.source_address else "",
+        )
 
     ai_advisor: Optional[AIAdvisor] = None
     if config.ai_enabled:
@@ -1403,6 +1411,7 @@ def main(dotenv_path: str | None = None) -> None:
     cached_universe_events: list[Any] = []
     last_universe_refresh_ts = 0.0
     last_telemetry_heartbeat_ts = 0.0
+    last_portfolio_sync_ts = 0.0
 
     dash_state = DashboardState()
     dash_state.update(
@@ -1413,14 +1422,13 @@ def main(dotenv_path: str | None = None) -> None:
         start_dashboard_server(dash_state, port=config.dashboard_port)
         LOG.info("Dashboard 已启动: http://127.0.0.1:%d", config.dashboard_port)
 
-    notifier.send(
-        f"🤖 套利机器人已启动\n"
-        f"模式: {'DRY RUN' if config.dry_run else 'LIVE'}\n"
-        f"最小利润: ${config.min_edge_usd} / {config.min_edge_pct}%\n"
-        f"扫描间隔: {config.scan_interval_sec}s\n"
-        f"WebSocket: {'启用' if config.ws_enabled else '禁用'}",
-        category="startup",
-        force=True,
+    notifier.notify_startup(
+        mode="DRY RUN" if config.dry_run else "LIVE",
+        min_profit_usd=config.min_edge_usd,
+        min_profit_pct=config.min_edge_pct,
+        scan_interval_sec=config.scan_interval_sec,
+        ws_enabled=config.ws_enabled,
+        portfolio_sync_enabled=config.portfolio_sync_enabled,
     )
 
     cycle = 0
@@ -1614,7 +1622,10 @@ def main(dotenv_path: str | None = None) -> None:
             )
             if consecutive_api_errors >= 10:
                 LOG.error("连续 %d 次 API 错误，暂停 60 秒", consecutive_api_errors)
-                notifier.notify_error(f"连续 {consecutive_api_errors} 次 API 错误")
+                notifier.notify_fatal_error(
+                    f"连续 {consecutive_api_errors} 次 API 错误，主循环将暂停 60 秒",
+                    error_key="api_error_streak",
+                )
                 time.sleep(60)
             else:
                 time.sleep(config.scan_interval_sec)
@@ -1826,8 +1837,7 @@ def main(dotenv_path: str | None = None) -> None:
                 continue
 
             trades = executor.execute_arbitrage(verified, adj_size)
-            if not config.dry_run:
-                risk_mgr.record_execution(verified, trades)
+            risk_mgr.record_execution(verified, trades)
             live_execution_success = _is_live_execution_success(config, executor, verified, trades)
             trade_payload = _serialize_trade_execution(verified, trades, live_execution_success, adj_size)
             event_recorder.write_event("trades", trade_payload)
@@ -1853,19 +1863,26 @@ def main(dotenv_path: str | None = None) -> None:
                     _estimate_ai_trade_outcome(verified, trades, live_execution_success, adj_size)
                 )
             if live_execution_success and filled:
-                trade_msg = (
-                    f"✅ 套利已执行\n"
-                    f"事件: {opp.event_title}\n"
-                    f"类型: {opp.arb_type.value}\n"
-                    f"腿数: {len(filled)}/{len(opp.legs)}\n"
-                    f"预期净利: ${opp.net_edge * adj_size:.4f}"
+                notifier.notify_trade_success(
+                    event_title=opp.event_title,
+                    arb_type=opp.arb_type.value,
+                    filled_legs=len(filled),
+                    total_legs=len(opp.legs),
+                    expected_profit=opp.net_edge * adj_size,
+                    simulated=bool(trade_payload.get("simulated", False)),
                 )
-                notifier.notify_trade(trade_msg)
             elif trades and not config.dry_run:
-                notifier.notify_error(
-                    f"套利执行未完成，已进入失败处理\n"
-                    f"事件: {opp.event_title}\n"
-                    f"已成交腿数: {len(filled)}/{len(opp.legs)}"
+                failure_reasons = sorted({
+                    str(getattr(trade, "error", "")).strip()
+                    for trade in trades
+                    if str(getattr(trade, "error", "")).strip()
+                })
+                notifier.notify_trade_failure(
+                    event_title=opp.event_title,
+                    filled_legs=len(filled),
+                    total_legs=len(opp.legs),
+                    simulated=bool(trade_payload.get("simulated", False)),
+                    details="; ".join(failure_reasons[:2]),
                 )
         cycle_timing["execution_sec"] += time.perf_counter() - phase_start
 
@@ -1922,6 +1939,36 @@ def main(dotenv_path: str | None = None) -> None:
                 })
         cycle_timing["strategy_execution_sec"] = time.perf_counter() - phase_start
 
+        if (
+            portfolio_sync is not None
+            and (time.time() - last_portfolio_sync_ts) >= config.portfolio_sync_interval_sec
+        ):
+            try:
+                snapshot = portfolio_sync.refresh()
+                risk_mgr.sync_portfolio_snapshot(
+                    snapshot.positions,
+                    realized_daily_pnl=snapshot.realized_daily_pnl,
+                    synced_at=snapshot.synced_at,
+                )
+                last_portfolio_sync_ts = snapshot.synced_at
+                if event_recorder.is_enabled:
+                    event_recorder.write_event("risk_events", {
+                        "event": "portfolio_sync",
+                        "source_address": snapshot.source_address,
+                        "positions": len(snapshot.positions),
+                        "realized_daily_pnl": snapshot.realized_daily_pnl,
+                        "synced_at": snapshot.synced_at,
+                    })
+            except Exception as exc:
+                risk_mgr.mark_portfolio_sync_error(str(exc))
+                LOG.warning("账户同步失败: %s", exc)
+                if event_recorder.is_enabled:
+                    event_recorder.write_event("risk_events", {
+                        "event": "portfolio_sync_error",
+                        "error": str(exc),
+                        "ts": time.time(),
+                    })
+
         risk_s = risk_mgr.state
         vol_snap = vol_estimator.snapshot()
         ws_status = _build_ws_status(
@@ -1953,6 +2000,10 @@ def main(dotenv_path: str | None = None) -> None:
                 "total_exposure": risk_s.total_exposure,
                 "daily_pnl": risk_s.daily_pnl,
                 "consecutive_failures": risk_s.consecutive_failures,
+                "portfolio_sync_enabled": config.portfolio_sync_enabled,
+                "last_portfolio_sync_ts": risk_s.last_portfolio_sync_ts or None,
+                "portfolio_sync_ok": risk_s.portfolio_sync_ok,
+                "portfolio_sync_error": risk_s.portfolio_sync_error,
             },
             volatility=vol_snap,
             edge_decision=edge_decision.to_dict() if edge_decision else None,
@@ -1977,6 +2028,18 @@ def main(dotenv_path: str | None = None) -> None:
                 "items": [signal.to_dict() for signal in research_signals[: config.research_signal_max_items]],
             } if config.research_signal_enabled else {},
             backtest_last_report=_load_last_backtest_report(config.backtest_reports_dir),
+            current_positions=[
+                {
+                    "token_id": position.token_id,
+                    "condition_id": position.condition_id,
+                    "outcome": position.outcome,
+                    "size": position.size,
+                    "avg_price": position.avg_price,
+                    "current_value": position.current_value,
+                    "unrealized_pnl": position.unrealized_pnl,
+                }
+                for position in risk_s.positions
+            ],
         )
         dash_state.append_pnl_point({
             "timestamp": time.time(),
@@ -2008,6 +2071,26 @@ def main(dotenv_path: str | None = None) -> None:
             event_recorder.write_event("risk_events", cycle_summary_payload)
             last_telemetry_heartbeat_ts = now_ts
 
+        notifier.observe_cycle(
+            daily_pnl=risk_s.daily_pnl,
+            open_positions=risk_s.open_positions,
+            total_exposure=risk_s.total_exposure,
+            is_halted=risk_s.is_halted,
+            halt_reason=risk_s.halt_reason,
+            now_ts=now_ts,
+        )
+        if risk_s.is_halted and risk_s.halt_reason:
+            notifier.notify_fatal_error(
+                f"风控已熔断\n原因: {risk_s.halt_reason}",
+                error_key=f"risk_halt:{risk_s.halt_reason}",
+                now_ts=now_ts,
+            )
+        notifier.maybe_notify_pnl_alert(
+            daily_pnl=risk_s.daily_pnl,
+            now_ts=now_ts,
+        )
+        notifier.maybe_notify_daily_summary(now_ts=now_ts)
+
         elapsed = time.time() - cycle_start
         if cycle % 100 == 0:
             LOG.info(
@@ -2018,7 +2101,6 @@ def main(dotenv_path: str | None = None) -> None:
                 "连接" if ws_status.get("connected") else "未连接",
                 elapsed,
             )
-            notifier.notify_status(risk_mgr.format_status_zh())
 
         sleep_time = max(0, config.scan_interval_sec - elapsed)
         if sleep_time > 0 and not _SHUTDOWN_EVENT.is_set():
@@ -2044,7 +2126,13 @@ def main(dotenv_path: str | None = None) -> None:
     event_recorder.close()
     dash_state.update(is_running=False)
     LOG.info("机器人已停止: run_id=%s。总计: %d 周期, %d 机会, %d 执行", run_id, cycle, total_arbs_found, total_arbs_executed)
-    notifier.send("🛑 套利机器人已停止", category="shutdown", force=True)
+    notifier.notify_shutdown(
+        run_id=run_id,
+        cycle_count=cycle,
+        total_arbs_found=total_arbs_found,
+        total_arbs_executed=total_arbs_executed,
+        simulated_successes=total_simulated_executed,
+    )
 
 
 def _scan_cycle(

@@ -10,6 +10,7 @@ from polymarket_arb.models import (
     ArbType,
     MarketInfo,
     OrderSide,
+    PositionSnapshot,
     TokenInfo,
     TradeRecord,
     TradeStatus,
@@ -217,6 +218,39 @@ def test_record_settlement_books_realized_pnl():
     mgr.record_settlement("c1", 1.25)
 
     assert mgr.state.daily_pnl == 1.25
+
+
+def test_sync_portfolio_snapshot_overwrites_real_positions_and_realized_daily_pnl():
+    mgr = RiskManager(make_test_config())
+    positions = [
+        PositionSnapshot(
+            token_id="yes-token",
+            condition_id="c1",
+            outcome="Yes",
+            size=3,
+            avg_price=0.4,
+            current_value=1.5,
+            unrealized_pnl=0.3,
+        ),
+        PositionSnapshot(
+            token_id="no-token",
+            condition_id="c2",
+            outcome="No",
+            size=2,
+            avg_price=0.6,
+            current_value=1.1,
+            unrealized_pnl=-0.1,
+        ),
+    ]
+
+    mgr.sync_portfolio_snapshot(positions, realized_daily_pnl=2.25, synced_at=1234.0)
+
+    assert mgr.state.daily_pnl == 2.25
+    assert mgr.state.open_positions == 2
+    assert mgr.state.total_exposure == (3 * 0.4) + (2 * 0.6)
+    assert mgr.state.last_portfolio_sync_ts == 1234.0
+    assert mgr.state.portfolio_sync_ok is True
+    assert len(mgr.state.positions) == 2
 
 
 def test_partial_fill_with_pending_decays_failure_counter():

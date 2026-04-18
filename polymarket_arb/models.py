@@ -210,6 +210,9 @@ class RiskState:
     is_halted: bool = False
     halt_reason: str = ""
     positions: list[PositionSnapshot] = field(default_factory=list)
+    last_portfolio_sync_ts: float = 0.0
+    portfolio_sync_ok: bool = False
+    portfolio_sync_error: str = ""
 
     def check_can_trade(
         self,

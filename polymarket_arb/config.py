@@ -6,6 +6,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
@@ -94,6 +95,13 @@ class ArbConfig:
     risk_pending_reservation_ttl_sec: float
     risk_halt_auto_recover_sec: float
 
+    # 账户同步 / Data API
+    portfolio_sync_enabled: bool
+    portfolio_sync_interval_sec: float
+    portfolio_sync_timeout_sec: float
+    data_api_host: str
+    portfolio_sync_user_address: str
+
     # Telegram
     telegram_enabled: bool
     telegram_bot_token: str
@@ -102,6 +110,22 @@ class ArbConfig:
     notify_on_trade: bool
     notify_on_error: bool
     telegram_cooldown_sec: float
+
+    # 通知路由 / 飞书
+    notification_provider: str
+    feishu_webhook_url: str
+    feishu_sign_secret: str
+    notify_on_trade_success: bool
+    notify_on_trade_failure: bool
+    notify_on_fatal_error: bool
+    notify_on_pnl_alert: bool
+    notify_on_daily_summary: bool
+    pnl_profit_alert_usdc: float
+    pnl_loss_alert_usdc: float
+    fatal_error_cooldown_sec: float
+    daily_summary_time_hhmm: str
+    daily_summary_timezone: str
+    notification_state_file: str
 
     # 波动率
     vol_fast_minutes: int
@@ -230,6 +254,33 @@ class ArbConfig:
             raise ValueError("RISK_PENDING_RESERVATION_TTL_SEC 不能为负数")
         if self.risk_halt_auto_recover_sec < 0:
             raise ValueError("RISK_HALT_AUTO_RECOVER_SEC 不能为负数")
+        if self.portfolio_sync_enabled and self.portfolio_sync_interval_sec <= 0:
+            raise ValueError("PORTFOLIO_SYNC_INTERVAL_SEC 必须大于 0")
+        if self.portfolio_sync_enabled and self.portfolio_sync_timeout_sec <= 0:
+            raise ValueError("PORTFOLIO_SYNC_TIMEOUT_SEC 必须大于 0")
+        if self.portfolio_sync_enabled and not self.data_api_host:
+            raise ValueError("DATA_API_HOST 不能为空")
+        if self.notification_provider.lower() not in {"", "none", "telegram", "feishu", "auto"}:
+            raise ValueError("NOTIFICATION_PROVIDER 仅支持 none/telegram/feishu/auto")
+        if self.pnl_profit_alert_usdc < 0 or self.pnl_loss_alert_usdc < 0:
+            raise ValueError("PNL 告警阈值不能为负数")
+        if self.fatal_error_cooldown_sec < 0:
+            raise ValueError("FATAL_ERROR_COOLDOWN_SEC 不能为负数")
+        hhmm = self.daily_summary_time_hhmm.strip()
+        if hhmm:
+            try:
+                hour_text, minute_text = hhmm.split(":", 1)
+                hour = int(hour_text)
+                minute = int(minute_text)
+            except ValueError as exc:
+                raise ValueError("DAILY_SUMMARY_TIME_HHMM 必须是 HH:MM 格式") from exc
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError("DAILY_SUMMARY_TIME_HHMM 必须在 00:00-23:59 之间")
+        if self.daily_summary_timezone:
+            try:
+                ZoneInfo(self.daily_summary_timezone)
+            except Exception as exc:
+                raise ValueError(f"DAILY_SUMMARY_TIMEZONE 无效: {self.daily_summary_timezone}") from exc
         if self.data_cleanup_enabled and self.data_cleanup_interval_sec <= 0:
             raise ValueError("DATA_CLEANUP_INTERVAL_SEC 必须大于 0")
         if min(
@@ -327,13 +378,32 @@ class ArbConfig:
             risk_event_cooldown_sec=_env_float("RISK_EVENT_COOLDOWN_SEC", 60.0),
             risk_pending_reservation_ttl_sec=_env_float("RISK_PENDING_RESERVATION_TTL_SEC", 30.0),
             risk_halt_auto_recover_sec=_env_float("RISK_HALT_AUTO_RECOVER_SEC", 3600.0),
+            portfolio_sync_enabled=_env_bool("PORTFOLIO_SYNC_ENABLED", False),
+            portfolio_sync_interval_sec=_env_float("PORTFOLIO_SYNC_INTERVAL_SEC", 60.0),
+            portfolio_sync_timeout_sec=_env_float("PORTFOLIO_SYNC_TIMEOUT_SEC", 5.0),
+            data_api_host=_env("DATA_API_HOST", "https://data-api.polymarket.com"),
+            portfolio_sync_user_address=_env("PORTFOLIO_SYNC_USER_ADDRESS"),
             telegram_enabled=_env_bool("TELEGRAM_ENABLED", False),
             telegram_bot_token=_env("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=_env("TELEGRAM_CHAT_ID"),
-            notify_on_arb_found=_env_bool("TELEGRAM_NOTIFY_ON_ARB_FOUND", True),
+            notify_on_arb_found=_env_bool("TELEGRAM_NOTIFY_ON_ARB_FOUND", False),
             notify_on_trade=_env_bool("TELEGRAM_NOTIFY_ON_TRADE", True),
             notify_on_error=_env_bool("TELEGRAM_NOTIFY_ON_ERROR", True),
             telegram_cooldown_sec=_env_float("TELEGRAM_NOTIFY_COOLDOWN_SEC", 30.0),
+            notification_provider=_env("NOTIFICATION_PROVIDER", "auto"),
+            feishu_webhook_url=_env("FEISHU_WEBHOOK_URL"),
+            feishu_sign_secret=_env("FEISHU_SIGN_SECRET"),
+            notify_on_trade_success=_env_bool("NOTIFY_ON_TRADE_SUCCESS", _env_bool("TELEGRAM_NOTIFY_ON_TRADE", True)),
+            notify_on_trade_failure=_env_bool("NOTIFY_ON_TRADE_FAILURE", _env_bool("TELEGRAM_NOTIFY_ON_ERROR", True)),
+            notify_on_fatal_error=_env_bool("NOTIFY_ON_FATAL_ERROR", _env_bool("TELEGRAM_NOTIFY_ON_ERROR", True)),
+            notify_on_pnl_alert=_env_bool("NOTIFY_ON_PNL_ALERT", True),
+            notify_on_daily_summary=_env_bool("NOTIFY_ON_DAILY_SUMMARY", True),
+            pnl_profit_alert_usdc=_env_float("PNL_PROFIT_ALERT_USDC", 20.0),
+            pnl_loss_alert_usdc=_env_float("PNL_LOSS_ALERT_USDC", 10.0),
+            fatal_error_cooldown_sec=_env_float("FATAL_ERROR_COOLDOWN_SEC", 300.0),
+            daily_summary_time_hhmm=_env("DAILY_SUMMARY_TIME_HHMM", "08:05"),
+            daily_summary_timezone=_env("DAILY_SUMMARY_TIMEZONE", "Asia/Shanghai"),
+            notification_state_file=_env("NOTIFICATION_STATE_FILE", "data/telemetry/notification_state.json"),
             vol_fast_minutes=_env_int("VOL_FAST_MINUTES", 60),
             vol_slow_minutes=_env_int("VOL_SLOW_MINUTES", 360),
             vol_min_bars=_env_int("VOL_MIN_BARS", 20),
@@ -419,7 +489,7 @@ class ArbConfig:
         d = {}
         for k, v in self.__dict__.items():
             key_lower = k.lower()
-            if "key" in key_lower or "token" in key_lower or "secret" in key_lower:
+            if "key" in key_lower or "token" in key_lower or "secret" in key_lower or "webhook" in key_lower:
                 d[k] = "***"
             elif k == "funder_address" and isinstance(v, str) and v:
                 d[k] = _mask_sensitive_value(v)

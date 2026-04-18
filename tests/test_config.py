@@ -39,7 +39,7 @@ def test_from_env_loads_new_edge_and_cooldown_config(tmp_path, monkeypatch):
     env_path = write_test_env(tmp_path)
     env_path.write_text(
         env_path.read_text(encoding="utf-8")
-        + "\nEDGE_CONFIDENCE_FULL_BPS=650\nEDGE_CONFIDENCE_IMBALANCE_WEIGHT=0.2\nORDERBOOK_MISSING_COOLDOWN_SEC=120\nORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC=15\nT2_MIN_DEVIATION=0.015\nT2_MAX_SPREAD_BPS=90\nT2_MIN_TOP_DEPTH=150\nT2_MAX_COMPLEMENT_ERROR_BPS=120\nCROSS_PLATFORM_PAIRS_JSON=[]\nRISK_PENDING_RESERVATION_TTL_SEC=300\n",
+        + "\nEDGE_CONFIDENCE_FULL_BPS=650\nEDGE_CONFIDENCE_IMBALANCE_WEIGHT=0.2\nORDERBOOK_MISSING_COOLDOWN_SEC=120\nORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC=15\nT2_MIN_DEVIATION=0.015\nT2_MAX_SPREAD_BPS=90\nT2_MIN_TOP_DEPTH=150\nT2_MAX_COMPLEMENT_ERROR_BPS=120\nCROSS_PLATFORM_PAIRS_JSON=[]\nRISK_PENDING_RESERVATION_TTL_SEC=300\nPORTFOLIO_SYNC_ENABLED=true\nPORTFOLIO_SYNC_INTERVAL_SEC=45\nPORTFOLIO_SYNC_TIMEOUT_SEC=4\nDATA_API_HOST=https://data-api.polymarket.com\nPORTFOLIO_SYNC_USER_ADDRESS=0xabc\n",
         encoding="utf-8",
     )
     for key in (
@@ -53,6 +53,11 @@ def test_from_env_loads_new_edge_and_cooldown_config(tmp_path, monkeypatch):
         "T2_MAX_COMPLEMENT_ERROR_BPS",
         "CROSS_PLATFORM_PAIRS_JSON",
         "RISK_PENDING_RESERVATION_TTL_SEC",
+        "PORTFOLIO_SYNC_ENABLED",
+        "PORTFOLIO_SYNC_INTERVAL_SEC",
+        "PORTFOLIO_SYNC_TIMEOUT_SEC",
+        "DATA_API_HOST",
+        "PORTFOLIO_SYNC_USER_ADDRESS",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -67,6 +72,11 @@ def test_from_env_loads_new_edge_and_cooldown_config(tmp_path, monkeypatch):
     assert cfg.t2_max_complement_error_bps == 120.0
     assert cfg.cross_platform_pairs_json == "[]"
     assert cfg.risk_pending_reservation_ttl_sec == 300.0
+    assert cfg.portfolio_sync_enabled is True
+    assert cfg.portfolio_sync_interval_sec == 45.0
+    assert cfg.portfolio_sync_timeout_sec == 4.0
+    assert cfg.data_api_host == "https://data-api.polymarket.com"
+    assert cfg.portfolio_sync_user_address == "0xabc"
     assert cfg.edge_confidence_full_bps == 650.0
     assert cfg.edge_confidence_imbalance_weight == 0.2
     assert cfg.telemetry_record_enabled is False
