@@ -34,7 +34,7 @@ class RiskManager:
         self._state = RiskState()
         self._market_exposure: dict[str, float] = {}  # condition_id -> 敞口
         self._recent_arb_markets: dict[str, float] = {}  # event_id -> 最后执行时间
-        self._pending_reservations: dict[str, tuple[str, float, float]] = {}
+        self._pending_reservations: dict[str, tuple[str, float, float, bool]] = {}
         self._daily_reset_ts: float = _start_of_day()
         self._effective_max_total_exposure = config.max_total_exposure
         self._effective_max_daily_loss = config.max_daily_loss
@@ -195,9 +195,10 @@ class RiskManager:
                 cid,
                 exposure,
                 time.time(),
+                not bool(getattr(t, "post_only", False)),
             )
 
-        self._state.open_positions = sum(1 for exposure in self._market_exposure.values() if exposure > 0)
+        self._state.open_positions = self._compute_open_positions()
 
         if event_should_cooldown:
             self._recent_arb_markets[opp.event_id] = time.time()
@@ -223,7 +224,7 @@ class RiskManager:
             for key, value in self._pending_reservations.items()
             if value[0] != condition_id
         }
-        self._state.open_positions = sum(1 for exp in self._market_exposure.values() if exp > 0)
+        self._state.open_positions = self._compute_open_positions()
 
     def reconcile_pending_order_statuses(self, trades: list[TradeRecord]) -> None:
         """根据订单状态同步结果修正 pending 预留敞口.
@@ -245,12 +246,13 @@ class RiskManager:
             if reservation is None:
                 continue
 
-            condition_id, reserved_exposure, _ = reservation
+            condition_id, reserved_exposure, _, consumes_slot = reservation
             if trade.status in (TradeStatus.PENDING, TradeStatus.PARTIAL):
                 self._pending_reservations[reservation_key] = (
                     condition_id,
                     reserved_exposure,
                     now,
+                    consumes_slot or trade.status == TradeStatus.PARTIAL,
                 )
                 continue
 
@@ -283,7 +285,7 @@ class RiskManager:
             )
 
         if updated:
-            self._state.open_positions = sum(1 for exp in self._market_exposure.values() if exp > 0)
+            self._state.open_positions = self._compute_open_positions()
 
     def sync_portfolio_snapshot(
         self,
@@ -323,11 +325,11 @@ class RiskManager:
         self._state.portfolio_sync_error = ""
 
         merged_exposure = dict(actual_market_exposure)
-        for condition_id, exposure, _ in self._pending_reservations.values():
+        for condition_id, exposure, _, _ in self._pending_reservations.values():
             merged_exposure[condition_id] = merged_exposure.get(condition_id, 0.0) + exposure
         self._market_exposure = merged_exposure
         self._state.total_exposure = sum(merged_exposure.values())
-        self._state.open_positions = sum(1 for exposure in merged_exposure.values() if exposure > 0)
+        self._state.open_positions = self._compute_open_positions()
 
     def mark_portfolio_sync_error(self, message: str, *, synced_at: float | None = None) -> None:
         self._state.portfolio_sync_ok = False
@@ -387,11 +389,11 @@ class RiskManager:
     def _reconcile_pending_reservations(self) -> None:
         now = time.time()
         expired_keys = [
-            key for key, (_, _, created_ts) in self._pending_reservations.items()
+            key for key, (_, _, created_ts, _) in self._pending_reservations.items()
             if now - created_ts >= self._pending_reservation_ttl_sec
         ]
         for key in expired_keys:
-            condition_id, exposure, _ = self._pending_reservations.pop(key)
+            condition_id, exposure, _, _ = self._pending_reservations.pop(key)
             current = self._market_exposure.get(condition_id, 0.0)
             remaining = max(0.0, current - exposure)
             if remaining > 0:
@@ -401,7 +403,21 @@ class RiskManager:
             self._state.total_exposure = max(0.0, self._state.total_exposure - exposure)
             LOG.info("释放过期预留敞口: key=%s, market=%s, exposure=$%.4f", key[:16], condition_id[:12], exposure)
 
-        self._state.open_positions = sum(1 for exp in self._market_exposure.values() if exp > 0)
+        self._state.open_positions = self._compute_open_positions()
+
+    def _compute_open_positions(self) -> int:
+        slotless_pending_by_market: dict[str, float] = {}
+        for condition_id, exposure, _, consumes_slot in self._pending_reservations.values():
+            if consumes_slot:
+                continue
+            slotless_pending_by_market[condition_id] = slotless_pending_by_market.get(condition_id, 0.0) + exposure
+
+        count = 0
+        for condition_id, exposure in self._market_exposure.items():
+            effective_exposure = float(exposure) - float(slotless_pending_by_market.get(condition_id, 0.0))
+            if effective_exposure > 1e-9:
+                count += 1
+        return count
 
     def format_status_zh(self) -> str:
         """格式化风控状态为中文文本."""

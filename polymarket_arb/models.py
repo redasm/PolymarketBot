@@ -184,6 +184,8 @@ class TradeRecord:
     economic_cost: Optional[float] = None
     rolled_back: bool = False
     simulated: bool = False
+    post_only: bool = False
+    order_type_name: Optional[str] = None
 
 
 @dataclass

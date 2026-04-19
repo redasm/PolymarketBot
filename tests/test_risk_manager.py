@@ -302,6 +302,57 @@ def test_pending_reservation_ttl_uses_configured_duration(monkeypatch):
     assert state.total_exposure == 0.45 * 5
 
 
+def test_post_only_pending_order_does_not_consume_open_position_slot():
+    mgr = RiskManager(make_test_config())
+    opp = _make_opp()
+    trade = TradeRecord(
+        "t1",
+        "a1",
+        "yes",
+        "c1",
+        OrderSide.BUY,
+        0.45,
+        5,
+        status=TradeStatus.PENDING,
+        economic_cost=0.45,
+        post_only=True,
+        order_type_name="GTC",
+    )
+
+    mgr.record_execution(opp, [trade], count_pending_as_failure=False)
+
+    assert mgr.state.total_exposure == 0.45 * 5
+    assert mgr.state.open_positions == 0
+
+
+def test_post_only_partial_order_starts_consuming_open_position_slot():
+    mgr = RiskManager(make_test_config())
+    opp = _make_opp()
+    trade = TradeRecord(
+        "t1",
+        "a1",
+        "yes",
+        "c1",
+        OrderSide.BUY,
+        0.45,
+        5,
+        status=TradeStatus.PENDING,
+        order_id="oid-1",
+        economic_cost=0.45,
+        post_only=True,
+        order_type_name="GTC",
+    )
+
+    mgr.record_execution(opp, [trade], count_pending_as_failure=False)
+    assert mgr.state.open_positions == 0
+
+    trade.status = TradeStatus.PARTIAL
+    trade.fill_size = 2.0
+    mgr.reconcile_pending_order_statuses([trade])
+
+    assert mgr.state.open_positions == 1
+
+
 def test_reconcile_pending_order_statuses_releases_cancelled_order():
     mgr = RiskManager(make_test_config())
     opp = _make_opp()

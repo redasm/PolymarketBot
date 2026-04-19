@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -73,6 +74,8 @@ class OrderSyncResult:
 class ExecutionEngine:
     """套利交易执行引擎."""
 
+    _BALANCE_CACHE_TTL_SEC = 5.0
+
     def __init__(self, config: ArbConfig, trading_client: Any):
         self._config = config
         self._client = trading_client
@@ -81,6 +84,8 @@ class ExecutionEngine:
         self._max_history = 2000
         self._execution_order_type = self._resolve_execution_order_type()
         self._gtc_order_type = self._resolve_named_order_type("GTC")
+        self._balance_cache: float | None = None
+        self._balance_cache_ts: float = 0.0
 
     @property
     def trade_history(self) -> list[TradeRecord]:
@@ -200,6 +205,7 @@ class ExecutionEngine:
         resp = self._client.post_order(
             signed_order, orderType=execution_type, post_only=post_only
         )
+        self.invalidate_balance_cache()
 
         order_id = ""
         success = False
@@ -298,6 +304,8 @@ class ExecutionEngine:
             price=float(price),
             size=float(size),
             economic_cost=float(price),
+            post_only=post_only,
+            order_type_name=order_type_name,
         )
 
         if size <= 0 or price <= 0:
@@ -355,8 +363,27 @@ class ExecutionEngine:
             return False, f"insufficient_balance available={available:.4f} required={required_notional:.4f}", available
         return True, "", available
 
-    def get_available_collateral_balance(self) -> float | None:
-        """读取可用 USDC 余额（余额与 allowance 的较小值）."""
+    def get_available_collateral_balance(self, *, use_cache: bool = True) -> float | None:
+        """读取可用 USDC 余额（余额与 allowance 的较小值）.
+
+        实盘模式下每次 pre-trade 都会调用；为避免在余额不足时每条信号都打一次 API，
+        默认走短 TTL 缓存。真实下单前或余额可能变化时调用 `invalidate_balance_cache()`。
+        """
+        if use_cache and self._balance_cache is not None:
+            if time.time() - self._balance_cache_ts < self._BALANCE_CACHE_TTL_SEC:
+                return self._balance_cache
+
+        value = self._fetch_collateral_balance_uncached()
+        self._balance_cache = value
+        self._balance_cache_ts = time.time()
+        return value
+
+    def invalidate_balance_cache(self) -> None:
+        """在下单/成交/充值等可能改变余额的动作后调用."""
+        self._balance_cache = None
+        self._balance_cache_ts = 0.0
+
+    def _fetch_collateral_balance_uncached(self) -> float | None:
         try:
             from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
         except Exception:
@@ -447,6 +474,54 @@ class ExecutionEngine:
                 )
 
         return OrderSyncResult(polled=polled, changed=changed)
+
+    def cancel_stale_maker_orders(self, max_age_sec: float) -> list[TradeRecord]:
+        """撤销超过 TTL 仍未成交的 live 挂单 (T3 做市 GTC / post_only 订单)。
+
+        返回本轮成功撤单的 TradeRecord 列表，调用方应把它传给
+        risk_manager.reconcile_pending_order_statuses 以释放预留敞口。
+        """
+        if self._config.dry_run or max_age_sec <= 0:
+            return []
+        if not hasattr(self._client, "cancel"):
+            return []
+
+        now = time.time()
+        cancelled: list[TradeRecord] = []
+        for trade in self._trade_history:
+            if trade.simulated or not trade.order_id:
+                continue
+            if trade.status not in (TradeStatus.PENDING, TradeStatus.PARTIAL):
+                continue
+            if (now - trade.timestamp) <= max_age_sec:
+                continue
+            if not bool(getattr(trade, "post_only", False)):
+                continue
+            if str(getattr(trade, "order_type_name", "") or "").upper() != "GTC":
+                continue
+
+            try:
+                self._client.cancel(trade.order_id)
+            except Exception as exc:  # pragma: no cover - depends on client transport
+                LOG.warning(
+                    "撤销过期挂单失败 order=%s age=%.1fs: %s",
+                    trade.order_id[:16],
+                    now - trade.timestamp,
+                    exc,
+                )
+                continue
+
+            trade.status = TradeStatus.CANCELLED
+            trade.error = trade.error or "maker_order_ttl_expired"
+            cancelled.append(trade)
+            LOG.info(
+                "撤销过期挂单: order=%s trade=%s market=%s age=%.1fs",
+                trade.order_id[:16],
+                trade.trade_id,
+                trade.condition_id[:12],
+                now - trade.timestamp,
+            )
+        return cancelled
 
     def get_pnl_summary(self, *, include_simulated: bool = False) -> dict:
         """计算已执行交易的盈亏摘要."""

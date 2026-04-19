@@ -138,7 +138,7 @@ class OrderBookAnalyzer:
                     )
                     return None
                 if attempt < self._retry_count:
-                    LOG.warning(
+                    LOG.debug(
                         "[cid=%s] get_order_book 失败，准备重试 (%d/%d) token=%s…: %s",
                         correlation_id,
                         attempt + 1,
@@ -150,7 +150,13 @@ class OrderBookAnalyzer:
                         time.sleep(self._retry_delay_sec)
                     continue
                 self._record_stat("rest_error")
-                LOG.error("[cid=%s] get_order_book 失败 token=%s…: %s", correlation_id, token_id[:20], e)
+                LOG.error(
+                    "[cid=%s] get_order_book 失败 token=%s… 重试 %d 次全部失败: %s",
+                    correlation_id,
+                    token_id[:20],
+                    self._retry_count + 1,
+                    e,
+                )
                 return None
 
         if book is None:

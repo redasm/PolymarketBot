@@ -107,6 +107,17 @@ _DEADLINE_RE = re.compile(
 )
 
 
+@dataclass
+class ExecutionDelta:
+    theoretical_opportunities: int = 0
+    live_successes: int = 0
+    simulated_successes: int = 0
+    live_submissions: int = 0
+    simulated_submissions: int = 0
+    live_profit_total: float = 0.0
+    simulated_profit_total: float = 0.0
+
+
 def _signal_handler(sig: int, frame: Any) -> None:
     LOG.info("收到信号 %d，准备优雅退出…", sig)
     _SHUTDOWN_EVENT.set()
@@ -581,13 +592,28 @@ def _collect_maker_strategy_signals(
         if quote is None or (quote.bid_price is None and quote.ask_price is None):
             continue
 
+        bid_edge = (
+            max(0.0, float(fair_value) - float(quote.bid_price))
+            if quote.bid_price is not None
+            else 0.0
+        )
+        ask_edge = (
+            max(0.0, float(quote.ask_price) - float(fair_value))
+            if quote.ask_price is not None
+            else 0.0
+        )
+        active_sides = (1 if quote.bid_price is not None else 0) + (
+            1 if quote.ask_price is not None else 0
+        )
+        per_fill_edge = (bid_edge + ask_edge) / active_sides if active_sides > 0 else 0.0
+
         signals.append(
             StrategySignal(
                 tier=StrategyTier.MARKET_MAKING,
                 signal_type="maker_quote",
                 market_id=market.condition_id,
                 description=f"{market.question[:80]} | maker fair={fair_value:.4f} spread={quote.spread:.4f}",
-                expected_edge=max(0.0, quote.spread) * 10_000.0,
+                expected_edge=per_fill_edge * 10_000.0,
                 confidence=0.5,
                 recommended_size_usdc=max(quote.bid_size, quote.ask_size),
                 urgency=0.2,
@@ -599,6 +625,8 @@ def _collect_maker_strategy_signals(
                         "ask_size": quote.ask_size,
                         "spread": quote.spread,
                         "fair_value": quote.fair_value,
+                        "bid_edge": bid_edge,
+                        "ask_edge": ask_edge,
                     }
                 },
             )
@@ -733,11 +761,11 @@ def _execute_strategy_signal(
     event_recorder: EventRecorder,
     maker_strategy: MakerStrategy,
     notifier: NotificationManager,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, ExecutionDelta]:
     market = _find_market_for_signal(signal.market_id, active_markets)
     if signal.tier == StrategyTier.CROSS_PLATFORM:
         if not config.dry_run:
-            return False, "cross_platform_live_requires_external_executor"
+            return False, "cross_platform_live_requires_external_executor", ExecutionDelta()
         pair_cost = max(float(signal.payload.get("total_cost", 0.0) or 0.0), 1e-9)
         bundle_size = max(0.0, float(signal.recommended_size_usdc)) / pair_cost
         trades = [
@@ -778,11 +806,11 @@ def _execute_strategy_signal(
                 "status": "simulated",
                 "trade_count": len(trades),
             })
-        return True, ""
+        return True, "", ExecutionDelta(simulated_successes=1)
 
     if signal.tier == StrategyTier.STATISTICAL_ARB:
         if market is None:
-            return False, "market_not_found"
+            return False, "market_not_found", ExecutionDelta()
         opportunity, target_size, build_reason = _build_directional_opportunity_from_signal(
             config=config,
             signal=signal,
@@ -790,13 +818,13 @@ def _execute_strategy_signal(
             ob_analyzer=ob_analyzer,
         )
         if opportunity is None:
-            return False, build_reason
+            return False, build_reason, ExecutionDelta()
         can_trade, reason, adj_size = risk_mgr.pre_trade_check(opportunity, target_size)
         if not can_trade:
-            return False, reason
+            return False, reason, ExecutionDelta()
         balance_ok, balance_reason, _ = executor.ensure_sufficient_collateral(opportunity.total_cost * adj_size)
         if not balance_ok:
-            return False, balance_reason
+            return False, balance_reason, ExecutionDelta()
         trades = executor.execute_arbitrage(opportunity, adj_size)
         execution_success = executor.is_successful_execution(opportunity, trades)
         # 无论 dry_run 与否都记录到 risk_mgr，保证持仓/敞口/冷却期追踪生效；
@@ -852,18 +880,26 @@ def _execute_strategy_signal(
                 simulated=simulated_exec,
                 details="; ".join(failure_reasons[:2]),
             )
-        return True, ""
+        delta = ExecutionDelta()
+        if execution_success:
+            if simulated_exec:
+                delta.simulated_successes = 1
+                delta.simulated_profit_total = opportunity.net_edge * adj_size
+            else:
+                delta.live_successes = 1
+                delta.live_profit_total = opportunity.net_edge * adj_size
+        return True, "", delta
 
     if signal.tier == StrategyTier.MARKET_MAKING:
         if market is None:
-            return False, "market_not_found"
+            return False, "market_not_found", ExecutionDelta()
         if len(market.tokens) < 2:
-            return False, "non_binary_market"
+            return False, "non_binary_market", ExecutionDelta()
         quote = signal.payload.get("quote", {}) if isinstance(signal.payload.get("quote", {}), dict) else {}
         bid_price = float(quote.get("bid_price") or 0.0)
         bid_size = float(quote.get("bid_size") or 0.0)
         if bid_price <= 0 or bid_size <= 0:
-            return False, "maker_bid_missing"
+            return False, "maker_bid_missing", ExecutionDelta()
         yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
         maker_opp = ArbOpportunity(
             arb_type=ArbType.MARKET_MAKING,
@@ -893,10 +929,10 @@ def _execute_strategy_signal(
         )
         can_trade, reason, adj_size = risk_mgr.pre_trade_check(maker_opp, bid_size)
         if not can_trade:
-            return False, reason
+            return False, reason, ExecutionDelta()
         balance_ok, balance_reason, _ = executor.ensure_sufficient_collateral(bid_price * adj_size)
         if not balance_ok:
-            return False, balance_reason
+            return False, balance_reason, ExecutionDelta()
         trade = executor.submit_limit_order(
             token_id=yes_token.token_id,
             condition_id=market.condition_id,
@@ -960,9 +996,24 @@ def _execute_strategy_signal(
                 simulated=simulated_maker,
                 details=str(getattr(trade, "error", "") or "").strip(),
             )
-        return submission_success, ""
+        delta = ExecutionDelta()
+        if submission_success:
+            if trade.status == TradeStatus.FILLED:
+                filled_size = float(trade.fill_size or adj_size)
+                if simulated_maker:
+                    delta.simulated_successes = 1
+                    delta.simulated_profit_total = spread_usdc * filled_size
+                else:
+                    delta.live_successes = 1
+                    delta.live_profit_total = spread_usdc * filled_size
+            else:
+                if simulated_maker:
+                    delta.simulated_submissions = 1
+                else:
+                    delta.live_submissions = 1
+        return submission_success, "", delta
 
-    return False, "unsupported_strategy_tier"
+    return False, "unsupported_strategy_tier", ExecutionDelta()
 
 
 def _market_priority_score(market: MarketInfo) -> tuple[float, float, float]:
@@ -1068,8 +1119,11 @@ def _build_cycle_summary_payload(
     markets_scanned: int,
     universe_market_count: int,
     selected_event_count: int,
-    arbs_found_total: int,
-    arbs_executed_total: int,
+    theoretical_opportunities_total: int,
+    live_successes_total: int,
+    simulated_successes_total: int,
+    live_submissions_total: int,
+    simulated_submissions_total: int,
     ws_status: dict[str, Any],
     research_count: int,
     daily_pnl: float,
@@ -1087,8 +1141,13 @@ def _build_cycle_summary_payload(
         "markets_scanned": markets_scanned,
         "universe_market_count": universe_market_count,
         "selected_event_count": selected_event_count,
-        "arbs_found_total": arbs_found_total,
-        "arbs_executed_total": arbs_executed_total,
+        "arbs_found_total": theoretical_opportunities_total,
+        "arbs_executed_total": live_successes_total,
+        "theoretical_opportunities_total": theoretical_opportunities_total,
+        "live_successes_total": live_successes_total,
+        "simulated_successes_total": simulated_successes_total,
+        "live_submissions_total": live_submissions_total,
+        "simulated_submissions_total": simulated_submissions_total,
         "ws_connected": ws_status.get("connected", False),
         "ws_tokens": ws_status.get("subscribed_tokens", 0),
         "research_count": research_count,
@@ -1126,8 +1185,11 @@ def _emit_cycle_metrics(
     markets_scanned: int,
     universe_market_count: int,
     selected_event_count: int,
-    arbs_found_total: int,
-    arbs_executed_total: int,
+    theoretical_opportunities_total: int,
+    live_successes_total: int,
+    simulated_successes_total: int,
+    live_submissions_total: int,
+    simulated_submissions_total: int,
     ws_status: dict[str, Any],
     research_count: int,
     daily_pnl: float,
@@ -1144,8 +1206,11 @@ def _emit_cycle_metrics(
         markets_scanned=markets_scanned,
         universe_market_count=universe_market_count,
         selected_event_count=selected_event_count,
-        arbs_found_total=arbs_found_total,
-        arbs_executed_total=arbs_executed_total,
+        theoretical_opportunities_total=theoretical_opportunities_total,
+        live_successes_total=live_successes_total,
+        simulated_successes_total=simulated_successes_total,
+        live_submissions_total=live_submissions_total,
+        simulated_submissions_total=simulated_submissions_total,
         ws_status=ws_status,
         research_count=research_count,
         daily_pnl=daily_pnl,
@@ -1481,9 +1546,11 @@ def main(dotenv_path: str | None = None) -> None:
     )
 
     cycle = 0
-    total_arbs_found = 0
-    total_arbs_executed = 0
-    total_simulated_executed = 0
+    total_theoretical_opportunities = 0
+    total_live_successes = 0
+    total_simulated_successes = 0
+    total_live_submissions = 0
+    total_simulated_submissions = 0
     total_live_expected_profit = 0.0
     total_simulated_expected_profit = 0.0
     consecutive_api_errors = 0
@@ -1604,7 +1671,7 @@ def main(dotenv_path: str | None = None) -> None:
                 universe_refreshed=universe_refreshed,
                 progress_cb=lambda **kwargs: dash_state.update(
                     markets_scanned=kwargs.get("scanned_markets", 0),
-                    arbs_found=total_arbs_found + kwargs.get("opportunities_found", 0),
+                    arbs_found=total_theoretical_opportunities + kwargs.get("opportunities_found", 0),
                     ws_status=_build_ws_status(
                         config=config,
                         enhanced_store=enhanced_store,
@@ -1655,8 +1722,11 @@ def main(dotenv_path: str | None = None) -> None:
                 markets_scanned=len(scanned_markets),
                 universe_market_count=len(cached_universe_markets),
                 selected_event_count=len(event_candidates),
-                arbs_found_total=total_arbs_found,
-                arbs_executed_total=total_arbs_executed,
+                theoretical_opportunities_total=total_theoretical_opportunities,
+                live_successes_total=total_live_successes,
+                simulated_successes_total=total_simulated_successes,
+                live_submissions_total=total_live_submissions,
+                simulated_submissions_total=total_simulated_submissions,
                 ws_status=_build_ws_status(
                     config=config,
                     enhanced_store=enhanced_store,
@@ -1693,7 +1763,7 @@ def main(dotenv_path: str | None = None) -> None:
                 last_vol_feed_ts = now
 
         if opportunities:
-            total_arbs_found += len(opportunities)
+            total_theoretical_opportunities += len(opportunities)
             LOG.info(
                 "周期 #%d: 发现 %d 个套利机会",
                 cycle,
@@ -1892,10 +1962,10 @@ def main(dotenv_path: str | None = None) -> None:
             event_recorder.write_event("trades", trade_payload)
             dashboard_execution_success = bool(trade_payload.get("arb_success", False))
             if live_execution_success:
-                total_arbs_executed += 1
+                total_live_successes += 1
                 total_live_expected_profit += float(trade_payload.get("trade_outcome_estimate") or 0.0)
             elif bool(trade_payload.get("simulated", False)) and dashboard_execution_success:
-                total_simulated_executed += 1
+                total_simulated_successes += 1
                 total_simulated_expected_profit += float(trade_payload.get("trade_outcome_estimate") or 0.0)
 
             for trade_row in _build_dashboard_trade_rows(
@@ -1962,8 +2032,10 @@ def main(dotenv_path: str | None = None) -> None:
         execution_markets = scanned_markets + [
             m for m in active_markets_for_overlay if m.condition_id not in _scanned_ids
         ]
+        insufficient_balance_skips: dict[str, int] = {}
+        insufficient_balance_last_reason: str = ""
         for processed_signal in orchestrator.process_signals():
-            executed, reason = _execute_strategy_signal(
+            executed, reason, delta = _execute_strategy_signal(
                 signal=processed_signal,
                 config=config,
                 active_markets=execution_markets,
@@ -1976,9 +2048,20 @@ def main(dotenv_path: str | None = None) -> None:
                 maker_strategy=maker_strategy,
                 notifier=notifier,
             )
+            total_live_successes += delta.live_successes
+            total_simulated_successes += delta.simulated_successes
+            total_live_submissions += delta.live_submissions
+            total_simulated_submissions += delta.simulated_submissions
+            total_live_expected_profit += delta.live_profit_total
+            total_simulated_expected_profit += delta.simulated_profit_total
             if executed:
                 continue
             orchestrator.record_processed(processed_signal)
+            if reason.startswith("insufficient_balance"):
+                key = processed_signal.tier.name
+                insufficient_balance_skips[key] = insufficient_balance_skips.get(key, 0) + 1
+                insufficient_balance_last_reason = reason
+                continue
             if event_recorder.is_enabled:
                 event_recorder.write_event("strategy_executions", {
                     "tier": processed_signal.tier.name,
@@ -1987,6 +2070,16 @@ def main(dotenv_path: str | None = None) -> None:
                     "status": "skipped",
                     "reason": reason,
                 })
+        if insufficient_balance_skips and event_recorder.is_enabled:
+            event_recorder.write_event("strategy_executions", {
+                "tier": "AGGREGATE",
+                "signal_type": "insufficient_balance_skipped",
+                "market_id": "",
+                "status": "skipped",
+                "reason": insufficient_balance_last_reason,
+                "count_by_tier": insufficient_balance_skips,
+                "total": sum(insufficient_balance_skips.values()),
+            })
         cycle_timing["strategy_execution_sec"] = time.perf_counter() - phase_start
 
         if not config.dry_run:
@@ -2015,6 +2108,33 @@ def main(dotenv_path: str | None = None) -> None:
                         "error": str(exc),
                         "ts": time.time(),
                     })
+
+            if config.maker_stale_order_ttl_sec > 0:
+                try:
+                    cancelled_stale = executor.cancel_stale_maker_orders(
+                        config.maker_stale_order_ttl_sec
+                    )
+                    if cancelled_stale:
+                        risk_mgr.reconcile_pending_order_statuses(cancelled_stale)
+                        if event_recorder.is_enabled:
+                            for trade in cancelled_stale:
+                                event_recorder.write_event("risk_events", {
+                                    "event": "maker_order_cancelled",
+                                    "reason": "stale_ttl",
+                                    "order_id": trade.order_id,
+                                    "trade_id": trade.trade_id,
+                                    "condition_id": trade.condition_id,
+                                    "age_sec": time.time() - trade.timestamp,
+                                    "ts": time.time(),
+                                })
+                except Exception as exc:
+                    LOG.warning("撤销过期挂单失败: %s", exc)
+                    if event_recorder.is_enabled:
+                        event_recorder.write_event("risk_events", {
+                            "event": "maker_order_cancel_error",
+                            "error": str(exc),
+                            "ts": time.time(),
+                        })
 
         if (
             portfolio_sync is not None
@@ -2056,8 +2176,8 @@ def main(dotenv_path: str | None = None) -> None:
         )
         dash_state.update(
             cycle_count=cycle,
-            arbs_found=total_arbs_found,
-            arbs_executed=total_arbs_executed,
+            arbs_found=total_theoretical_opportunities,
+            arbs_executed=total_live_successes,
             markets_scanned=len(scanned_markets),
             universe_status={
                 "universe_market_count": len(cached_universe_markets),
@@ -2089,9 +2209,11 @@ def main(dotenv_path: str | None = None) -> None:
             market_catalog=_summarize_market_catalog(universe_markets if universe_markets else scanned_markets),
             strategy_status=orchestrator.get_status(),
             execution_summary={
-                "theoretical_opportunities": total_arbs_found,
-                "live_successes": total_arbs_executed,
-                "simulated_successes": total_simulated_executed,
+                "theoretical_opportunities": total_theoretical_opportunities,
+                "live_successes": total_live_successes,
+                "simulated_successes": total_simulated_successes,
+                "live_submissions": total_live_submissions,
+                "simulated_submissions": total_simulated_submissions,
                 "live_profit_total": round(total_live_expected_profit, 6),
                 "simulated_profit_total": round(total_simulated_expected_profit, 6),
             },
@@ -2133,8 +2255,11 @@ def main(dotenv_path: str | None = None) -> None:
             markets_scanned=len(scanned_markets),
             universe_market_count=len(cached_universe_markets),
             selected_event_count=len(event_candidates),
-            arbs_found_total=total_arbs_found,
-            arbs_executed_total=total_arbs_executed,
+            theoretical_opportunities_total=total_theoretical_opportunities,
+            live_successes_total=total_live_successes,
+            simulated_successes_total=total_simulated_successes,
+            live_submissions_total=total_live_submissions,
+            simulated_submissions_total=total_simulated_submissions,
             ws_status=ws_status,
             research_count=len(research_signals),
             daily_pnl=risk_s.daily_pnl,
@@ -2171,10 +2296,13 @@ def main(dotenv_path: str | None = None) -> None:
         elapsed = time.time() - cycle_start
         if cycle % 100 == 0:
             LOG.info(
-                "状态: 已扫描 %d 周期, 发现 %d 机会, 执行 %d 次, WS=%s, 本周期 %.1fs",
+                "状态: 已扫描 %d 周期, 理论机会 %d, 真实成交 %d, 模拟成交 %d, 挂单提交(真/模)=%d/%d, WS=%s, 本周期 %.1fs",
                 cycle,
-                total_arbs_found,
-                total_arbs_executed,
+                total_theoretical_opportunities,
+                total_live_successes,
+                total_simulated_successes,
+                total_live_submissions,
+                total_simulated_submissions,
                 "连接" if ws_status.get("connected") else "未连接",
                 elapsed,
             )
@@ -2196,19 +2324,31 @@ def main(dotenv_path: str | None = None) -> None:
             "run_id": run_id,
             "pid": os.getpid(),
             "cycle": cycle,
-            "arbs_found_total": total_arbs_found,
-            "arbs_executed_total": total_arbs_executed,
+            "arbs_found_total": total_theoretical_opportunities,
+            "arbs_executed_total": total_live_successes,
+            "simulated_successes_total": total_simulated_successes,
+            "live_submissions_total": total_live_submissions,
+            "simulated_submissions_total": total_simulated_submissions,
         })
     tick_recorder.close()
     event_recorder.close()
     dash_state.update(is_running=False)
-    LOG.info("机器人已停止: run_id=%s。总计: %d 周期, %d 机会, %d 执行", run_id, cycle, total_arbs_found, total_arbs_executed)
+    LOG.info(
+        "机器人已停止: run_id=%s。总计: %d 周期, 理论机会=%d, 真实成交=%d, 模拟成交=%d, 挂单提交(真/模)=%d/%d",
+        run_id,
+        cycle,
+        total_theoretical_opportunities,
+        total_live_successes,
+        total_simulated_successes,
+        total_live_submissions,
+        total_simulated_submissions,
+    )
     notifier.notify_shutdown(
         run_id=run_id,
         cycle_count=cycle,
-        total_arbs_found=total_arbs_found,
-        total_arbs_executed=total_arbs_executed,
-        simulated_successes=total_simulated_executed,
+        total_arbs_found=total_theoretical_opportunities,
+        total_arbs_executed=total_live_successes,
+        simulated_successes=total_simulated_successes,
     )
 
 

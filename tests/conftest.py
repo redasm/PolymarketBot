@@ -115,6 +115,7 @@ def make_test_config(**overrides) -> ArbConfig:
         risk_event_cooldown_sec=60.0,
         risk_pending_reservation_ttl_sec=30.0,
         risk_halt_auto_recover_sec=3600.0,
+        maker_stale_order_ttl_sec=60.0,
         portfolio_sync_enabled=False,
         portfolio_sync_interval_sec=60.0,
         portfolio_sync_timeout_sec=5.0,

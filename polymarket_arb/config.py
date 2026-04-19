@@ -94,6 +94,7 @@ class ArbConfig:
     risk_event_cooldown_sec: float
     risk_pending_reservation_ttl_sec: float
     risk_halt_auto_recover_sec: float
+    maker_stale_order_ttl_sec: float
 
     # 账户同步 / Data API
     portfolio_sync_enabled: bool
@@ -248,6 +249,8 @@ class ArbConfig:
             raise ValueError("RISK_PENDING_RESERVATION_TTL_SEC 不能为负数")
         if self.risk_halt_auto_recover_sec < 0:
             raise ValueError("RISK_HALT_AUTO_RECOVER_SEC 不能为负数")
+        if self.maker_stale_order_ttl_sec < 0:
+            raise ValueError("MAKER_STALE_ORDER_TTL_SEC 不能为负数")
         if self.portfolio_sync_enabled and self.portfolio_sync_interval_sec <= 0:
             raise ValueError("PORTFOLIO_SYNC_INTERVAL_SEC 必须大于 0")
         if self.portfolio_sync_enabled and self.portfolio_sync_timeout_sec <= 0:
@@ -378,6 +381,7 @@ class ArbConfig:
             risk_event_cooldown_sec=_env_float("RISK_EVENT_COOLDOWN_SEC", 60.0),
             risk_pending_reservation_ttl_sec=_env_float("RISK_PENDING_RESERVATION_TTL_SEC", 30.0),
             risk_halt_auto_recover_sec=_env_float("RISK_HALT_AUTO_RECOVER_SEC", 3600.0),
+            maker_stale_order_ttl_sec=_env_float("MAKER_STALE_ORDER_TTL_SEC", 60.0),
             portfolio_sync_enabled=_env_bool("PORTFOLIO_SYNC_ENABLED", False),
             portfolio_sync_interval_sec=_env_float("PORTFOLIO_SYNC_INTERVAL_SEC", 60.0),
             portfolio_sync_timeout_sec=_env_float("PORTFOLIO_SYNC_TIMEOUT_SEC", 5.0),

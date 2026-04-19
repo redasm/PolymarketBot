@@ -683,8 +683,11 @@ def test_build_cycle_summary_payload_includes_book_stats_and_timing():
         markets_scanned=6,
         universe_market_count=195,
         selected_event_count=4,
-        arbs_found_total=1,
-        arbs_executed_total=0,
+        theoretical_opportunities_total=1,
+        live_successes_total=0,
+        simulated_successes_total=2,
+        live_submissions_total=1,
+        simulated_submissions_total=3,
         ws_status={"connected": True, "subscribed_tokens": 12},
         research_count=3,
         daily_pnl=0.0,
@@ -714,6 +717,8 @@ def test_build_cycle_summary_payload_includes_book_stats_and_timing():
     assert payload["book_stats"]["rest_error"] == 1
     assert payload["timing"]["prewarm_sec"] == 0.4
     assert payload["timing"]["total_cycle_sec"] == 5.1
+    assert payload["simulated_successes_total"] == 2
+    assert payload["live_submissions_total"] == 1
     assert payload["cycle_status"] == "ok"
 
 
@@ -751,8 +756,11 @@ def test_emit_cycle_metrics_writes_cycle_metrics_and_returns_payload():
         markets_scanned=6,
         universe_market_count=195,
         selected_event_count=4,
-        arbs_found_total=0,
-        arbs_executed_total=0,
+        theoretical_opportunities_total=0,
+        live_successes_total=0,
+        simulated_successes_total=1,
+        live_submissions_total=0,
+        simulated_submissions_total=2,
         ws_status={"connected": True, "subscribed_tokens": 12},
         research_count=1,
         daily_pnl=0.0,
@@ -762,6 +770,7 @@ def test_emit_cycle_metrics_writes_cycle_metrics_and_returns_payload():
 
     assert payload["book_stats"]["ws_hit"] == 5
     assert payload["timing"]["total_cycle_sec"] >= 0.2
+    assert payload["simulated_submissions_total"] == 2
     assert payload["cycle_status"] == "ok"
     assert recorder.events == [("cycle_metrics", payload)]
 
@@ -800,8 +809,11 @@ def test_emit_cycle_metrics_can_mark_error_cycles():
         markets_scanned=0,
         universe_market_count=10,
         selected_event_count=0,
-        arbs_found_total=0,
-        arbs_executed_total=0,
+        theoretical_opportunities_total=0,
+        live_successes_total=0,
+        simulated_successes_total=0,
+        live_submissions_total=0,
+        simulated_submissions_total=0,
         ws_status={"connected": False, "subscribed_tokens": 0},
         research_count=0,
         daily_pnl=0.0,

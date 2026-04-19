@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import types
 
 from polymarket_arb.execution_engine import ExecutionEngine, OrderSubmissionResult
@@ -382,6 +383,83 @@ def test_sync_pending_trade_statuses_keeps_open_order_without_change(monkeypatch
     assert result.polled == [trade]
     assert result.changed == []
     assert trade.status == TradeStatus.PENDING
+
+
+def test_cancel_stale_maker_orders_cancels_only_old_post_only_gtc(monkeypatch):
+    _install_fake_clob_modules(monkeypatch)
+    client = _FakeClient()
+    engine = ExecutionEngine(make_test_config(dry_run=False), client)
+
+    stale_maker = engine.submit_limit_order(
+        token_id="token-maker",
+        condition_id="cond-maker",
+        outcome="Yes",
+        side=OrderSide.BUY,
+        price=0.41,
+        size=3,
+        post_only=True,
+        order_type_name="GTC",
+    )
+    stale_maker.order_id = "oid-maker"
+    stale_maker.timestamp = time.time() - 120.0
+
+    stale_non_maker = engine.submit_limit_order(
+        token_id="token-taker",
+        condition_id="cond-taker",
+        outcome="Yes",
+        side=OrderSide.BUY,
+        price=0.42,
+        size=2,
+        post_only=False,
+        order_type_name="GTC",
+    )
+    stale_non_maker.order_id = "oid-taker"
+    stale_non_maker.status = TradeStatus.PENDING
+    stale_non_maker.timestamp = time.time() - 120.0
+
+    recent_maker = engine.submit_limit_order(
+        token_id="token-recent",
+        condition_id="cond-recent",
+        outcome="Yes",
+        side=OrderSide.BUY,
+        price=0.43,
+        size=1,
+        post_only=True,
+        order_type_name="GTC",
+    )
+    recent_maker.order_id = "oid-recent"
+    recent_maker.timestamp = time.time() - 10.0
+
+    cancelled = engine.cancel_stale_maker_orders(60.0)
+
+    assert cancelled == [stale_maker]
+    assert client.cancelled == ["oid-maker"]
+    assert stale_maker.status == TradeStatus.CANCELLED
+    assert stale_non_maker.status == TradeStatus.PENDING
+    assert recent_maker.status == TradeStatus.PENDING
+
+
+def test_cancel_stale_maker_orders_skips_dry_run():
+    client = _FakeClient()
+    engine = ExecutionEngine(make_test_config(dry_run=True), client)
+
+    trade = engine.submit_limit_order(
+        token_id="token-maker",
+        condition_id="cond-maker",
+        outcome="Yes",
+        side=OrderSide.BUY,
+        price=0.41,
+        size=3,
+        post_only=True,
+        order_type_name="GTC",
+    )
+    trade.order_id = "oid-maker"
+    trade.timestamp = time.time() - 120.0
+
+    cancelled = engine.cancel_stale_maker_orders(60.0)
+
+    assert cancelled == []
+    assert client.cancelled == []
 
 
 def test_get_pnl_summary_excludes_simulated_trades_by_default():
