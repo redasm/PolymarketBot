@@ -225,6 +225,66 @@ class RiskManager:
         }
         self._state.open_positions = sum(1 for exp in self._market_exposure.values() if exp > 0)
 
+    def reconcile_pending_order_statuses(self, trades: list[TradeRecord]) -> None:
+        """根据订单状态同步结果修正 pending 预留敞口.
+
+        目前主要用于 live maker/GTC 订单:
+        - `PENDING` / `PARTIAL`: 续租预留，避免 TTL 误释放仍在交易所挂着的订单
+        - `FILLED`: 释放预留并按最终成交数量落地真实敞口
+        - `FAILED` / `CANCELLED`: 释放预留
+        """
+        now = time.time()
+        updated = False
+
+        for trade in trades:
+            reservation_key = trade.order_id or trade.trade_id
+            if not reservation_key:
+                continue
+
+            reservation = self._pending_reservations.get(reservation_key)
+            if reservation is None:
+                continue
+
+            condition_id, reserved_exposure, _ = reservation
+            if trade.status in (TradeStatus.PENDING, TradeStatus.PARTIAL):
+                self._pending_reservations[reservation_key] = (
+                    condition_id,
+                    reserved_exposure,
+                    now,
+                )
+                continue
+
+            self._pending_reservations.pop(reservation_key, None)
+            current = self._market_exposure.get(condition_id, 0.0)
+            leg_cost = trade.economic_cost if trade.economic_cost is not None else trade.price
+
+            if trade.status == TradeStatus.FILLED:
+                final_exposure = leg_cost * _resolved_exposure_size(trade)
+                delta = final_exposure - reserved_exposure
+                action = "成交落地"
+            else:
+                delta = -reserved_exposure
+                action = "释放挂单"
+
+            remaining = max(0.0, current + delta)
+            if remaining > 0:
+                self._market_exposure[condition_id] = remaining
+            else:
+                self._market_exposure.pop(condition_id, None)
+            self._state.total_exposure = max(0.0, self._state.total_exposure + delta)
+            updated = True
+            LOG.info(
+                "同步订单后修正敞口: action=%s key=%s market=%s delta=$%.4f status=%s",
+                action,
+                reservation_key[:16],
+                condition_id[:12],
+                delta,
+                trade.status.value,
+            )
+
+        if updated:
+            self._state.open_positions = sum(1 for exp in self._market_exposure.values() if exp > 0)
+
     def sync_portfolio_snapshot(
         self,
         positions: list[PositionSnapshot],

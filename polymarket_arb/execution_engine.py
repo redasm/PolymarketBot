@@ -64,6 +64,12 @@ class OrderSubmissionResult:
     fill_price: float | None = None
 
 
+@dataclass
+class OrderSyncResult:
+    polled: list[TradeRecord]
+    changed: list[TradeRecord]
+
+
 class ExecutionEngine:
     """套利交易执行引擎."""
 
@@ -377,6 +383,71 @@ class ExecutionEngine:
         history = self._trade_history if not include_simulated else self._trade_history + self._simulated_trade_history
         return history[-limit:]
 
+    def sync_pending_trade_statuses(self) -> OrderSyncResult:
+        """主动同步本地 pending/partial 订单状态.
+
+        返回:
+            OrderSyncResult:
+              - polled: 本轮查询过的挂单/部分成交记录
+              - changed: 状态或成交字段有变化的记录
+        """
+        if self._config.dry_run or not hasattr(self._client, "get_order"):
+            return OrderSyncResult(polled=[], changed=[])
+
+        polled: list[TradeRecord] = []
+        changed: list[TradeRecord] = []
+
+        for trade in self._trade_history:
+            if trade.simulated or not trade.order_id:
+                continue
+            if trade.status not in (TradeStatus.PENDING, TradeStatus.PARTIAL):
+                continue
+
+            try:
+                response = self._client.get_order(trade.order_id)
+            except Exception as exc:  # pragma: no cover - depends on client transport
+                LOG.debug("同步订单状态失败 order=%s: %s", trade.order_id[:16], exc)
+                continue
+
+            polled.append(trade)
+            next_status, fill_size, fill_price, error = _parse_trade_sync_response(
+                response,
+                requested_size=trade.size,
+                current_status=trade.status,
+            )
+
+            before = (
+                trade.status,
+                trade.fill_size,
+                trade.fill_price,
+                trade.error or "",
+            )
+            trade.status = next_status
+            if fill_size is not None:
+                trade.fill_size = fill_size
+            if fill_price is not None:
+                trade.fill_price = fill_price
+            if error:
+                trade.error = error
+
+            after = (
+                trade.status,
+                trade.fill_size,
+                trade.fill_price,
+                trade.error or "",
+            )
+            if after != before:
+                changed.append(trade)
+                LOG.info(
+                    "订单状态已同步: order=%s status=%s fill_size=%s fill_price=%s",
+                    trade.order_id[:16],
+                    trade.status.value,
+                    f"{trade.fill_size:.4f}" if trade.fill_size is not None else "N/A",
+                    f"{trade.fill_price:.4f}" if trade.fill_price is not None else "N/A",
+                )
+
+        return OrderSyncResult(polled=polled, changed=changed)
+
     def get_pnl_summary(self, *, include_simulated: bool = False) -> dict:
         """计算已执行交易的盈亏摘要."""
         total_cost = 0.0
@@ -595,3 +666,76 @@ def _coerce_fill_field(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed >= 0 else None
+
+
+def _parse_trade_sync_response(
+    response: Any,
+    *,
+    requested_size: float,
+    current_status: TradeStatus,
+) -> tuple[TradeStatus, float | None, float | None, str]:
+    payload = response
+    if isinstance(payload, dict):
+        for key in ("data", "result", "order"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                payload = nested
+                break
+
+    remote_status = ""
+    error_msg = ""
+    fill_size: float | None = None
+    fill_price: float | None = None
+    success = True
+
+    if isinstance(payload, dict):
+        success = bool(payload.get("success", not payload.get("error")))
+        remote_status = str(payload.get("status") or "").lower()
+        error_msg = str(payload.get("errorMsg") or payload.get("error") or "")
+        fill_size = _coerce_fill_field(
+            payload.get("fillSize")
+            or payload.get("filledSize")
+            or payload.get("matchedAmount")
+            or payload.get("sizeMatched")
+            or payload.get("filled")
+        )
+        fill_price = _coerce_fill_field(
+            payload.get("fillPrice")
+            or payload.get("avgPrice")
+            or payload.get("averagePrice")
+            or payload.get("matchedPrice")
+        )
+    else:
+        remote_status = str(getattr(payload, "status", "")).lower()
+        error_msg = str(getattr(payload, "errorMsg", "") or getattr(payload, "error", ""))
+        fill_size = _coerce_fill_field(
+            getattr(payload, "fillSize", None)
+            or getattr(payload, "filledSize", None)
+            or getattr(payload, "matchedAmount", None)
+            or getattr(payload, "sizeMatched", None)
+            or getattr(payload, "filled", None)
+        )
+        fill_price = _coerce_fill_field(
+            getattr(payload, "fillPrice", None)
+            or getattr(payload, "avgPrice", None)
+            or getattr(payload, "averagePrice", None)
+            or getattr(payload, "matchedPrice", None)
+        )
+
+    if not success:
+        return TradeStatus.FAILED, fill_size, fill_price, error_msg
+    if remote_status in {"matched", "filled"}:
+        return TradeStatus.FILLED, fill_size or float(requested_size), fill_price, error_msg
+    if remote_status in _PARTIAL_REMOTE_STATUSES:
+        return TradeStatus.PARTIAL, fill_size, fill_price, error_msg
+    if remote_status in _FAILED_REMOTE_STATUSES:
+        next_status = TradeStatus.CANCELLED if remote_status in {"cancelled", "canceled"} else TradeStatus.FAILED
+        return next_status, fill_size, fill_price, error_msg
+    if remote_status in _PENDING_REMOTE_STATUSES:
+        return TradeStatus.PENDING, fill_size, fill_price, error_msg
+    if fill_size is not None:
+        if fill_size + 1e-9 >= float(requested_size):
+            return TradeStatus.FILLED, fill_size, fill_price, error_msg
+        if fill_size > 0:
+            return TradeStatus.PARTIAL, fill_size, fill_price, error_msg
+    return current_status, fill_size, fill_price, error_msg

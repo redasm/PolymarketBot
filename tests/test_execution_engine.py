@@ -36,6 +36,7 @@ class _FakeClient:
         self.cancelled: list[str] = []
         self.last_post_only = None
         self.balance_response = {"balance": "100.0", "allowance": "100.0"}
+        self.order_responses: dict[str, dict] = {}
 
     def create_order(self, order_args, options):
         return {"order": order_args, "options": options}
@@ -50,6 +51,9 @@ class _FakeClient:
 
     def get_balance_allowance(self, params=None):
         return self.balance_response
+
+    def get_order(self, order_id):
+        return self.order_responses.get(order_id, {"orderID": order_id, "status": "open"})
 
 
 def _install_fake_clob_modules(monkeypatch, order_type=None):
@@ -325,6 +329,59 @@ def test_ensure_sufficient_collateral_rejects_when_balance_too_low(monkeypatch):
     assert ok is False
     assert "insufficient_balance" in reason
     assert available == 4.0
+
+
+def test_sync_pending_trade_statuses_updates_filled_trade(monkeypatch):
+    _install_fake_clob_modules(monkeypatch)
+    client = _FakeClient()
+    client.order_responses["oid-123"] = {
+        "orderID": "oid-123",
+        "status": "filled",
+        "filledSize": 3.0,
+        "avgPrice": 0.411,
+    }
+    engine = ExecutionEngine(make_test_config(dry_run=False), client)
+    trade = engine.submit_limit_order(
+        token_id="token-1",
+        condition_id="cond-1",
+        outcome="Yes",
+        side=OrderSide.BUY,
+        price=0.41,
+        size=3,
+        post_only=True,
+        order_type_name="GTC",
+    )
+
+    result = engine.sync_pending_trade_statuses()
+
+    assert result.polled == [trade]
+    assert result.changed == [trade]
+    assert trade.status == TradeStatus.FILLED
+    assert trade.fill_size == 3.0
+    assert trade.fill_price == 0.411
+
+
+def test_sync_pending_trade_statuses_keeps_open_order_without_change(monkeypatch):
+    _install_fake_clob_modules(monkeypatch)
+    client = _FakeClient()
+    client.order_responses["oid-123"] = {"orderID": "oid-123", "status": "open"}
+    engine = ExecutionEngine(make_test_config(dry_run=False), client)
+    trade = engine.submit_limit_order(
+        token_id="token-1",
+        condition_id="cond-1",
+        outcome="Yes",
+        side=OrderSide.BUY,
+        price=0.41,
+        size=3,
+        post_only=True,
+        order_type_name="GTC",
+    )
+
+    result = engine.sync_pending_trade_statuses()
+
+    assert result.polled == [trade]
+    assert result.changed == []
+    assert trade.status == TradeStatus.PENDING
 
 
 def test_get_pnl_summary_excludes_simulated_trades_by_default():

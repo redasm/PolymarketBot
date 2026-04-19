@@ -302,6 +302,88 @@ def test_pending_reservation_ttl_uses_configured_duration(monkeypatch):
     assert state.total_exposure == 0.45 * 5
 
 
+def test_reconcile_pending_order_statuses_releases_cancelled_order():
+    mgr = RiskManager(make_test_config())
+    opp = _make_opp()
+    trade = TradeRecord(
+        "t1",
+        "a1",
+        "yes",
+        "c1",
+        OrderSide.BUY,
+        0.45,
+        5,
+        status=TradeStatus.PENDING,
+        order_id="oid-1",
+        economic_cost=0.45,
+    )
+
+    mgr.record_execution(opp, [trade], count_pending_as_failure=False)
+    assert mgr.state.total_exposure == 0.45 * 5
+
+    trade.status = TradeStatus.CANCELLED
+    mgr.reconcile_pending_order_statuses([trade])
+
+    assert mgr.state.total_exposure == 0.0
+    assert mgr.state.open_positions == 0
+
+
+def test_reconcile_pending_order_statuses_keeps_partial_order_reserved(monkeypatch):
+    base_time = 1_000.0
+    monkeypatch.setattr(risk_manager_module.time, "time", lambda: base_time)
+    mgr = RiskManager(make_test_config(risk_pending_reservation_ttl_sec=30.0))
+    opp = _make_opp()
+    trade = TradeRecord(
+        "t1",
+        "a1",
+        "yes",
+        "c1",
+        OrderSide.BUY,
+        0.45,
+        5,
+        status=TradeStatus.PENDING,
+        order_id="oid-1",
+        economic_cost=0.45,
+    )
+
+    mgr.record_execution(opp, [trade], count_pending_as_failure=False)
+    trade.status = TradeStatus.PARTIAL
+    trade.fill_size = 2.0
+    mgr.reconcile_pending_order_statuses([trade])
+
+    monkeypatch.setattr(risk_manager_module.time, "time", lambda: base_time + 20.0)
+    mgr.reconcile_pending_order_statuses([trade])
+    assert mgr.state.total_exposure == 0.45 * 5
+
+    monkeypatch.setattr(risk_manager_module.time, "time", lambda: base_time + 35.0)
+    assert mgr.state.total_exposure == 0.45 * 5
+
+
+def test_reconcile_pending_order_statuses_converts_filled_order_to_actual_exposure():
+    mgr = RiskManager(make_test_config())
+    opp = _make_opp()
+    trade = TradeRecord(
+        "t1",
+        "a1",
+        "yes",
+        "c1",
+        OrderSide.BUY,
+        0.45,
+        5,
+        status=TradeStatus.PENDING,
+        order_id="oid-1",
+        economic_cost=0.45,
+    )
+
+    mgr.record_execution(opp, [trade], count_pending_as_failure=False)
+    trade.status = TradeStatus.FILLED
+    trade.fill_size = 3.0
+    mgr.reconcile_pending_order_statuses([trade])
+
+    assert mgr.state.total_exposure == 0.45 * 3
+    assert mgr.state.open_positions == 1
+
+
 def test_pre_trade_check_uses_leg_exposure_per_market_in_multi_outcome():
     mgr = RiskManager(make_test_config(max_exposure_per_market=100.0))
     market_a = MarketInfo(

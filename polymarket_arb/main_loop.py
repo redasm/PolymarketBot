@@ -732,6 +732,7 @@ def _execute_strategy_signal(
     dash_state: DashboardState,
     event_recorder: EventRecorder,
     maker_strategy: MakerStrategy,
+    notifier: NotificationManager,
 ) -> tuple[bool, str]:
     market = _find_market_for_signal(signal.market_id, active_markets)
     if signal.tier == StrategyTier.CROSS_PLATFORM:
@@ -827,6 +828,30 @@ def _execute_strategy_signal(
                 "timestamp": trade.timestamp,
                 "simulated": trade.simulated,
             })
+        simulated_exec = bool(trades) and all(getattr(t, "simulated", False) for t in trades)
+        filled_legs_count = sum(1 for t in trades if t.status == TradeStatus.FILLED)
+        if execution_success:
+            notifier.notify_trade_success(
+                event_title=opportunity.event_title,
+                arb_type=f"T2_{opportunity.arb_type.value}",
+                filled_legs=filled_legs_count,
+                total_legs=len(opportunity.legs),
+                expected_profit=opportunity.net_edge * adj_size,
+                simulated=simulated_exec,
+            )
+        elif trades and not config.dry_run:
+            failure_reasons = sorted({
+                str(getattr(t, "error", "")).strip()
+                for t in trades
+                if str(getattr(t, "error", "")).strip()
+            })
+            notifier.notify_trade_failure(
+                event_title=opportunity.event_title,
+                filled_legs=filled_legs_count,
+                total_legs=len(opportunity.legs),
+                simulated=simulated_exec,
+                details="; ".join(failure_reasons[:2]),
+            )
         return True, ""
 
     if signal.tier == StrategyTier.MARKET_MAKING:
@@ -916,6 +941,25 @@ def _execute_strategy_signal(
                 "trade_status": trade.status.value,
                 "post_only": True,
             })
+        simulated_maker = bool(getattr(trade, "simulated", False))
+        spread_usdc = float(quote.get("spread") or 0.0)
+        if trade.status == TradeStatus.FILLED:
+            notifier.notify_trade_success(
+                event_title=market.question,
+                arb_type="T3_market_making",
+                filled_legs=1,
+                total_legs=1,
+                expected_profit=spread_usdc * float(trade.fill_size or adj_size),
+                simulated=simulated_maker,
+            )
+        elif trade.status in (TradeStatus.FAILED, TradeStatus.CANCELLED) and not config.dry_run:
+            notifier.notify_trade_failure(
+                event_title=market.question,
+                filled_legs=0,
+                total_legs=1,
+                simulated=simulated_maker,
+                details=str(getattr(trade, "error", "") or "").strip(),
+            )
         return submission_success, ""
 
     return False, "unsupported_strategy_tier"
@@ -1429,6 +1473,11 @@ def main(dotenv_path: str | None = None) -> None:
         scan_interval_sec=config.scan_interval_sec,
         ws_enabled=config.ws_enabled,
         portfolio_sync_enabled=config.portfolio_sync_enabled,
+        max_order_size_usdc=config.max_order_size_usdc,
+        max_exposure_per_market=config.max_exposure_per_market,
+        max_total_exposure=config.max_total_exposure,
+        max_daily_loss=config.max_daily_loss,
+        max_open_positions=config.max_open_positions,
     )
 
     cycle = 0
@@ -1925,6 +1974,7 @@ def main(dotenv_path: str | None = None) -> None:
                 dash_state=dash_state,
                 event_recorder=event_recorder,
                 maker_strategy=maker_strategy,
+                notifier=notifier,
             )
             if executed:
                 continue
@@ -1938,6 +1988,33 @@ def main(dotenv_path: str | None = None) -> None:
                     "reason": reason,
                 })
         cycle_timing["strategy_execution_sec"] = time.perf_counter() - phase_start
+
+        if not config.dry_run:
+            try:
+                order_sync = executor.sync_pending_trade_statuses()
+                if order_sync.polled:
+                    risk_mgr.reconcile_pending_order_statuses(order_sync.polled)
+                if event_recorder.is_enabled and order_sync.changed:
+                    for trade in order_sync.changed:
+                        event_recorder.write_event("risk_events", {
+                            "event": "order_status_sync",
+                            "order_id": trade.order_id,
+                            "trade_id": trade.trade_id,
+                            "condition_id": trade.condition_id,
+                            "status": trade.status.value,
+                            "fill_size": trade.fill_size,
+                            "fill_price": trade.fill_price,
+                            "error": trade.error,
+                            "ts": time.time(),
+                        })
+            except Exception as exc:
+                LOG.warning("订单状态同步失败: %s", exc)
+                if event_recorder.is_enabled:
+                    event_recorder.write_event("risk_events", {
+                        "event": "order_status_sync_error",
+                        "error": str(exc),
+                        "ts": time.time(),
+                    })
 
         if (
             portfolio_sync is not None

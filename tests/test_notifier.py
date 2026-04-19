@@ -98,8 +98,8 @@ def test_notification_manager_daily_summary_uses_completed_day_stats_after_rollo
     assert len(daily_messages) == 1
     assert "统计日(UTC): 2026-04-17" in daily_messages[0]
     assert "交易概览: 成功 1 | 失败 1 | 严重错误 1" in daily_messages[0]
-    assert "收益概览: LIVE $+1.2500" in daily_messages[0]
-    assert "收盘日盈亏 $+3.50" in daily_messages[0]
+    assert "理论累计净利(LIVE): $+1.2500" in daily_messages[0]
+    assert "真实已实现日盈亏:   $+3.50" in daily_messages[0]
     assert "资金状态: 持仓 2 | 敞口 $42.00" in daily_messages[0]
 
 
@@ -123,6 +123,11 @@ def test_notification_manager_formats_startup_and_shutdown_messages(tmp_path):
         scan_interval_sec=3.0,
         ws_enabled=True,
         portfolio_sync_enabled=True,
+        max_order_size_usdc=10.0,
+        max_exposure_per_market=25.0,
+        max_total_exposure=100.0,
+        max_daily_loss=10.0,
+        max_open_positions=3,
     ) is True
     assert manager.notify_shutdown(
         run_id="run-1",

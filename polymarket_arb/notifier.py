@@ -64,6 +64,11 @@ class NotificationManager:
         scan_interval_sec: float,
         ws_enabled: bool,
         portfolio_sync_enabled: bool,
+        max_order_size_usdc: float,
+        max_exposure_per_market: float,
+        max_total_exposure: float,
+        max_daily_loss: float,
+        max_open_positions: int,
     ) -> bool:
         message = (
             "🤖 机器人启动\n"
@@ -71,7 +76,13 @@ class NotificationManager:
             f"最小利润: ${min_profit_usd:.4f} / {min_profit_pct:.2f}%\n"
             f"扫描间隔: {scan_interval_sec:.1f}s\n"
             f"WebSocket: {'启用' if ws_enabled else '禁用'}\n"
-            f"账户同步: {'启用' if portfolio_sync_enabled else '禁用'}"
+            f"账户同步: {'启用' if portfolio_sync_enabled else '禁用'}\n"
+            "---- 风控上限 ----\n"
+            f"单笔上限: ${max_order_size_usdc:.2f}\n"
+            f"单市场敞口: ${max_exposure_per_market:.2f}\n"
+            f"总敞口: ${max_total_exposure:.2f}\n"
+            f"日亏熔断: -${max_daily_loss:.2f}\n"
+            f"最大持仓数: {max_open_positions}"
         )
         return self._backend.send(message, category="startup", force=True)
 
@@ -416,7 +427,9 @@ def _format_daily_summary_message(summary: DailySummaryPayload, *, timezone_name
         "🧾 每日汇总\n"
         f"日期: {summary.summary_local_date} ({timezone_name}) | 统计日(UTC): {summary.risk_date}\n"
         f"交易概览: 成功 {summary.trade_success_count} | 失败 {summary.trade_failure_count} | 严重错误 {summary.fatal_error_count}\n"
-        f"收益概览: LIVE ${summary.live_expected_profit_total:+.4f} | DRY ${summary.simulated_expected_profit_total:+.4f} | 收盘日盈亏 ${summary.closing_daily_pnl:+.2f}\n"
+        f"理论累计净利(LIVE): ${summary.live_expected_profit_total:+.4f}  [按 net_edge×size 估算，未扣滑点/手续费]\n"
+        f"理论累计净利(DRY):  ${summary.simulated_expected_profit_total:+.4f}  [dry-run 模拟盘口，仅供观测]\n"
+        f"真实已实现日盈亏:   ${summary.closing_daily_pnl:+.2f}  [账户同步的 closed-positions realized PnL，未含浮盈浮亏]\n"
         f"资金状态: 持仓 {summary.closing_open_positions} | 敞口 ${summary.closing_total_exposure:.2f}\n"
-        "口径: 当日盈亏优先使用账户同步后的真实已实现盈亏"
+        "口径: 落袋盈亏以「真实已实现日盈亏」为准；理论累计净利仅反映信号质量，不等同实盘收益"
     )
