@@ -38,6 +38,51 @@ class TestBinaryArbDetection:
         assert opp.is_profitable
         assert len(opp.legs) == 2
 
+    def test_binary_arb_uses_outcome_labels_not_token_order(self, make_snapshot):
+        snapshots = {
+            "0xyes": make_snapshot(token_id="0xyes", best_bid=0.44, best_ask=0.45),
+            "0xno": make_snapshot(token_id="0xno", best_bid=0.49, best_ask=0.50),
+        }
+        market = MarketInfo(
+            condition_id="c1",
+            question="Test?",
+            slug="test",
+            tokens=[
+                TokenInfo(token_id="0xno", outcome="No"),
+                TokenInfo(token_id="0xyes", outcome="Yes"),
+            ],
+            active=True,
+            closed=False,
+            event_id="e1",
+        )
+        detector = ArbitrageDetector(make_test_config(), MockOrderBookAnalyzer(snapshots))
+        opp = detector.scan_binary_market(market)
+
+        assert opp is not None
+        assert [leg.outcome for leg in opp.legs] == ["Yes", "No"]
+        assert [leg.token_id for leg in opp.legs] == ["0xyes", "0xno"]
+
+    def test_binary_arb_requires_yes_and_no_outcomes(self, make_snapshot):
+        snapshots = {
+            "0xa": make_snapshot(token_id="0xa", best_ask=0.45),
+            "0xb": make_snapshot(token_id="0xb", best_ask=0.50),
+        }
+        market = MarketInfo(
+            condition_id="c1",
+            question="Test?",
+            slug="test",
+            tokens=[
+                TokenInfo(token_id="0xa", outcome="Alpha"),
+                TokenInfo(token_id="0xb", outcome="Beta"),
+            ],
+            active=True,
+            closed=False,
+            event_id="e1",
+        )
+        detector = ArbitrageDetector(make_test_config(), MockOrderBookAnalyzer(snapshots))
+
+        assert detector.scan_binary_market(market) is None
+
     def test_no_arb_when_sum_exceeds_one(self, make_snapshot):
         snapshots = {
             "0xyes": make_snapshot(token_id="0xyes", best_ask=0.52),

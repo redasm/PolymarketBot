@@ -12,6 +12,14 @@ from tests.conftest import make_test_config, write_test_env
     ("field_name", "value", "expected_msg"),
     [
         ("market_fetch_limit", 0, "ARB_MARKET_FETCH_LIMIT"),
+        ("min_edge_usd", -0.01, "ARB_MIN_EDGE_USD"),
+        ("min_edge_pct", -0.01, "ARB_MIN_EDGE_PCT"),
+        ("max_order_size_usdc", 0.0, "ARB_MAX_ORDER_SIZE_USDC"),
+        ("default_order_size_usdc", 0.0, "ARB_DEFAULT_ORDER_SIZE_USDC"),
+        ("min_liquidity", -1.0, "ARB_MIN_LIQUIDITY"),
+        ("min_volume_24h", -1.0, "ARB_MIN_LIQUIDITY"),
+        ("polymarket_taker_fee_rate", 1.0, "POLYMARKET_TAKER_FEE_RATE"),
+        ("kalshi_taker_fee_rate", -0.1, "KALSHI_TAKER_FEE_RATE"),
         ("scan_interval_sec", 0.0, "ARB_SCAN_INTERVAL_SEC"),
         ("orderbook_retry_count", -1, "ORDERBOOK_RETRY_COUNT"),
         ("orderbook_ws_snapshot_max_age_sec", -0.1, "ORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC"),
@@ -33,6 +41,11 @@ def test_config_validate_rejects_invalid_values(field_name, value, expected_msg)
 
     with pytest.raises(ValueError, match=expected_msg):
         make_test_config(**kwargs)
+
+
+def test_config_validate_rejects_default_order_above_max_order():
+    with pytest.raises(ValueError, match="ARB_DEFAULT_ORDER_SIZE_USDC"):
+        make_test_config(default_order_size_usdc=60.0, max_order_size_usdc=50.0)
 
 
 def test_from_env_loads_new_edge_and_cooldown_config(tmp_path, monkeypatch):

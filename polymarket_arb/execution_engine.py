@@ -535,7 +535,8 @@ class ExecutionEngine:
             arb_ids.add(t.arb_id)
             if t.status == TradeStatus.FILLED:
                 leg_cost = t.economic_cost if t.economic_cost is not None else t.price
-                total_cost += leg_cost * t.size
+                size = t.fill_size if t.fill_size is not None else t.size
+                total_cost += leg_cost * size
                 total_filled += 1
             elif t.status == TradeStatus.FAILED:
                 total_failed += 1
@@ -579,7 +580,9 @@ class ExecutionEngine:
                     record.price,
                     actual_size,
                 ): (index, leg, record)
-                for index, (leg, record) in enumerate(zip(opp.legs, records, strict=True))
+                # `zip(strict=True)` 仅在较新的 Python 版本可用；这里前面已经做过长度一致性校验，
+                # 因此直接使用普通 zip 以兼容部署环境中的旧版本解释器。
+                for index, (leg, record) in enumerate(zip(opp.legs, records))
             }
             for future in concurrent.futures.as_completed(future_map):
                 index, leg, record = future_map[future]

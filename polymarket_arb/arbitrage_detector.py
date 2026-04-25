@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import re
 import statistics
-from typing import Optional
+from typing import Any, Optional
 
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.models import (
@@ -42,6 +42,18 @@ LOG = logging.getLogger(__name__)
 PAYOUT_PER_SHARE = 1.0
 
 
+def _find_token_by_outcome(market: MarketInfo, outcome: str) -> Any | None:
+    expected = outcome.strip().lower()
+    return next(
+        (
+            token
+            for token in market.tokens
+            if str(token.outcome or "").strip().lower() == expected
+        ),
+        None,
+    )
+
+
 class ArbitrageDetector:
     """检测 Polymarket 上的套利机会."""
 
@@ -57,8 +69,10 @@ class ArbitrageDetector:
         if market.closed or not market.active:
             return None
 
-        token_yes = market.tokens[0]
-        token_no = market.tokens[1]
+        token_yes = _find_token_by_outcome(market, "yes")
+        token_no = _find_token_by_outcome(market, "no")
+        if token_yes is None or token_no is None or token_yes.token_id == token_no.token_id:
+            return None
 
         snap_yes = self._ob.get_snapshot(token_yes.token_id)
         snap_no = self._ob.get_snapshot(token_no.token_id)
@@ -224,7 +238,9 @@ class ArbitrageDetector:
 
     def _get_standard_leg(self, market: MarketInfo) -> Optional[ArbLeg]:
         """标准市场：买入 Yes token 的 best ask."""
-        yes_token = market.tokens[0] if market.tokens else None
+        yes_token = _find_token_by_outcome(market, "yes") if market.tokens else None
+        if yes_token is None and len(market.tokens) == 1:
+            yes_token = market.tokens[0]
         if yes_token is None:
             return None
 
@@ -249,8 +265,10 @@ class ArbitrageDetector:
         if len(market.tokens) < 2:
             return None
 
-        yes_token = market.tokens[0]
-        no_token = market.tokens[1]
+        yes_token = _find_token_by_outcome(market, "yes")
+        no_token = _find_token_by_outcome(market, "no")
+        if yes_token is None or no_token is None or yes_token.token_id == no_token.token_id:
+            return None
 
         snap_yes = self._ob.get_snapshot(yes_token.token_id)
         snap_no = self._ob.get_snapshot(no_token.token_id)

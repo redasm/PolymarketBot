@@ -90,3 +90,31 @@ def test_summarize_runtime_artifacts_recovers_legacy_dry_run_trade_rows(tmp_path
     assert summary["trades"]["reported_successes"] == 1
     assert summary["trades"]["simulated_successes"] == 1
     assert summary["trades"]["expected_profit_total"] == 0.155
+
+
+def test_summarize_runtime_artifacts_reads_rotated_telemetry_files(tmp_path: Path):
+    log_path = tmp_path / "arb_bot.log"
+    telemetry_dir = tmp_path / "telemetry"
+    ticks_dir = tmp_path / "ticks"
+    telemetry_dir.mkdir()
+    ticks_dir.mkdir()
+
+    log_path.write_text("2026-04-15 [INFO] main_loop | 模式: LIVE (实盘交易)", encoding="utf-8")
+    (telemetry_dir / "2026-04-14.strategy_signals.ndjson").write_text(
+        '{"tier":"MARKET_MAKING","signal_type":"maker_quote"}\n',
+        encoding="utf-8",
+    )
+    (telemetry_dir / "2026-04-14.strategy_signals.1.ndjson").write_text(
+        '{"tier":"STATISTICAL_ARB","signal_type":"statistical_buy_no"}\n',
+        encoding="utf-8",
+    )
+    (telemetry_dir / "2026-04-14.trades.1.ndjson").write_text(
+        '{"arb_success":true,"live_execution_success":true,"trade_outcome_estimate":0.01}\n',
+        encoding="utf-8",
+    )
+
+    summary = summarize_runtime_artifacts(log_path=log_path, telemetry_dir=telemetry_dir, ticks_dir=ticks_dir)
+
+    assert summary["signals"]["by_tier"] == {"MARKET_MAKING": 1, "STATISTICAL_ARB": 1}
+    assert summary["trades"]["live_successes"] == 1
+    assert summary["trades"]["expected_profit_total"] == 0.01

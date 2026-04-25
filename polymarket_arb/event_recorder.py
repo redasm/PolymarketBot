@@ -45,10 +45,15 @@ class EventRecorder:
     def write_event(self, category: str, payload: dict[str, Any]) -> None:
         if not self._enabled:
             return
+        safe_payload = dict(payload)
+        if "ts" in safe_payload:
+            safe_payload.setdefault("payload_ts", safe_payload.pop("ts"))
+        if "category" in safe_payload:
+            safe_payload.setdefault("payload_category", safe_payload.pop("category"))
         record = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "category": category,
-            **payload,
+            **safe_payload,
         }
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
         encoded = line.encode("utf-8")

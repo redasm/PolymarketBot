@@ -7,7 +7,7 @@ import time
 import types
 
 from polymarket_arb.execution_engine import ExecutionEngine, OrderSubmissionResult
-from polymarket_arb.models import ArbLeg, ArbOpportunity, ArbType, OrderSide, TradeStatus
+from polymarket_arb.models import ArbLeg, ArbOpportunity, ArbType, OrderSide, TradeRecord, TradeStatus
 
 from tests.conftest import make_test_config
 
@@ -470,3 +470,22 @@ def test_get_pnl_summary_excludes_simulated_trades_by_default():
 
     assert engine.get_pnl_summary()["total_trades"] == 0
     assert engine.get_pnl_summary(include_simulated=True)["total_trades"] == 2
+
+
+def test_get_pnl_summary_uses_fill_size_for_filled_cost():
+    engine = ExecutionEngine(make_test_config(dry_run=False), _FakeClient())
+    trade = TradeRecord(
+        trade_id="t1",
+        arb_id="a1",
+        token_id="token",
+        condition_id="cond",
+        side=OrderSide.BUY,
+        price=0.50,
+        size=10.0,
+        status=TradeStatus.FILLED,
+        fill_size=4.0,
+        economic_cost=0.50,
+    )
+    engine._trade_history.append(trade)
+
+    assert engine.get_pnl_summary()["total_cost"] == 2.0

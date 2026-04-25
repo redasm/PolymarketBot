@@ -21,6 +21,14 @@ def _load_ndjson_rows(paths: list[Path]) -> list[dict[str, Any]]:
     return rows
 
 
+def _telemetry_category_paths(telemetry_dir: Path, category: str) -> list[Path]:
+    paths = {
+        *telemetry_dir.glob(f"*.{category}.ndjson"),
+        *telemetry_dir.glob(f"*.{category}.*.ndjson"),
+    }
+    return sorted(paths)
+
+
 def _detect_run_mode(log_text: str) -> str:
     if "DRY RUN" in log_text:
         return "dry_run"
@@ -155,9 +163,9 @@ def summarize_runtime_artifacts(
     ticks_dir = Path(ticks_dir)
 
     log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
-    opportunity_rows = _load_ndjson_rows(list(telemetry_dir.glob("*.opportunities.ndjson")))
-    trade_rows = _load_ndjson_rows(list(telemetry_dir.glob("*.trades.ndjson")))
-    signal_rows = _load_ndjson_rows(list(telemetry_dir.glob("*.strategy_signals.ndjson")))
+    opportunity_rows = _load_ndjson_rows(_telemetry_category_paths(telemetry_dir, "opportunities"))
+    trade_rows = _load_ndjson_rows(_telemetry_category_paths(telemetry_dir, "trades"))
+    signal_rows = _load_ndjson_rows(_telemetry_category_paths(telemetry_dir, "strategy_signals"))
     tick_rows = _load_ndjson_rows(list(ticks_dir.glob("*.ndjson")))
 
     run_mode = _detect_run_mode(log_text)

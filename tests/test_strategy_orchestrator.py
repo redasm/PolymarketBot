@@ -350,6 +350,36 @@ def test_process_signals_prefers_higher_confidence_after_edge_normalization():
     assert [signal.market_id for signal in ready] == ["market-2", "market-1"]
 
 
+def test_process_signals_reallocates_idle_budget_for_small_bankroll():
+    orchestrator = StrategyOrchestrator(total_bankroll=3.0)
+    stat_signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_no",
+        market_id="market-stat",
+        description="stat",
+        expected_edge=250.0,
+        confidence=0.8,
+        recommended_size_usdc=1.0,
+    )
+    maker_signal = StrategySignal(
+        tier=StrategyTier.MARKET_MAKING,
+        signal_type="maker_quote",
+        market_id="market-maker",
+        description="maker",
+        expected_edge=500.0,
+        confidence=0.5,
+        recommended_size_usdc=1.0,
+        urgency=0.2,
+    )
+
+    orchestrator.submit_signal(stat_signal)
+    orchestrator.submit_signal(maker_signal)
+    ready = orchestrator.process_signals()
+
+    assert {signal.market_id for signal in ready} == {"market-stat", "market-maker"}
+    assert orchestrator.get_last_skip_reasons()["total"] == 0
+
+
 def test_record_processed_prunes_executed_signal_history():
     orchestrator = StrategyOrchestrator(total_bankroll=1000)
 

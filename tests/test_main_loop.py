@@ -24,6 +24,7 @@ from polymarket_arb.main_loop import (
     _build_t2_related_market_context,
     _extract_market_deadline,
     _extract_market_temporal_stem,
+    _execute_strategy_signal,
     _focus_keywords,
     _find_pending_signal,
     _find_pending_signal_overlay,
@@ -1293,6 +1294,213 @@ def test_collect_maker_strategy_signals_can_compute_fair_value_without_t2_signal
 
     assert len(signals) == 1
     assert signals[0].market_id == "cond-1"
+
+
+def test_execute_maker_quote_converts_yes_ask_to_no_bid():
+    class _StubExecutor:
+        def __init__(self):
+            self.submitted = None
+
+        def ensure_sufficient_collateral(self, amount):
+            return True, "", amount
+
+        def submit_limit_order(self, **kwargs):
+            self.submitted = kwargs
+            return TradeRecord(
+                trade_id="trade-1",
+                arb_id="arb-1",
+                token_id=kwargs["token_id"],
+                condition_id=kwargs["condition_id"],
+                side=kwargs["side"],
+                price=kwargs["price"],
+                size=kwargs["size"],
+                status=TradeStatus.PENDING,
+                simulated=True,
+                post_only=kwargs["post_only"],
+                order_type_name=kwargs["order_type_name"],
+                economic_cost=kwargs["price"],
+            )
+
+    class _StubRiskManager:
+        def __init__(self):
+            self.opp = None
+
+        def pre_trade_check(self, opp, size):
+            self.opp = opp
+            return True, "", size
+
+        def record_execution(self, opp, trades, count_pending_as_failure=True):
+            self.opp = opp
+
+    class _StubEventRecorder:
+        is_enabled = True
+
+        def __init__(self):
+            self.events = []
+
+        def write_event(self, category, payload):
+            self.events.append((category, payload))
+
+    class _StubNotifier:
+        def notify_trade_success(self, **kwargs):
+            pass
+
+        def notify_trade_failure(self, **kwargs):
+            pass
+
+    market = MarketInfo(
+        condition_id="cond-1",
+        question="Will BTC rise?",
+        slug="btc-rise",
+        tokens=[TokenInfo("yes-1", "Yes"), TokenInfo("no-1", "No")],
+    )
+    signal = StrategySignal(
+        tier=StrategyTier.MARKET_MAKING,
+        signal_type="maker_quote",
+        market_id="cond-1",
+        description="ask-only maker quote",
+        expected_edge=350.0,
+        confidence=0.5,
+        recommended_size_usdc=1.0,
+        payload={
+            "quote": {
+                "bid_price": None,
+                "ask_price": 0.07,
+                "bid_size": 1.0,
+                "ask_size": 1.0,
+                "fair_value": 0.025,
+                "spread": 0.0,
+            }
+        },
+    )
+    executor = _StubExecutor()
+    event_recorder = _StubEventRecorder()
+    orchestrator = StrategyOrchestrator(total_bankroll=3.0)
+
+    executed, reason, delta = _execute_strategy_signal(
+        signal=signal,
+        config=make_test_config(dry_run=True),
+        active_markets=[market],
+        ob_analyzer=SimpleNamespace(),
+        executor=executor,
+        risk_mgr=_StubRiskManager(),
+        orchestrator=orchestrator,
+        dash_state=DashboardState(),
+        event_recorder=event_recorder,
+        maker_strategy=MakerStrategy(default_size=1.0),
+        notifier=_StubNotifier(),
+    )
+
+    assert executed is True
+    assert reason == ""
+    assert delta.simulated_submissions == 1
+    assert executor.submitted["token_id"] == "no-1"
+    assert executor.submitted["outcome"] == "No"
+    assert round(executor.submitted["price"], 6) == 0.93
+    assert event_recorder.events[-1][1]["maker_side"] == "buy_no_from_yes_ask"
+    assert orchestrator.get_status()["T3"]["current_exposure"] == 0.0
+
+
+def test_execute_maker_quote_prefers_selling_existing_inventory():
+    class _StubExecutor:
+        def __init__(self):
+            self.submitted = None
+
+        def ensure_sufficient_collateral(self, amount):
+            raise AssertionError("sell inventory should not require collateral")
+
+        def submit_limit_order(self, **kwargs):
+            self.submitted = kwargs
+            return TradeRecord(
+                trade_id="trade-1",
+                arb_id="arb-1",
+                token_id=kwargs["token_id"],
+                condition_id=kwargs["condition_id"],
+                side=kwargs["side"],
+                price=kwargs["price"],
+                size=kwargs["size"],
+                status=TradeStatus.PENDING,
+                simulated=True,
+                post_only=kwargs["post_only"],
+                order_type_name=kwargs["order_type_name"],
+                economic_cost=kwargs["price"],
+            )
+
+    class _StubRiskManager:
+        def pre_trade_check(self, opp, size):
+            raise AssertionError("sell inventory should not open new risk")
+
+        def record_execution(self, opp, trades, count_pending_as_failure=True):
+            raise AssertionError("sell inventory should not increase exposure")
+
+    class _StubEventRecorder:
+        is_enabled = True
+
+        def __init__(self):
+            self.events = []
+
+        def write_event(self, category, payload):
+            self.events.append((category, payload))
+
+    class _StubNotifier:
+        def notify_trade_success(self, **kwargs):
+            pass
+
+        def notify_trade_failure(self, **kwargs):
+            pass
+
+    market = MarketInfo(
+        condition_id="cond-1",
+        question="Will BTC rise?",
+        slug="btc-rise",
+        tokens=[TokenInfo("yes-1", "Yes"), TokenInfo("no-1", "No")],
+    )
+    signal = StrategySignal(
+        tier=StrategyTier.MARKET_MAKING,
+        signal_type="maker_quote",
+        market_id="cond-1",
+        description="two-sided maker quote",
+        expected_edge=350.0,
+        confidence=0.5,
+        recommended_size_usdc=1.0,
+        payload={
+            "quote": {
+                "bid_price": 0.02,
+                "ask_price": 0.07,
+                "bid_size": 1.0,
+                "ask_size": 1.0,
+                "fair_value": 0.025,
+                "spread": 0.05,
+            }
+        },
+    )
+    maker_strategy = MakerStrategy(default_size=1.0)
+    maker_strategy.update_inventory("yes-1", "BUY", 2.0)
+    executor = _StubExecutor()
+    event_recorder = _StubEventRecorder()
+
+    executed, reason, delta = _execute_strategy_signal(
+        signal=signal,
+        config=make_test_config(dry_run=True),
+        active_markets=[market],
+        ob_analyzer=SimpleNamespace(),
+        executor=executor,
+        risk_mgr=_StubRiskManager(),
+        orchestrator=StrategyOrchestrator(total_bankroll=3.0),
+        dash_state=DashboardState(),
+        event_recorder=event_recorder,
+        maker_strategy=maker_strategy,
+        notifier=_StubNotifier(),
+    )
+
+    assert executed is True
+    assert reason == ""
+    assert delta.simulated_submissions == 1
+    assert executor.submitted["token_id"] == "yes-1"
+    assert executor.submitted["side"] == OrderSide.SELL
+    assert executor.submitted["price"] == 0.07
+    assert event_recorder.events[-1][1]["maker_side"] == "sell_yes_inventory"
+    assert event_recorder.events[-1][1]["side"] == "SELL"
 
 
 def test_collect_cross_platform_strategy_signals_maps_opportunities():

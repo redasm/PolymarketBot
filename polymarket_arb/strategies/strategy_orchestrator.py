@@ -124,6 +124,8 @@ class StrategyOrchestrator:
             "vetoed": 0,
         }
         self._overlay_history: list[dict[str, Any]] = []
+        self._last_skip_reasons: dict[str, int] = {}
+        self._last_skipped_by_tier: dict[str, int] = {}
 
     def submit_signal(
         self,
@@ -170,17 +172,28 @@ class StrategyOrchestrator:
         )
 
         to_execute: list[StrategySignal] = []
-        remaining_by_tier = self._available_by_tier()
+        requested_by_tier: dict[StrategyTier, float] = {}
+        for signal in self._pending_signals:
+            if signal.recommended_size_usdc > 0:
+                requested_by_tier[signal.tier] = (
+                    requested_by_tier.get(signal.tier, 0.0)
+                    + float(signal.recommended_size_usdc)
+                )
+        remaining_by_tier = self._effective_available_by_tier(requested_by_tier)
+        self._last_skip_reasons = {}
+        self._last_skipped_by_tier = {}
 
         for signal in self._pending_signals:
             tier = signal.tier
             available = remaining_by_tier.get(tier, 0.0)
 
             if signal.recommended_size_usdc <= 0:
+                self._record_process_skip(signal, "non_positive_size")
                 continue
             if signal.recommended_size_usdc > available:
                 adjusted = available
                 if adjusted < 1.0:
+                    self._record_process_skip(signal, "tier_budget_below_min_order")
                     continue
                 signal.recommended_size_usdc = adjusted
 
@@ -259,8 +272,17 @@ class StrategyOrchestrator:
             "executed_signals": len(self._executed_signals),
             "research_overlay": dict(self._research_overlay_stats),
             "recent_overlays": list(self._overlay_history[-10:]),
+            "last_skip_reasons": dict(self._last_skip_reasons),
+            "last_skipped_by_tier": dict(self._last_skipped_by_tier),
         }
         return status
+
+    def get_last_skip_reasons(self) -> dict[str, Any]:
+        return {
+            "reasons": dict(self._last_skip_reasons),
+            "by_tier": dict(self._last_skipped_by_tier),
+            "total": sum(self._last_skip_reasons.values()),
+        }
 
     def _available_by_tier(self) -> dict[StrategyTier, float]:
         result = {}
@@ -269,6 +291,43 @@ class StrategyOrchestrator:
             available = max(0, budget - alloc.current_exposure)
             result[tier] = available
         return result
+
+    def _effective_available_by_tier(
+        self,
+        requested_by_tier: dict[StrategyTier, float],
+    ) -> dict[StrategyTier, float]:
+        static_available = self._available_by_tier()
+        total_available = max(
+            0.0,
+            self._bankroll
+            - sum(max(0.0, alloc.current_exposure) for alloc in self._allocations.values()),
+        )
+        effective: dict[StrategyTier, float] = {}
+        for tier, available in static_available.items():
+            requested = max(0.0, float(requested_by_tier.get(tier, 0.0)))
+            effective[tier] = min(float(available), requested) if requested > 0 else 0.0
+
+        spare = max(0.0, total_available - sum(effective.values()))
+        if spare <= 1e-9:
+            return effective
+
+        unmet = {
+            tier: requested - effective.get(tier, 0.0)
+            for tier, requested in requested_by_tier.items()
+            if requested > effective.get(tier, 0.0)
+            and self._allocations.get(tier) is not None
+            and self._allocations[tier].allocation_pct > 0
+        }
+        total_unmet = sum(unmet.values())
+        if total_unmet <= 1e-9:
+            return effective
+
+        for tier, amount in unmet.items():
+            effective[tier] = effective.get(tier, 0.0) + min(
+                amount,
+                spare * (amount / total_unmet),
+            )
+        return effective
 
     def _edge_scales_by_tier(self, signals: list[StrategySignal]) -> dict[StrategyTier, float]:
         scales: dict[StrategyTier, float] = {}
@@ -290,6 +349,11 @@ class StrategyOrchestrator:
         confidence = max(0.0, min(1.0, float(signal.confidence)))
         urgency = max(0.0, min(1.0, float(signal.urgency)))
         return (urgency * 0.5) + (confidence * 0.35) + (normalized_edge * 0.15)
+
+    def _record_process_skip(self, signal: StrategySignal, reason: str) -> None:
+        self._last_skip_reasons[reason] = self._last_skip_reasons.get(reason, 0) + 1
+        tier_name = getattr(signal.tier, "name", str(signal.tier))
+        self._last_skipped_by_tier[tier_name] = self._last_skipped_by_tier.get(tier_name, 0) + 1
 
     def _apply_research_overlay(
         self,

@@ -219,6 +219,22 @@ class ArbConfig:
             raise ValueError("CLOB_HOST 和 GAMMA_HOST 不能为空")
         if self.market_fetch_limit <= 0:
             raise ValueError("ARB_MARKET_FETCH_LIMIT 必须大于 0")
+        if self.min_edge_usd < 0:
+            raise ValueError("ARB_MIN_EDGE_USD 不能为负数")
+        if self.min_edge_pct < 0:
+            raise ValueError("ARB_MIN_EDGE_PCT 不能为负数")
+        if self.max_order_size_usdc <= 0:
+            raise ValueError("ARB_MAX_ORDER_SIZE_USDC 必须大于 0")
+        if self.default_order_size_usdc <= 0:
+            raise ValueError("ARB_DEFAULT_ORDER_SIZE_USDC 必须大于 0")
+        if self.default_order_size_usdc > self.max_order_size_usdc:
+            raise ValueError("ARB_DEFAULT_ORDER_SIZE_USDC 不能大于 ARB_MAX_ORDER_SIZE_USDC")
+        if self.min_liquidity < 0 or self.min_volume_24h < 0:
+            raise ValueError("ARB_MIN_LIQUIDITY 和 ARB_MIN_VOLUME_24H 不能为负数")
+        if not 0 <= self.polymarket_taker_fee_rate < 1:
+            raise ValueError("POLYMARKET_TAKER_FEE_RATE 必须在 [0, 1) 区间")
+        if not 0 <= self.kalshi_taker_fee_rate < 1:
+            raise ValueError("KALSHI_TAKER_FEE_RATE 必须在 [0, 1) 区间")
         if self.market_universe_refresh_sec <= 0:
             raise ValueError("ARB_MARKET_UNIVERSE_REFRESH_SEC 必须大于 0")
         if self.hot_market_pool_size <= 0:

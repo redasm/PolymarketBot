@@ -736,9 +736,11 @@ def _build_directional_opportunity_from_signal(
     return opportunity, float(target_size), ""
 
 
-def _sum_trade_exposure(trades: list[Any]) -> float:
+def _sum_trade_exposure(trades: list[Any], *, include_simulated: bool = True) -> float:
     total = 0.0
     for trade in trades:
+        if not include_simulated and bool(getattr(trade, "simulated", False)):
+            continue
         leg_cost = getattr(trade, "economic_cost", None)
         if leg_cost is None:
             leg_cost = getattr(trade, "price", 0.0)
@@ -827,13 +829,14 @@ def _execute_strategy_signal(
             return False, balance_reason, ExecutionDelta()
         trades = executor.execute_arbitrage(opportunity, adj_size)
         execution_success = executor.is_successful_execution(opportunity, trades)
+        simulated_exec = bool(trades) and all(getattr(t, "simulated", False) for t in trades)
         # 无论 dry_run 与否都记录到 risk_mgr，保证持仓/敞口/冷却期追踪生效；
         # dry_run 下 trades 均为 simulated，不会触发真实订单。
         risk_mgr.record_execution(opportunity, trades)
         orchestrator.record_execution(
             signal,
             success=execution_success,
-            exposure_amount_usdc=_sum_trade_exposure(trades),
+            exposure_amount_usdc=_sum_trade_exposure(trades, include_simulated=False),
         )
         if event_recorder.is_enabled:
             event_recorder.write_event("strategy_executions", {
@@ -856,7 +859,6 @@ def _execute_strategy_signal(
                 "timestamp": trade.timestamp,
                 "simulated": trade.simulated,
             })
-        simulated_exec = bool(trades) and all(getattr(t, "simulated", False) for t in trades)
         filled_legs_count = sum(1 for t in trades if t.status == TradeStatus.FILLED)
         if execution_success:
             notifier.notify_trade_success(
@@ -896,66 +898,140 @@ def _execute_strategy_signal(
         if len(market.tokens) < 2:
             return False, "non_binary_market", ExecutionDelta()
         quote = signal.payload.get("quote", {}) if isinstance(signal.payload.get("quote", {}), dict) else {}
-        bid_price = float(quote.get("bid_price") or 0.0)
-        bid_size = float(quote.get("bid_size") or 0.0)
-        if bid_price <= 0 or bid_size <= 0:
-            return False, "maker_bid_missing", ExecutionDelta()
         yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
+        no_token = next((t for t in market.tokens if (t.outcome or "").lower() == "no"), market.tokens[-1])
+        fair_value = float(quote.get("fair_value") or 0.0)
+        bid_price = float(quote.get("bid_price") or 0.0)
+        ask_price = float(quote.get("ask_price") or 0.0)
+        bid_size = float(quote.get("bid_size") or 0.0)
+        ask_size = float(quote.get("ask_size") or 0.0)
+        bid_edge = max(0.0, fair_value - bid_price) if bid_price > 0 else 0.0
+        ask_edge = max(0.0, ask_price - fair_value) if ask_price > 0 else 0.0
+
+        yes_inventory = max(0.0, float(maker_strategy.get_inventory(yes_token.token_id)))
+        no_inventory = max(0.0, float(maker_strategy.get_inventory(no_token.token_id)))
+        candidates: list[dict[str, Any]] = []
+        if yes_inventory > 0 and ask_edge > 0 and ask_price > 0 and ask_size > 0:
+            candidates.append({
+                "is_exit": True,
+                "maker_side": "sell_yes_inventory",
+                "token": yes_token,
+                "outcome": "Yes",
+                "side": OrderSide.SELL,
+                "price": ask_price,
+                "size": min(ask_size, yes_inventory),
+                "edge": ask_edge,
+            })
+        if no_inventory > 0 and bid_edge > 0 and bid_price > 0 and bid_size > 0:
+            candidates.append({
+                "is_exit": True,
+                "maker_side": "sell_no_inventory",
+                "token": no_token,
+                "outcome": "No",
+                "side": OrderSide.SELL,
+                "price": 1.0 - bid_price,
+                "size": min(bid_size, no_inventory),
+                "edge": bid_edge,
+            })
+        if bid_edge > 0 and bid_price > 0 and bid_size > 0:
+            candidates.append({
+                "is_exit": False,
+                "maker_side": "buy_yes",
+                "token": yes_token,
+                "outcome": "Yes",
+                "side": OrderSide.BUY,
+                "price": bid_price,
+                "size": bid_size,
+                "edge": bid_edge,
+            })
+        if ask_edge > 0 and ask_price > 0 and ask_size > 0:
+            candidates.append({
+                "is_exit": False,
+                "maker_side": "buy_no_from_yes_ask",
+                "token": no_token,
+                "outcome": "No",
+                "side": OrderSide.BUY,
+                "price": 1.0 - ask_price,
+                "size": ask_size,
+                "edge": ask_edge,
+            })
+        candidates = [
+            candidate for candidate in candidates
+            if 0 < float(candidate["price"]) < 1 and float(candidate["size"]) > 0
+        ]
+        if not candidates:
+            return False, "maker_no_executable_side", ExecutionDelta()
+        chosen = max(candidates, key=lambda item: (bool(item["is_exit"]), float(item["edge"])))
+        maker_side = str(chosen["maker_side"])
+        target_token = chosen["token"]
+        target_outcome = str(chosen["outcome"])
+        target_order_side = chosen["side"]
+        target_price = float(chosen["price"])
+        target_size = float(chosen["size"])
+        side_edge = float(chosen["edge"])
         maker_opp = ArbOpportunity(
             arb_type=ArbType.MARKET_MAKING,
             event_id=market.event_id or market.condition_id,
             event_title=market.question,
             markets=[market],
-            total_cost=bid_price,
+            total_cost=target_price,
             guaranteed_payout=1.0,
-            gross_edge=max(0.0, float(quote.get("spread") or 0.0)),
-            net_edge=max(0.0, float(quote.get("spread") or 0.0)),
-            edge_pct=((float(quote.get("spread") or 0.0) / bid_price) * 100.0) if bid_price > 0 else 0.0,
+            gross_edge=side_edge,
+            net_edge=side_edge,
+            edge_pct=((side_edge / target_price) * 100.0) if target_price > 0 else 0.0,
             legs=[
                 ArbLeg(
-                    token_id=yes_token.token_id,
+                    token_id=target_token.token_id,
                     condition_id=market.condition_id,
-                    outcome="Yes",
-                    side=OrderSide.BUY,
-                    price=bid_price,
-                    size=bid_size,
-                    available_size=bid_size,
-                    execution_price=bid_price,
-                    economic_cost=bid_price,
+                    outcome=target_outcome,
+                    side=target_order_side,
+                    price=target_price,
+                    size=target_size,
+                    available_size=target_size,
+                    execution_price=target_price,
+                    economic_cost=target_price,
                 )
             ],
-            max_executable_size=bid_size,
+            max_executable_size=target_size,
             confidence=float(signal.confidence),
         )
-        can_trade, reason, adj_size = risk_mgr.pre_trade_check(maker_opp, bid_size)
-        if not can_trade:
-            return False, reason, ExecutionDelta()
-        balance_ok, balance_reason, _ = executor.ensure_sufficient_collateral(bid_price * adj_size)
-        if not balance_ok:
-            return False, balance_reason, ExecutionDelta()
+        if target_order_side == OrderSide.BUY:
+            can_trade, reason, adj_size = risk_mgr.pre_trade_check(maker_opp, target_size)
+            if not can_trade:
+                return False, reason, ExecutionDelta()
+            balance_ok, balance_reason, _ = executor.ensure_sufficient_collateral(target_price * adj_size)
+            if not balance_ok:
+                return False, balance_reason, ExecutionDelta()
+        else:
+            adj_size = target_size
         trade = executor.submit_limit_order(
-            token_id=yes_token.token_id,
+            token_id=target_token.token_id,
             condition_id=market.condition_id,
-            outcome="Yes",
-            side=OrderSide.BUY,
-            price=bid_price,
+            outcome=target_outcome,
+            side=target_order_side,
+            price=target_price,
             size=adj_size,
             post_only=True,
             order_type_name="GTC",
         )
         submission_success = trade.status in {TradeStatus.PENDING, TradeStatus.PARTIAL, TradeStatus.FILLED}
-        risk_mgr.record_execution(
-            maker_opp,
-            [trade],
-            count_pending_as_failure=False,
-        )
+        if target_order_side == OrderSide.BUY:
+            risk_mgr.record_execution(
+                maker_opp,
+                [trade],
+                count_pending_as_failure=False,
+            )
         orchestrator.record_execution(
             signal,
             success=submission_success,
-            exposure_amount_usdc=_sum_trade_exposure([trade]),
+            exposure_amount_usdc=(
+                _sum_trade_exposure([trade], include_simulated=False)
+                if target_order_side == OrderSide.BUY
+                else 0.0
+            ),
         )
         if trade.status == TradeStatus.FILLED and trade.fill_size:
-            maker_strategy.update_inventory(yes_token.token_id, "BUY", float(trade.fill_size))
+            maker_strategy.update_inventory(target_token.token_id, target_order_side.value, float(trade.fill_size))
         dash_state.append_trade({
             "trade_id": trade.trade_id,
             "arb_id": trade.arb_id,
@@ -975,17 +1051,21 @@ def _execute_strategy_signal(
                 "market_id": signal.market_id,
                 "status": "submitted" if submission_success else "failed",
                 "trade_status": trade.status.value,
+                "maker_side": maker_side,
+                "outcome": target_outcome,
+                "side": target_order_side.value,
+                "expected_edge_per_share": side_edge,
                 "post_only": True,
             })
         simulated_maker = bool(getattr(trade, "simulated", False))
-        spread_usdc = float(quote.get("spread") or 0.0)
+        expected_edge_usdc = side_edge
         if trade.status == TradeStatus.FILLED:
             notifier.notify_trade_success(
                 event_title=market.question,
                 arb_type="T3_market_making",
                 filled_legs=1,
                 total_legs=1,
-                expected_profit=spread_usdc * float(trade.fill_size or adj_size),
+                expected_profit=expected_edge_usdc * float(trade.fill_size or adj_size),
                 simulated=simulated_maker,
             )
         elif trade.status in (TradeStatus.FAILED, TradeStatus.CANCELLED) and not config.dry_run:
@@ -1002,10 +1082,10 @@ def _execute_strategy_signal(
                 filled_size = float(trade.fill_size or adj_size)
                 if simulated_maker:
                     delta.simulated_successes = 1
-                    delta.simulated_profit_total = spread_usdc * filled_size
+                    delta.simulated_profit_total = expected_edge_usdc * filled_size
                 else:
                     delta.live_successes = 1
-                    delta.live_profit_total = spread_usdc * filled_size
+                    delta.live_profit_total = expected_edge_usdc * filled_size
             else:
                 if simulated_maker:
                     delta.simulated_submissions = 1
@@ -1956,7 +2036,8 @@ def main(dotenv_path: str | None = None) -> None:
                 continue
 
             trades = executor.execute_arbitrage(verified, adj_size)
-            risk_mgr.record_execution(verified, trades)
+            if not _has_simulated_trades(trades):
+                risk_mgr.record_execution(verified, trades)
             live_execution_success = _is_live_execution_success(config, executor, verified, trades)
             trade_payload = _serialize_trade_execution(verified, trades, live_execution_success, adj_size)
             event_recorder.write_event("trades", trade_payload)
@@ -2034,7 +2115,20 @@ def main(dotenv_path: str | None = None) -> None:
         ]
         insufficient_balance_skips: dict[str, int] = {}
         insufficient_balance_last_reason: str = ""
-        for processed_signal in orchestrator.process_signals():
+        processed_signals = orchestrator.process_signals()
+        process_skip_summary = orchestrator.get_last_skip_reasons()
+        if process_skip_summary.get("total") and event_recorder.is_enabled:
+            event_recorder.write_event("strategy_executions", {
+                "tier": "AGGREGATE",
+                "signal_type": "orchestrator_skipped",
+                "market_id": "",
+                "status": "skipped",
+                "reason": "orchestrator_process_filter",
+                "skip_reasons": process_skip_summary.get("reasons", {}),
+                "count_by_tier": process_skip_summary.get("by_tier", {}),
+                "total": process_skip_summary.get("total", 0),
+            })
+        for processed_signal in processed_signals:
             executed, reason, delta = _execute_strategy_signal(
                 signal=processed_signal,
                 config=config,
