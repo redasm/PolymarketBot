@@ -43,6 +43,44 @@ def test_build_trading_client_uses_create_or_derive_api_creds(monkeypatch):
     assert calls[1]["creds"] == {"api_key": "k", "api_secret": "s", "api_passphrase": "p"}
 
 
+def test_build_trading_client_supports_v2_api_key_method(monkeypatch):
+    calls: list[dict] = []
+
+    class _FakeV2ClobClient:
+        def __init__(self, host, chain_id=None, key=None, creds=None, signature_type=None, funder=None, **kwargs):
+            calls.append(
+                {
+                    "host": host,
+                    "chain_id": chain_id,
+                    "key": key,
+                    "creds": creds,
+                    "signature_type": signature_type,
+                    "funder": funder,
+                }
+            )
+            self._creds = {"api_key": "v2-k", "api_secret": "v2-s", "api_passphrase": "v2-p"}
+
+        def create_or_derive_api_key(self):
+            return self._creds
+
+    fake_module = types.ModuleType("py_clob_client_v2")
+    fake_module.ClobClient = _FakeV2ClobClient
+    monkeypatch.setitem(sys.modules, "py_clob_client_v2", fake_module)
+
+    cfg = make_test_config(
+        dry_run=False,
+        clob_client_version="v2",
+        signature_type=2,
+        funder_address="0xabc123456789",
+    )
+    client = build_trading_client(cfg)
+
+    assert client is not None
+    assert len(calls) == 2
+    assert calls[0]["key"] == "0xdead"
+    assert calls[1]["creds"] == {"api_key": "v2-k", "api_secret": "v2-s", "api_passphrase": "v2-p"}
+
+
 def test_build_trading_client_raises_when_creds_missing(monkeypatch):
     class _FakeClobClient:
         def __init__(self, *args, **kwargs):

@@ -168,7 +168,10 @@ class ExecutionEngine:
     def _resolve_named_order_type(self, name: str) -> Any:
         if self._config.dry_run:
             return name
-        from py_clob_client.clob_types import OrderType
+        try:
+            from py_clob_client_v2 import OrderType
+        except ImportError:
+            from py_clob_client.clob_types import OrderType
 
         return getattr(OrderType, name, None)
 
@@ -183,6 +186,35 @@ class ExecutionEngine:
         post_only: bool = False,
     ) -> OrderSubmissionResult:
         """提交单笔订单到 CLOB."""
+        if hasattr(self._client, "create_and_post_order"):
+            return self._submit_order_v2(
+                token_id,
+                side,
+                price,
+                size,
+                order_type=order_type,
+                post_only=post_only,
+            )
+
+        return self._submit_order_v1(
+            token_id,
+            side,
+            price,
+            size,
+            order_type=order_type,
+            post_only=post_only,
+        )
+
+    def _submit_order_v1(
+        self,
+        token_id: str,
+        side: OrderSide,
+        price: float,
+        size: float,
+        *,
+        order_type: Any | None = None,
+        post_only: bool = False,
+    ) -> OrderSubmissionResult:
         from py_clob_client.clob_types import (
             OrderArgs,
             PartialCreateOrderOptions,
@@ -206,7 +238,38 @@ class ExecutionEngine:
             signed_order, orderType=execution_type, post_only=post_only
         )
         self.invalidate_balance_cache()
+        return self._parse_order_submission_response(resp, execution_type=execution_type)
 
+    def _submit_order_v2(
+        self,
+        token_id: str,
+        side: OrderSide,
+        price: float,
+        size: float,
+        *,
+        order_type: Any | None = None,
+        post_only: bool = False,
+    ) -> OrderSubmissionResult:
+        from py_clob_client_v2 import OrderArgs, PartialCreateOrderOptions, Side
+
+        clob_side = Side.BUY if side == OrderSide.BUY else Side.SELL
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=float(price),
+            size=float(size),
+            side=clob_side,
+        )
+        execution_type = order_type if order_type is not None else self._execution_order_type
+        resp = self._client.create_and_post_order(
+            order_args=order_args,
+            options=PartialCreateOrderOptions(tick_size="0.01"),
+            order_type=execution_type,
+            post_only=post_only,
+        )
+        self.invalidate_balance_cache()
+        return self._parse_order_submission_response(resp, execution_type=execution_type)
+
+    def _parse_order_submission_response(self, resp: Any, *, execution_type: Any) -> OrderSubmissionResult:
         order_id = ""
         success = False
         remote_status = ""

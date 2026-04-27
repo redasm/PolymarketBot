@@ -123,6 +123,11 @@ class StrategyOrchestrator:
             "penalized": 0,
             "vetoed": 0,
         }
+        self._tail_risk_stats = {
+            "applied": 0,
+            "penalized": 0,
+            "high_risk": 0,
+        }
         self._overlay_history: list[dict[str, Any]] = []
         self._last_skip_reasons: dict[str, int] = {}
         self._last_skipped_by_tier: dict[str, int] = {}
@@ -152,6 +157,12 @@ class StrategyOrchestrator:
                 overlay.get("reasons", []),
             )
             return False
+        tail_risk = self._apply_tail_risk_adjustment(
+            signal_copy,
+            active_markets=active_markets or [],
+        )
+        signal_copy.payload["tail_risk"] = tail_risk
+        self._record_tail_risk(tail_risk)
         self._pending_signals.append(signal_copy)
         return True
 
@@ -271,6 +282,7 @@ class StrategyOrchestrator:
             "pending_signals": len(self._pending_signals),
             "executed_signals": len(self._executed_signals),
             "research_overlay": dict(self._research_overlay_stats),
+            "tail_risk": dict(self._tail_risk_stats),
             "recent_overlays": list(self._overlay_history[-10:]),
             "last_skip_reasons": dict(self._last_skip_reasons),
             "last_skipped_by_tier": dict(self._last_skipped_by_tier),
@@ -419,6 +431,45 @@ class StrategyOrchestrator:
             confidence_delta -= 0.05
             reasons.append("mixed_research_stance")
 
+        source_diversity = len({
+            str(source)
+            for row in matched_rows
+            for source in row.get("sources", [])
+            if str(source)
+        })
+        aligned_rows = [
+            row for row in matched_rows
+            if (
+                (action == "BUY_YES" and row.get("stance") == "bullish")
+                or (action == "BUY_NO" and row.get("stance") == "bearish")
+            )
+        ]
+        conflict_rows = [
+            row for row in matched_rows
+            if (
+                (action == "BUY_YES" and row.get("stance") == "bearish")
+                or (action == "BUY_NO" and row.get("stance") == "bullish")
+            )
+        ]
+        resonance_score = self._research_resonance_score(
+            matched_count=len(matched_rows),
+            source_diversity=source_diversity,
+            avg_confidence=avg_conf,
+            aligned_count=len(aligned_rows),
+            conflict_count=len(conflict_rows),
+        )
+        if resonance_score >= 0.70 and aligned and not mixed:
+            size_multiplier *= 1.08
+            confidence_delta += 0.04
+            reasons.append("research_resonance")
+        elif resonance_score <= -0.70 and conflicting and not mixed:
+            size_multiplier *= 0.75
+            confidence_delta -= 0.05
+            reasons.append("conflicting_research_resonance")
+            if len(conflict_rows) >= 3 and avg_conf >= 0.78:
+                veto = True
+                reasons.append("three_signal_conflict_veto")
+
         if avg_freshness > 6 * 3600:
             size_multiplier *= 0.85
             confidence_delta -= 0.03
@@ -428,7 +479,7 @@ class StrategyOrchestrator:
             size_multiplier *= 0.90
             reasons.append("weak_research_coverage")
 
-        size_multiplier = max(0.25, min(1.25, size_multiplier))
+        size_multiplier = max(0.25, min(1.35, size_multiplier))
         signal.confidence = max(0.0, min(1.0, signal.confidence + confidence_delta))
         signal.recommended_size_usdc = max(0.0, signal.recommended_size_usdc * size_multiplier)
 
@@ -442,11 +493,103 @@ class StrategyOrchestrator:
             "dominant_stance": dominant_stance,
             "avg_confidence": round(avg_conf, 3),
             "avg_freshness_sec": round(avg_freshness, 1),
+            "source_diversity": source_diversity,
+            "resonance_score": round(resonance_score, 3),
             "size_multiplier": round(size_multiplier, 3),
             "confidence_delta": round(confidence_delta, 3),
             "reasons": reasons,
             "source_counts": source_counts,
         }
+
+    def _research_resonance_score(
+        self,
+        *,
+        matched_count: int,
+        source_diversity: int,
+        avg_confidence: float,
+        aligned_count: int,
+        conflict_count: int,
+    ) -> float:
+        if matched_count <= 0:
+            return 0.0
+        directional = aligned_count - conflict_count
+        direction_strength = directional / max(1, matched_count)
+        coverage = min(1.0, matched_count / 3.0)
+        diversity = min(1.0, source_diversity / 3.0)
+        confidence = max(0.0, min(1.0, avg_confidence))
+        return direction_strength * ((coverage * 0.40) + (diversity * 0.25) + (confidence * 0.35))
+
+    def _apply_tail_risk_adjustment(
+        self,
+        signal: StrategySignal,
+        *,
+        active_markets: list[Any],
+    ) -> dict[str, Any]:
+        action = self._resolve_signal_action(signal)
+        if signal.tier not in {StrategyTier.STATISTICAL_ARB, StrategyTier.CROSS_PLATFORM}:
+            return {"applied": False, "risk_class": "not_applicable", "size_multiplier": 1.0, "reasons": []}
+        if action not in {"BUY_YES", "BUY_NO"}:
+            return {"applied": False, "risk_class": "not_directional", "size_multiplier": 1.0, "reasons": []}
+
+        market = self._find_market(signal.market_id, active_markets)
+        text = self._tail_risk_text(signal, market)
+        risk_class, multiplier, confidence_delta, reasons = self._classify_tail_risk(text)
+        signal.recommended_size_usdc = max(0.0, signal.recommended_size_usdc * multiplier)
+        signal.confidence = max(0.0, min(1.0, signal.confidence + confidence_delta))
+        return {
+            "applied": True,
+            "risk_class": risk_class,
+            "size_multiplier": round(multiplier, 3),
+            "confidence_delta": round(confidence_delta, 3),
+            "reasons": reasons,
+        }
+
+    def _tail_risk_text(self, signal: StrategySignal, market: Any | None) -> str:
+        parts = [signal.description, signal.market_id]
+        if market is not None:
+            parts.extend([
+                getattr(market, "question", ""),
+                getattr(market, "event_title", ""),
+                getattr(market, "event_slug", ""),
+                getattr(market, "slug", ""),
+            ])
+            raw = getattr(market, "raw", {}) or {}
+            for key in ("description", "category", "tags", "game_start_time", "resolutionSource"):
+                parts.append(str(raw.get(key, "")))
+        return " ".join(part for part in parts if part).lower()
+
+    def _classify_tail_risk(self, text: str) -> tuple[str, float, float, list[str]]:
+        high_keywords = (
+            "war", "ceasefire", "missile", "invasion", "iran", "israel", "russia", "ukraine",
+            "china", "taiwan", "geopolit", "hostage", "terror", "coup", "nuclear", "assassination",
+            "supreme court", "resign", "death", "fired", "will trump", "will biden",
+        )
+        medium_keywords = (
+            "election", "president", "nominee", "crypto", "bitcoin", "btc", "ethereum", "eth",
+            "solana", "fed", "fomc", "rate cut", "cpi", "inflation", "sec", "lawsuit",
+        )
+        low_keywords = (
+            "economic data", "jobless", "payroll", "unemployment", "gdp", "pce", "cpi",
+            "sports", "nba", "nfl", "mlb", "nhl", "weather",
+        )
+
+        if any(keyword in text for keyword in high_keywords):
+            return "high_tail", 0.50, -0.10, ["tail_risk_high", "kelly_fraction_discount"]
+        if any(keyword in text for keyword in medium_keywords):
+            return "medium_tail", 1.0, 0.0, ["tail_risk_medium"]
+        if any(keyword in text for keyword in low_keywords):
+            return "data_driven", 1.0, 0.0, ["tail_risk_low"]
+        return "unknown", 1.0, 0.0, ["tail_risk_unknown"]
+
+    def _record_tail_risk(self, tail_risk: dict[str, Any]) -> None:
+        if not tail_risk.get("applied"):
+            return
+        self._tail_risk_stats["applied"] += 1
+        multiplier = float(tail_risk.get("size_multiplier", 1.0))
+        if multiplier < 1.0:
+            self._tail_risk_stats["penalized"] += 1
+        if tail_risk.get("risk_class") == "high_tail":
+            self._tail_risk_stats["high_risk"] += 1
 
     def _match_research_rows(
         self,

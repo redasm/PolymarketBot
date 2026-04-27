@@ -59,6 +59,7 @@ class ArbConfig:
     # 端点
     clob_host: str
     gamma_host: str
+    clob_client_version: str
 
     # 套利参数
     min_edge_usd: float
@@ -72,6 +73,12 @@ class ArbConfig:
     hot_event_pool_size: int
     market_focus_keywords: str
     dry_run: bool
+    live_trading_ack: bool
+    live_require_portfolio_sync: bool
+    live_allow_zero_taker_fee: bool
+    live_max_order_size_usdc: float
+    live_max_total_exposure_usdc: float
+    maker_strategy_enabled: bool
     min_liquidity: float
     min_volume_24h: float
     orderbook_snapshot_ttl_sec: float
@@ -217,6 +224,8 @@ class ArbConfig:
     def validate(self) -> None:
         if not self.clob_host or not self.gamma_host:
             raise ValueError("CLOB_HOST 和 GAMMA_HOST 不能为空")
+        if self.clob_client_version not in {"auto", "v1", "v2"}:
+            raise ValueError("POLYMARKET_CLOB_CLIENT_VERSION 必须是 auto / v1 / v2")
         if self.market_fetch_limit <= 0:
             raise ValueError("ARB_MARKET_FETCH_LIMIT 必须大于 0")
         if self.min_edge_usd < 0:
@@ -229,6 +238,10 @@ class ArbConfig:
             raise ValueError("ARB_DEFAULT_ORDER_SIZE_USDC 必须大于 0")
         if self.default_order_size_usdc > self.max_order_size_usdc:
             raise ValueError("ARB_DEFAULT_ORDER_SIZE_USDC 不能大于 ARB_MAX_ORDER_SIZE_USDC")
+        if self.live_max_order_size_usdc <= 0:
+            raise ValueError("LIVE_MAX_ORDER_SIZE_USDC 必须大于 0")
+        if self.live_max_total_exposure_usdc <= 0:
+            raise ValueError("LIVE_MAX_TOTAL_EXPOSURE_USDC 必须大于 0")
         if self.min_liquidity < 0 or self.min_volume_24h < 0:
             raise ValueError("ARB_MIN_LIQUIDITY 和 ARB_MIN_VOLUME_24H 不能为负数")
         if not 0 <= self.polymarket_taker_fee_rate < 1:
@@ -334,6 +347,17 @@ class ArbConfig:
             raise ValueError("T2_MIN_TOP_DEPTH 不能为负数")
         if self.t2_max_complement_error_bps < 0:
             raise ValueError("T2_MAX_COMPLEMENT_ERROR_BPS 不能为负数")
+        if not self.dry_run:
+            if not self.live_trading_ack:
+                raise ValueError("实盘前必须设置 LIVE_TRADING_ACK=true")
+            if self.live_require_portfolio_sync and not self.portfolio_sync_enabled:
+                raise ValueError("实盘前必须启用 PORTFOLIO_SYNC_ENABLED=true 或设置 LIVE_REQUIRE_PORTFOLIO_SYNC=false")
+            if not self.live_allow_zero_taker_fee and self.polymarket_taker_fee_rate <= 0:
+                raise ValueError("实盘前 POLYMARKET_TAKER_FEE_RATE 不能为 0，除非设置 LIVE_ALLOW_ZERO_TAKER_FEE=true")
+            if self.max_order_size_usdc > self.live_max_order_size_usdc:
+                raise ValueError("ARB_MAX_ORDER_SIZE_USDC 超过 LIVE_MAX_ORDER_SIZE_USDC")
+            if self.max_total_exposure > self.live_max_total_exposure_usdc:
+                raise ValueError("RISK_MAX_TOTAL_EXPOSURE 超过 LIVE_MAX_TOTAL_EXPOSURE_USDC")
 
     @classmethod
     def from_env(
@@ -366,6 +390,7 @@ class ArbConfig:
             chain_id=_env_int("CHAIN_ID", 137),
             clob_host=_env("CLOB_HOST", "https://clob.polymarket.com"),
             gamma_host=_env("GAMMA_HOST", "https://gamma-api.polymarket.com"),
+            clob_client_version=_env("POLYMARKET_CLOB_CLIENT_VERSION", "auto").lower() or "auto",
             min_edge_usd=_env_float("ARB_MIN_EDGE_USD", 0.005),
             min_edge_pct=_env_float("ARB_MIN_EDGE_PCT", 0.3),
             max_order_size_usdc=_env_float("ARB_MAX_ORDER_SIZE_USDC", 50.0),
@@ -377,6 +402,12 @@ class ArbConfig:
             hot_event_pool_size=_env_int("ARB_HOT_EVENT_POOL_SIZE", 30),
             market_focus_keywords=_env("ARB_MARKET_FOCUS_KEYWORDS", ""),
             dry_run=_env_bool("ARB_DRY_RUN", True),
+            live_trading_ack=_env_bool("LIVE_TRADING_ACK", False),
+            live_require_portfolio_sync=_env_bool("LIVE_REQUIRE_PORTFOLIO_SYNC", True),
+            live_allow_zero_taker_fee=_env_bool("LIVE_ALLOW_ZERO_TAKER_FEE", False),
+            live_max_order_size_usdc=_env_float("LIVE_MAX_ORDER_SIZE_USDC", 10.0),
+            live_max_total_exposure_usdc=_env_float("LIVE_MAX_TOTAL_EXPOSURE_USDC", 100.0),
+            maker_strategy_enabled=_env_bool("MAKER_STRATEGY_ENABLED", True),
             min_liquidity=_env_float("ARB_MIN_LIQUIDITY", 1000.0),
             min_volume_24h=_env_float("ARB_MIN_VOLUME_24H", 500.0),
             orderbook_snapshot_ttl_sec=_env_float("ORDERBOOK_SNAPSHOT_TTL_SEC", 0.5),

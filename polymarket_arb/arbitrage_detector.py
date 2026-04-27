@@ -87,7 +87,10 @@ class ArbitrageDetector:
 
         total_cost = ask_yes + ask_no
         gross_edge = PAYOUT_PER_SHARE - total_cost
-        fee = self._fees.estimate_fee(total_cost, num_legs=2)
+        fee = FeeStructure.for_market(
+            self._config.polymarket_taker_fee_rate,
+            market,
+        ).estimate_leg_fees([ask_yes, ask_no])
         net_edge = gross_edge - fee
 
         if net_edge <= 0:
@@ -201,7 +204,15 @@ class ArbitrageDetector:
                 return None
 
         gross_edge = PAYOUT_PER_SHARE - total_ask_cost
-        fee = self._fees.estimate_fee(total_ask_cost, num_legs=len(legs))
+        fee = sum(
+            FeeStructure.for_market(
+                self._config.polymarket_taker_fee_rate,
+                market,
+            ).estimate_price_fee(
+                float(leg.execution_price if leg.execution_price is not None else leg.price)
+            )
+            for market, leg in zip(active_markets, legs)
+        )
         net_edge = gross_edge - fee
 
         if net_edge <= 0:
@@ -354,7 +365,16 @@ class ArbitrageDetector:
             )
 
         gross_edge = PAYOUT_PER_SHARE - total_vwap_cost
-        fee = self._fees.estimate_fee(total_vwap_cost, num_legs=len(verified_legs))
+        markets_by_condition = {market.condition_id: market for market in opp.markets}
+        fee = sum(
+            FeeStructure.for_market(
+                self._config.polymarket_taker_fee_rate,
+                markets_by_condition.get(leg.condition_id),
+            ).estimate_price_fee(
+                float(leg.execution_price if leg.execution_price is not None else leg.price)
+            )
+            for leg in verified_legs
+        )
         net_edge = gross_edge - fee
 
         if net_edge <= 0:

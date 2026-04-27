@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from research.backtest.features import summarize_binary_microstructure
+from research.backtest.execution_model.base import estimate_binary_clob_fee
 from polymarket_arb.strategies.statistical_model import ProbabilityEstimate, StatisticalMispricingDetector
 
 
@@ -104,7 +105,7 @@ class T2BacktestAdapter:
             return 0.0, {"exit_price": None, "markout_bps": None}
 
         gross = (float(exit_mid) - execution_price) * filled_size
-        exit_fee = float(exit_mid) * filled_size * exit_fee_rate
+        exit_fee = estimate_binary_clob_fee(float(exit_mid), filled_size, exit_fee_rate)
         pnl = gross - entry_fees - exit_fee
         markout_bps = ((float(exit_mid) - execution_price) / execution_price) * 10_000.0 if execution_price > 0 else None
         return pnl, {"exit_price": float(exit_mid), "markout_bps": markout_bps}

@@ -126,7 +126,7 @@
 
 ### P1：应在小额实盘前处理
 
-- 手续费模型应与当前加密市场官方费率机制重新对齐
+- 手续费模型已改为 CLOB `feeRate * price * (1-price)` 本地估算；小额实盘前仍需按市场核实 `feesEnabled/getClobMarketInfo`
 - 面板应明确区分“理论机会”“模拟执行”“真实执行”
 - 需要把真实成交后的收益、失败、部分成交单独统计
 
@@ -208,6 +208,26 @@
 - 单市场上限：`25 USDC`
 - 总敞口上限：`100 USDC`
 - 日亏损上限：`10 USDC`
+
+当前仓库已增加第一道实盘闸门：
+
+- `ARB_DRY_RUN=false`
+- `LIVE_TRADING_ACK=true`
+- `PORTFOLIO_SYNC_ENABLED=true`（除非显式设置 `LIVE_REQUIRE_PORTFOLIO_SYNC=false`）
+- `POLYMARKET_TAKER_FEE_RATE>0`（除非显式设置 `LIVE_ALLOW_ZERO_TAKER_FEE=true`）
+- `ARB_MAX_ORDER_SIZE_USDC<=LIVE_MAX_ORDER_SIZE_USDC`
+- `RISK_MAX_TOTAL_EXPOSURE<=LIVE_MAX_TOTAL_EXPOSURE_USDC`
+
+首笔真钱验证建议使用 `polymarket_only_canary_10usd.env.example` 作为模板。该模板默认：
+
+- 单笔上限 `1.5 USDC`
+- 总敞口上限 `3 USDC`
+- `MAKER_STRATEGY_ENABLED=false`
+- `POLYMARKET_TAKER_FEE_RATE=0.072`
+- `POLYMARKET_CLOB_CLIENT_VERSION=auto`
+- CLOB V2/HTTP 传输错误仍需在 dry-run 与 1 USDC canary 中继续观察
+
+这样先验证余额、签名、下单、失败处理、账户同步和通知链路，再考虑打开 T3 做市。
 
 升级条件：
 

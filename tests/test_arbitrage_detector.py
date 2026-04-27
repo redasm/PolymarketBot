@@ -3,9 +3,47 @@
 import pytest
 
 from polymarket_arb.arbitrage_detector import ArbitrageDetector
-from polymarket_arb.models import EventInfo, MarketInfo, TokenInfo
+from polymarket_arb.models import EventInfo, FeeStructure, MarketInfo, TokenInfo
 
 from tests.conftest import MockOrderBookAnalyzer, make_test_config
+
+
+def test_fee_structure_uses_clob_price_shape():
+    fees = FeeStructure(taker_fee_rate=0.072)
+
+    assert fees.estimate_price_fee(0.5) == pytest.approx(0.018)
+    assert fees.estimate_price_fee(0.9) == pytest.approx(0.00648)
+    assert fees.estimate_leg_fees([0.45, 0.50]) == pytest.approx(0.072 * (0.45 * 0.55 + 0.5 * 0.5))
+
+
+def test_fee_structure_uses_market_fee_metadata():
+    market = MarketInfo(
+        condition_id="c1",
+        question="Crypto market?",
+        slug="crypto",
+        tokens=[],
+        raw={"feesEnabled": True, "feeRateBps": 720},
+    )
+
+    fees = FeeStructure.for_market(0.02, market)
+
+    assert fees.taker_fee_rate == pytest.approx(0.072)
+    assert fees.estimate_price_fee(0.50) == pytest.approx(0.018)
+
+
+def test_fee_structure_honors_fee_disabled_market():
+    market = MarketInfo(
+        condition_id="c1",
+        question="No fee market?",
+        slug="nofee",
+        tokens=[],
+        raw={"feesEnabled": False, "feeRateBps": 720},
+    )
+
+    fees = FeeStructure.for_market(0.02, market)
+
+    assert fees.taker_fee_rate == 0.0
+    assert fees.estimate_price_fee(0.50) == 0.0
 
 
 class TestBinaryArbDetection:
@@ -34,6 +72,7 @@ class TestBinaryArbDetection:
         assert opp is not None
         assert opp.total_cost == pytest.approx(0.95, abs=0.001)
         assert opp.gross_edge == pytest.approx(0.05, abs=0.001)
+        assert opp.net_edge == pytest.approx(0.05 - 0.02 * (0.45 * 0.55 + 0.50 * 0.50), abs=0.001)
         assert opp.net_edge > 0
         assert opp.is_profitable
         assert len(opp.legs) == 2
@@ -125,8 +164,8 @@ class TestBinaryArbDetection:
 
     def test_edge_below_threshold_filtered(self, make_snapshot):
         snapshots = {
-            "0xyes": make_snapshot(token_id="0xyes", best_ask=0.49),
-            "0xno": make_snapshot(token_id="0xno", best_ask=0.49),
+            "0xyes": make_snapshot(token_id="0xyes", best_ask=0.493),
+            "0xno": make_snapshot(token_id="0xno", best_ask=0.493),
         }
         market = MarketInfo(
             condition_id="c1",

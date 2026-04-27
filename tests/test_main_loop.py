@@ -5,11 +5,14 @@ from pathlib import Path
 from types import SimpleNamespace
 import time
 
+import pytest
+
 from polymarket_arb.dashboard_api import _enrich_ai_decision
 from polymarket_arb.market_scanner import MarketScanner
 from polymarket_arb.main_loop import (
     _build_cycle_summary_payload,
     _build_dashboard_trade_rows,
+    _build_directional_opportunity_from_signal,
     _emit_cycle_metrics,
     _collect_cross_platform_strategy_signals,
     _collect_maker_strategy_signals,
@@ -32,6 +35,7 @@ from polymarket_arb.main_loop import (
     _build_ws_status,
     _create_research_signal_service,
     _is_live_execution_success,
+    _apply_maker_fill_to_inventory,
     _matches_focus,
     _merge_focus_event_markets,
     _refresh_market_universe,
@@ -1207,6 +1211,61 @@ def test_evaluate_t2_market_quality_reports_reasons():
     assert "top_depth_too_low" in quality["reasons"]
 
 
+def test_build_directional_opportunity_uses_clob_fee_shape():
+    class _Snapshot:
+        def __init__(self, best_ask):
+            self.best_ask = best_ask
+            self.best_bid = best_ask - 0.01
+            self.asks = [type("Level", (), {"price": best_ask, "size": 100.0})()]
+            self.bids = [type("Level", (), {"price": self.best_bid, "size": 100.0})()]
+
+        @property
+        def mid(self):
+            return (self.best_bid + self.best_ask) / 2.0
+
+        @property
+        def best_ask_size(self):
+            return self.asks[0].size
+
+    class _StubOrderBookAnalyzer:
+        def get_snapshot(self, token_id):
+            return _Snapshot(0.50)
+
+        def get_executable_ask_price(self, token_id, target_size):
+            return (0.50, target_size)
+
+    market = MarketInfo(
+        condition_id="cond-1",
+        question="Will BTC rise?",
+        slug="btc-rise",
+        tokens=[TokenInfo("yes-1", "Yes"), TokenInfo("no-1", "No")],
+    )
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id="cond-1",
+        description="test",
+        expected_edge=200.0,
+        confidence=0.8,
+        recommended_size_usdc=1.0,
+        payload={"deviation": 0.02, "model_prob": 0.52, "market_prob": 0.50},
+    )
+
+    opportunity, target_size, reason = _build_directional_opportunity_from_signal(
+        config=make_test_config(polymarket_taker_fee_rate=0.072),
+        signal=signal,
+        market=market,
+        ob_analyzer=_StubOrderBookAnalyzer(),
+    )
+
+    assert reason == ""
+    assert opportunity is not None
+    assert target_size == pytest.approx(2.0)
+    assert opportunity.net_edge == pytest.approx(0.02 - 0.072 * 0.5 * 0.5)
+    assert signal.payload["execution_check"]["fee_estimate"] == pytest.approx(0.018)
+    assert signal.payload["execution_check"]["net_edge_bps"] == pytest.approx(20.0)
+
+
 def test_collect_maker_strategy_signals_use_snapshot_tick_size():
     class _Snapshot:
         def __init__(self, best_bid, best_ask, bid_size, ask_size, tick_size):
@@ -1501,6 +1560,34 @@ def test_execute_maker_quote_prefers_selling_existing_inventory():
     assert executor.submitted["price"] == 0.07
     assert event_recorder.events[-1][1]["maker_side"] == "sell_yes_inventory"
     assert event_recorder.events[-1][1]["side"] == "SELL"
+
+
+def test_apply_maker_fill_to_inventory_accounts_only_new_fill_delta():
+    maker_strategy = MakerStrategy(default_size=1.0)
+    trade = TradeRecord(
+        "trade-1",
+        "arb-1",
+        "yes-1",
+        "cond-1",
+        OrderSide.SELL,
+        0.07,
+        3.0,
+        status=TradeStatus.PARTIAL,
+        fill_size=1.0,
+        post_only=True,
+        order_type_name="GTC",
+    )
+    maker_strategy.update_inventory("yes-1", "BUY", 3.0)
+
+    first_delta = _apply_maker_fill_to_inventory(maker_strategy, trade)
+    trade.fill_size = 2.5
+    second_delta = _apply_maker_fill_to_inventory(maker_strategy, trade)
+    third_delta = _apply_maker_fill_to_inventory(maker_strategy, trade)
+
+    assert first_delta == 1.0
+    assert second_delta == 1.5
+    assert third_delta == 0.0
+    assert maker_strategy.get_inventory("yes-1") == 0.5
 
 
 def test_collect_cross_platform_strategy_signals_maps_opportunities():

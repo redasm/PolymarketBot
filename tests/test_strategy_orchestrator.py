@@ -70,6 +70,58 @@ def test_research_overlay_boosts_aligned_signal():
     assert signal.recommended_size_usdc == 100.0
 
 
+def test_research_overlay_adds_resonance_for_three_aligned_sources():
+    orchestrator = StrategyOrchestrator(total_bankroll=1000)
+    market = _make_market()
+    market.raw["research_signals"] = [
+        ResearchSignal(
+            topic_id="event:event-1-a",
+            event_candidates=["event-1"],
+            summary="BTC momentum remains strong",
+            sources=["google_news_rss"],
+            confidence=0.74,
+            freshness_sec=60.0,
+            stance="bullish",
+        ).to_dict(),
+        ResearchSignal(
+            topic_id="event:event-1-b",
+            event_candidates=["event-1"],
+            summary="Order flow favors upside",
+            sources=["polymarket_market"],
+            confidence=0.70,
+            freshness_sec=90.0,
+            stance="bullish",
+        ).to_dict(),
+        ResearchSignal(
+            topic_id="event:event-1-c",
+            event_candidates=["event-1"],
+            summary="Local model agrees with upside",
+            sources=["local_kb"],
+            confidence=0.72,
+            freshness_sec=120.0,
+            stance="bullish",
+        ).to_dict(),
+    ]
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="ai_buy_yes",
+        market_id=market.condition_id[:12],
+        description="LLM sees positive edge",
+        expected_edge=80.0,
+        confidence=0.60,
+        recommended_size_usdc=100.0,
+    )
+
+    assert orchestrator.submit_signal(signal, active_markets=[market]) is True
+    ready = orchestrator.process_signals()
+    overlay = ready[0].payload["research_overlay"]
+
+    assert "research_resonance" in overlay["reasons"]
+    assert overlay["source_diversity"] == 3
+    assert overlay["resonance_score"] >= 0.70
+    assert ready[0].recommended_size_usdc > 110.0
+
+
 def test_research_overlay_penalizes_but_does_not_veto_two_row_conflict():
     orchestrator = StrategyOrchestrator(total_bankroll=1000)
     market = _make_market()
@@ -120,6 +172,32 @@ def test_research_overlay_penalizes_but_does_not_veto_two_row_conflict():
     assert ready[0].recommended_size_usdc < 100.0
     assert ready[0].confidence < 0.65
     assert status["meta"]["research_overlay"]["vetoed"] == 0
+
+
+def test_tail_risk_discount_reduces_directional_high_tail_signal():
+    orchestrator = StrategyOrchestrator(total_bankroll=1000)
+    market = _make_market()
+    market.question = "Will there be an Iran Israel ceasefire this week?"
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="ai_buy_yes",
+        market_id=market.condition_id[:12],
+        description="directional edge",
+        expected_edge=90.0,
+        confidence=0.70,
+        recommended_size_usdc=100.0,
+    )
+
+    assert orchestrator.submit_signal(signal, active_markets=[market]) is True
+    ready = orchestrator.process_signals()
+    tail_risk = ready[0].payload["tail_risk"]
+    status = orchestrator.get_status()
+
+    assert tail_risk["risk_class"] == "high_tail"
+    assert tail_risk["size_multiplier"] == 0.5
+    assert ready[0].recommended_size_usdc == 50.0
+    assert ready[0].confidence == 0.60
+    assert status["meta"]["tail_risk"]["high_risk"] == 1
 
 
 def test_research_overlay_vetoes_only_on_three_row_high_conflict():

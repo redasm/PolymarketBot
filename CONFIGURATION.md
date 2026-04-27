@@ -130,8 +130,8 @@ Polymarket 由三套独立 API 组成：
 **利润计算公式（T0 结构性套利）：**
 
 ```
-二元市场: profit = $1.00 - ask_yes - ask_no - taker_fee(2%)
-多结果:   profit = $1.00 - Σ(ask_i) - taker_fee(2%)
+二元市场: profit = $1.00 - ask_yes - ask_no - Σ(feeRate * price * (1-price))
+多结果:   profit = $1.00 - Σ(ask_i) - Σ(feeRate * price_i * (1-price_i))
 ```
 
 ### 风险管理

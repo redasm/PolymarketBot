@@ -260,10 +260,18 @@ class RiskManager:
             current = self._market_exposure.get(condition_id, 0.0)
             leg_cost = trade.economic_cost if trade.economic_cost is not None else trade.price
 
+            terminal_fill_exposure = leg_cost * _resolved_exposure_size(trade)
             if trade.status == TradeStatus.FILLED:
-                final_exposure = leg_cost * _resolved_exposure_size(trade)
+                final_exposure = terminal_fill_exposure
                 delta = final_exposure - reserved_exposure
                 action = "成交落地"
+            elif terminal_fill_exposure > 0:
+                # A resting order can partially fill and then be cancelled.
+                # Release only the unfilled reservation; keep filled inventory
+                # booked as live exposure.
+                final_exposure = leg_cost * _resolved_exposure_size(trade)
+                delta = final_exposure - reserved_exposure
+                action = "部分成交后释放剩余挂单"
             else:
                 delta = -reserved_exposure
                 action = "释放挂单"

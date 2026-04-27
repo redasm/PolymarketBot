@@ -48,6 +48,7 @@ from polymarket_arb.models import (
     ArbLeg,
     ArbOpportunity,
     ArbType,
+    FeeStructure,
     MarketInfo,
     OrderSide,
     ResearchSignalReport,
@@ -174,7 +175,8 @@ def _log_startup_summary(config: ArbConfig, run_id: str) -> None:
         config.portfolio_sync_interval_sec,
     )
     LOG.info(
-        "研究/AI: research=%s knowledge=%s ai=%s provider=%s model=%s",
+        "策略: maker=%s | 研究/AI: research=%s knowledge=%s ai=%s provider=%s model=%s",
+        config.maker_strategy_enabled,
         config.research_signal_enabled,
         config.research_signal_knowledge_enabled,
         config.ai_enabled,
@@ -676,9 +678,11 @@ def _build_directional_opportunity_from_signal(
 ) -> tuple[ArbOpportunity | None, float, str]:
     action = _resolve_strategy_signal_action(signal)
     if action not in {"BUY_YES", "BUY_NO"}:
+        _set_signal_execution_check(signal, reason="unsupported_direction", action=action)
         return None, 0.0, "unsupported_direction"
 
     if len(market.tokens) < 2:
+        _set_signal_execution_check(signal, reason="non_binary_market", action=action)
         return None, 0.0, "non_binary_market"
 
     yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
@@ -688,24 +692,70 @@ def _build_directional_opportunity_from_signal(
 
     snap = ob_analyzer.get_snapshot(target_token.token_id)
     if snap is None or snap.best_ask is None or snap.best_ask <= 0:
+        _set_signal_execution_check(
+            signal,
+            reason="missing_best_ask",
+            action=action,
+            token_id=target_token.token_id[:20],
+        )
         return None, 0.0, "missing_best_ask"
 
     target_notional = max(0.0, float(signal.recommended_size_usdc))
     if target_notional <= 0:
+        _set_signal_execution_check(signal, reason="non_positive_notional", action=action)
         return None, 0.0, "non_positive_notional"
     target_size = target_notional / float(snap.best_ask)
     executable = ob_analyzer.get_executable_ask_price(target_token.token_id, target_size)
     if executable is None:
+        _set_signal_execution_check(
+            signal,
+            reason="insufficient_depth",
+            action=action,
+            best_ask=float(snap.best_ask),
+            target_notional=target_notional,
+            target_size=target_size,
+        )
         return None, 0.0, "insufficient_depth"
     execution_price, fillable_size = executable
     if fillable_size <= 0:
+        _set_signal_execution_check(
+            signal,
+            reason="zero_fillable_size",
+            action=action,
+            best_ask=float(snap.best_ask),
+            execution_price=float(execution_price),
+            target_size=target_size,
+        )
         return None, 0.0, "zero_fillable_size"
 
     gross_edge = abs(float(signal.payload.get("deviation", 0.0) or (signal.expected_edge / 10_000.0)))
-    fee_estimate = float(config.polymarket_taker_fee_rate) * float(execution_price)
+    fee_estimate = FeeStructure.for_market(config.polymarket_taker_fee_rate, market).estimate_price_fee(
+        float(execution_price)
+    )
     net_edge = gross_edge - fee_estimate
+    check_payload = {
+        "action": action,
+        "token_id": target_token.token_id[:20],
+        "target_notional": target_notional,
+        "target_size": target_size,
+        "fillable_size": float(fillable_size),
+        "best_ask": float(snap.best_ask),
+        "execution_price": float(execution_price),
+        "gross_edge": gross_edge,
+        "fee_estimate": fee_estimate,
+        "net_edge": net_edge,
+        "gross_edge_bps": gross_edge * 10_000.0,
+        "fee_estimate_bps": fee_estimate * 10_000.0,
+        "net_edge_bps": net_edge * 10_000.0,
+        "model_prob": signal.payload.get("model_prob"),
+        "market_prob": signal.payload.get("market_prob"),
+        "fee_model": "clob_binary_fee_rate_x_price_x_1_minus_price",
+        "fee_rate": FeeStructure.for_market(config.polymarket_taker_fee_rate, market).taker_fee_rate,
+    }
     if net_edge <= 0:
+        _set_signal_execution_check(signal, reason="edge_below_fee", **check_payload)
         return None, 0.0, "edge_below_fee"
+    _set_signal_execution_check(signal, reason="", **check_payload)
 
     opportunity = ArbOpportunity(
         arb_type=ArbType.DIRECTIONAL,
@@ -736,6 +786,15 @@ def _build_directional_opportunity_from_signal(
     return opportunity, float(target_size), ""
 
 
+def _set_signal_execution_check(signal: StrategySignal, *, reason: str, **fields: Any) -> None:
+    payload = {
+        "reason": reason,
+        "checked_at": time.time(),
+    }
+    payload.update(fields)
+    signal.payload["execution_check"] = payload
+
+
 def _sum_trade_exposure(trades: list[Any], *, include_simulated: bool = True) -> float:
     total = 0.0
     for trade in trades:
@@ -748,6 +807,20 @@ def _sum_trade_exposure(trades: list[Any], *, include_simulated: bool = True) ->
         size = float(fill_size if fill_size is not None else getattr(trade, "size", 0.0) or 0.0)
         total += float(leg_cost or 0.0) * size
     return total
+
+
+def _apply_maker_fill_to_inventory(maker_strategy: MakerStrategy, trade: TradeRecord) -> float:
+    """Apply newly observed maker fill delta to local inventory."""
+    if not bool(getattr(trade, "post_only", False)):
+        return 0.0
+    filled = float(trade.fill_size or 0.0)
+    accounted = float(getattr(trade, "inventory_accounted_size", 0.0) or 0.0)
+    delta = max(0.0, filled - accounted)
+    if delta <= 0:
+        return 0.0
+    maker_strategy.update_inventory(trade.token_id, trade.side.value, delta)
+    trade.inventory_accounted_size = accounted + delta
+    return delta
 
 
 def _execute_strategy_signal(
@@ -812,6 +885,7 @@ def _execute_strategy_signal(
 
     if signal.tier == StrategyTier.STATISTICAL_ARB:
         if market is None:
+            _set_signal_execution_check(signal, reason="market_not_found")
             return False, "market_not_found", ExecutionDelta()
         opportunity, target_size, build_reason = _build_directional_opportunity_from_signal(
             config=config,
@@ -846,6 +920,7 @@ def _execute_strategy_signal(
                 "status": "executed" if execution_success else "attempted",
                 "trade_count": len(trades),
                 "arb_type": opportunity.arb_type.value,
+                "execution_check": dict(signal.payload.get("execution_check") or {}),
             })
         for trade in trades:
             dash_state.append_trade({
@@ -1030,8 +1105,8 @@ def _execute_strategy_signal(
                 else 0.0
             ),
         )
-        if trade.status == TradeStatus.FILLED and trade.fill_size:
-            maker_strategy.update_inventory(target_token.token_id, target_order_side.value, float(trade.fill_size))
+        if trade.fill_size:
+            _apply_maker_fill_to_inventory(maker_strategy, trade)
         dash_state.append_trade({
             "trade_id": trade.trade_id,
             "arb_id": trade.arb_id,
@@ -1559,6 +1634,7 @@ def main(dotenv_path: str | None = None) -> None:
             "ws_enabled": config.ws_enabled,
             "research_enabled": config.research_signal_enabled,
             "ai_enabled": config.ai_enabled,
+            "maker_enabled": config.maker_strategy_enabled,
         })
     if config.data_cleanup_enabled:
         LOG.info("Data 定期清理已开启: interval=%.0fs", config.data_cleanup_interval_sec)
@@ -1929,12 +2005,16 @@ def main(dotenv_path: str | None = None) -> None:
             for signal in statistical_signals
             if signal.payload.get("model_prob") is not None
         }
-        maker_signals = _collect_maker_strategy_signals(
-            candidate_markets=scanned_markets,
-            ob_analyzer=ob_analyzer,
-            maker_strategy=maker_strategy,
-            fair_values_by_market=fair_values_by_market,
-            detector=statistical_detector,
+        maker_signals = (
+            _collect_maker_strategy_signals(
+                candidate_markets=scanned_markets,
+                ob_analyzer=ob_analyzer,
+                maker_strategy=maker_strategy,
+                fair_values_by_market=fair_values_by_market,
+                detector=statistical_detector,
+            )
+            if config.maker_strategy_enabled
+            else []
         )
         strategy_signals.extend(maker_signals)
 
@@ -2163,6 +2243,7 @@ def main(dotenv_path: str | None = None) -> None:
                     "market_id": processed_signal.market_id,
                     "status": "skipped",
                     "reason": reason,
+                    "execution_check": dict(processed_signal.payload.get("execution_check") or {}),
                 })
         if insufficient_balance_skips and event_recorder.is_enabled:
             event_recorder.write_event("strategy_executions", {
@@ -2181,6 +2262,11 @@ def main(dotenv_path: str | None = None) -> None:
                 order_sync = executor.sync_pending_trade_statuses()
                 if order_sync.polled:
                     risk_mgr.reconcile_pending_order_statuses(order_sync.polled)
+                if order_sync.changed:
+                    inventory_deltas = {
+                        trade.trade_id: _apply_maker_fill_to_inventory(maker_strategy, trade)
+                        for trade in order_sync.changed
+                    }
                 if event_recorder.is_enabled and order_sync.changed:
                     for trade in order_sync.changed:
                         event_recorder.write_event("risk_events", {
@@ -2191,6 +2277,7 @@ def main(dotenv_path: str | None = None) -> None:
                             "status": trade.status.value,
                             "fill_size": trade.fill_size,
                             "fill_price": trade.fill_price,
+                            "inventory_delta": inventory_deltas.get(trade.trade_id, 0.0),
                             "error": trade.error,
                             "ts": time.time(),
                         })

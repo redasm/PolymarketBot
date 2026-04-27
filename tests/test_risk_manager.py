@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import polymarket_arb.risk_manager as risk_manager_module
+import pytest
 
 from polymarket_arb.models import (
     ArbLeg,
@@ -161,7 +162,7 @@ def test_partial_fill_exposure_is_not_released_by_pending_ttl(monkeypatch):
     ]
 
     mgr.record_execution(opp, trades)
-    assert mgr.state.total_exposure == 0.45 * 2
+    assert mgr.state.total_exposure == pytest.approx(0.45 * 2)
     assert mgr.state.consecutive_failures == 0  # partial fill decays counter, not increment
 
     monkeypatch.setattr(
@@ -432,6 +433,33 @@ def test_reconcile_pending_order_statuses_converts_filled_order_to_actual_exposu
     mgr.reconcile_pending_order_statuses([trade])
 
     assert mgr.state.total_exposure == 0.45 * 3
+    assert mgr.state.open_positions == 1
+
+
+def test_reconcile_pending_order_statuses_keeps_partial_fill_after_cancel():
+    mgr = RiskManager(make_test_config())
+    opp = _make_opp()
+    trade = TradeRecord(
+        "t1",
+        "a1",
+        "yes",
+        "c1",
+        OrderSide.BUY,
+        0.45,
+        5,
+        status=TradeStatus.PENDING,
+        order_id="oid-1",
+        economic_cost=0.45,
+    )
+
+    mgr.record_execution(opp, [trade], count_pending_as_failure=False)
+    trade.status = TradeStatus.PARTIAL
+    trade.fill_size = 2.0
+    mgr.reconcile_pending_order_statuses([trade])
+    trade.status = TradeStatus.CANCELLED
+    mgr.reconcile_pending_order_statuses([trade])
+
+    assert mgr.state.total_exposure == pytest.approx(0.45 * 2)
     assert mgr.state.open_positions == 1
 
 

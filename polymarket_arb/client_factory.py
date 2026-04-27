@@ -10,21 +10,61 @@ from polymarket_arb.config import ArbConfig
 LOG = logging.getLogger(__name__)
 
 
-def build_readonly_client(config: ArbConfig) -> Any:
-    """构建只读 CLOB 客户端（无需私钥，用于读取订单簿）."""
+def _load_clob_client_class(config: ArbConfig) -> tuple[Any, str]:
+    preferred = (config.clob_client_version or "auto").lower()
+    if preferred in {"auto", "v2"}:
+        try:
+            from py_clob_client_v2 import ClobClient
+
+            return ClobClient, "v2"
+        except ImportError:
+            if preferred == "v2":
+                raise
     from py_clob_client.client import ClobClient
 
-    client = ClobClient(config.clob_host, chain_id=config.chain_id)
-    LOG.info("只读 CLOB 客户端已创建: %s", config.clob_host)
+    return ClobClient, "v1"
+
+
+def _build_client(clob_client: Any, config: ArbConfig, **kwargs: Any) -> Any:
+    base_kwargs = {"chain_id": config.chain_id}
+    base_kwargs.update(kwargs)
+    candidates = [
+        base_kwargs,
+        {k: v for k, v in base_kwargs.items() if k in {"chain_id", "key", "creds"}},
+        {k: v for k, v in base_kwargs.items() if k in {"chain_id", "key"}},
+        {k: v for k, v in base_kwargs.items() if k == "chain_id"},
+    ]
+    last_error: TypeError | None = None
+    for candidate in candidates:
+        try:
+            return clob_client(config.clob_host, **candidate)
+        except TypeError as exc:
+            last_error = exc
+    raise last_error or TypeError("无法构建 CLOB 客户端")
+
+
+def build_readonly_client(config: ArbConfig) -> Any:
+    """构建只读 CLOB 客户端（无需私钥，用于读取订单簿）."""
+    clob_client, version = _load_clob_client_class(config)
+    if version == "v2":
+        _force_py_clob_http1()
+
+    client = _build_client(clob_client, config)
+    LOG.info("只读 CLOB 客户端已创建: %s client=%s", config.clob_host, version)
     return client
 
 
 def build_trading_client(config: ArbConfig) -> Any:
     """构建带认证的交易 CLOB 客户端."""
-    from py_clob_client.client import ClobClient
-    from py_clob_client.exceptions import PolyApiException
+    try:
+        from py_clob_client.exceptions import PolyApiException
+    except ImportError:  # py-clob-client-v2 only installs a different package.
+        PolyApiException = RuntimeError  # type: ignore[assignment]
+    clob_client, version = _load_clob_client_class(config)
+    if version == "v2":
+        _force_py_clob_http1()
 
-    temp_client = _build_l1_client(config)
+    temp_client = _build_l1_client(config, clob_client=clob_client)
     try:
         creds = _create_or_derive_with_transport_fallback(temp_client, config)
     except Exception as exc:
@@ -44,50 +84,72 @@ def build_trading_client(config: ArbConfig) -> Any:
         )
     LOG.info("API 凭证已创建/派生")
 
-    client = ClobClient(
-        config.clob_host,
+    client = _build_client(
+        clob_client,
+        config,
         key=config.private_key,
-        chain_id=config.chain_id,
         creds=creds,
         signature_type=config.signature_type,
         funder=config.funder_address,
     )
     LOG.info(
-        "交易 CLOB 客户端已创建: host=%s, sig_type=%d, funder=%s…",
+        "交易 CLOB 客户端已创建: host=%s, client=%s, sig_type=%d, funder=%s…",
         config.clob_host,
+        version,
         config.signature_type,
         config.funder_address[:10],
     )
     return client
 
 
-def _build_l1_client(config: ArbConfig):
-    from py_clob_client.client import ClobClient
-
-    return ClobClient(
-        config.clob_host,
+def _build_l1_client(config: ArbConfig, *, clob_client: Any | None = None):
+    if clob_client is None:
+        clob_client, _ = _load_clob_client_class(config)
+    return _build_client(
+        clob_client,
+        config,
         key=config.private_key,
-        chain_id=config.chain_id,
         signature_type=config.signature_type,
         funder=config.funder_address,
     )
 
 
 def _force_py_clob_http1() -> None:
+    import sys
     import httpx
-    from py_clob_client.http_helpers import helpers as http_helpers
 
-    current = getattr(http_helpers, "_http_client", None)
-    if current is not None:
+    for module_name in (
+        "py_clob_client_v2.http_helpers.helpers",
+        "py_clob_client.http_helpers.helpers",
+    ):
+        http_helpers = sys.modules.get(module_name)
+        if http_helpers is None:
+            try:
+                http_helpers = __import__(module_name, fromlist=["helpers"])
+            except Exception:
+                continue
+
+        current = getattr(http_helpers, "_http_client", None)
+        if current is not None:
+            try:
+                current.close()
+            except Exception:
+                pass
         try:
-            current.close()
-        except Exception:
-            pass
-    http_helpers._http_client = httpx.Client(http2=False)
+            http_helpers._http_client = httpx.Client(http2=False)
+            LOG.debug("已将 %s 切换为 HTTP/1.1 client", module_name)
+        except Exception as exc:
+            LOG.debug("切换 %s 到 HTTP/1.1 失败: %s", module_name, exc)
 
 
 def _create_or_derive_with_transport_fallback(temp_client: Any, config: ArbConfig):
-    from py_clob_client.exceptions import PolyApiException
+    if hasattr(temp_client, "create_or_derive_api_key"):
+        return temp_client.create_or_derive_api_key()
+
+    try:
+        from py_clob_client.exceptions import PolyApiException
+    except ImportError:
+        PolyApiException = RuntimeError  # type: ignore[assignment]
 
     try:
         return temp_client.create_or_derive_api_creds()

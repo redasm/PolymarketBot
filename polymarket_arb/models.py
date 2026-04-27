@@ -186,6 +186,7 @@ class TradeRecord:
     simulated: bool = False
     post_only: bool = False
     order_type_name: Optional[str] = None
+    inventory_accounted_size: float = 0.0
 
 
 @dataclass
@@ -457,12 +458,101 @@ class FeeStructure:
     maker_rebate: float = 0.0
 
     def estimate_fee(self, cost: float, num_legs: int) -> float:
-        """按总成交成本估算 taker fee.
+        """兼容旧调用方的保守费用估算.
 
-        这里采用更保守的模型：把套利中所有腿的成交成本都视为会产生 taker fee。
-        这样即使真实费率模型比它更宽松，也只会低估利润，不会高估利润。
-        `num_legs` 目前保留用于兼容调用方。
+        Prefer estimate_price_fee()/estimate_leg_fees() for Polymarket CLOB
+        markets. Official CLOB fees are proportional to p * (1 - p), not
+        notional alone. Without individual leg prices we assume an even split.
         """
         if cost <= 0:
             return 0.0
-        return self.taker_fee_rate * cost
+        legs = max(1, int(num_legs or 1))
+        price = max(0.0, min(1.0, float(cost) / legs))
+        return self.estimate_price_fee(price, size=float(legs))
+
+    def estimate_price_fee(self, price: float, size: float = 1.0) -> float:
+        """Estimate CLOB taker fee for `size` shares at a binary-token price.
+
+        Polymarket's CLOB fee shape is fee_rate * price * (1 - price) per
+        share. The function clamps prices to [0, 1] so malformed orderbook
+        rows cannot produce negative fees.
+        """
+        if size <= 0 or self.taker_fee_rate <= 0:
+            return 0.0
+        bounded = max(0.0, min(1.0, float(price)))
+        return float(size) * float(self.taker_fee_rate) * bounded * (1.0 - bounded)
+
+    def estimate_leg_fees(self, prices: list[float], size: float = 1.0) -> float:
+        """Estimate total taker fees for several legs filled with same size."""
+        return sum(self.estimate_price_fee(price, size=size) for price in prices)
+
+    @classmethod
+    def for_market(cls, default_taker_fee_rate: float, market: MarketInfo | None = None) -> "FeeStructure":
+        """Build a fee structure using market metadata when available.
+
+        Gamma/CLOB payloads can expose fees in slightly different shapes
+        (`feeRateBps`, `base_fee`, `feeRate`, and friends). The config value
+        remains a fallback so offline tests and cached datasets still work.
+        """
+        return cls(taker_fee_rate=resolve_polymarket_fee_rate(default_taker_fee_rate, market))
+
+
+def resolve_polymarket_fee_rate(default_taker_fee_rate: float, market: MarketInfo | dict | None = None) -> float:
+    """Resolve a decimal taker fee rate from market metadata.
+
+    Returns a decimal rate (`0.02` for 2%). Bps-like fields are converted from
+    basis points, while decimal-looking fields are used directly.
+    """
+    raw: dict[str, Any] = {}
+    if isinstance(market, MarketInfo):
+        raw = dict(market.raw or {})
+    elif isinstance(market, dict):
+        raw = dict(market)
+
+    fees_enabled = _first_present(raw, ("feesEnabled", "fees_enabled"))
+    if fees_enabled is not None and not _coerce_bool(fees_enabled):
+        return 0.0
+
+    bps_value = _first_present(
+        raw,
+        (
+            "feeRateBps",
+            "fee_rate_bps",
+            "baseFeeBps",
+            "base_fee_bps",
+            "base_fee",
+            "baseFee",
+        ),
+    )
+    bps = _coerce_non_negative_float(bps_value)
+    if bps is not None:
+        return bps / 10_000.0
+
+    rate_value = _first_present(raw, ("feeRate", "fee_rate", "takerFeeRate", "taker_fee_rate"))
+    rate = _coerce_non_negative_float(rate_value)
+    if rate is not None:
+        return rate / 10_000.0 if rate > 1.0 else rate
+
+    return max(0.0, float(default_taker_fee_rate))
+
+
+def _first_present(raw: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in raw and raw[key] not in (None, ""):
+            return raw[key]
+    return None
+
+
+def _coerce_non_negative_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    return text not in {"0", "false", "no", "off", "disabled"}

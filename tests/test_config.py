@@ -12,10 +12,13 @@ from tests.conftest import make_test_config, write_test_env
     ("field_name", "value", "expected_msg"),
     [
         ("market_fetch_limit", 0, "ARB_MARKET_FETCH_LIMIT"),
+        ("clob_client_version", "bad", "POLYMARKET_CLOB_CLIENT_VERSION"),
         ("min_edge_usd", -0.01, "ARB_MIN_EDGE_USD"),
         ("min_edge_pct", -0.01, "ARB_MIN_EDGE_PCT"),
         ("max_order_size_usdc", 0.0, "ARB_MAX_ORDER_SIZE_USDC"),
         ("default_order_size_usdc", 0.0, "ARB_DEFAULT_ORDER_SIZE_USDC"),
+        ("live_max_order_size_usdc", 0.0, "LIVE_MAX_ORDER_SIZE_USDC"),
+        ("live_max_total_exposure_usdc", 0.0, "LIVE_MAX_TOTAL_EXPOSURE_USDC"),
         ("min_liquidity", -1.0, "ARB_MIN_LIQUIDITY"),
         ("min_volume_24h", -1.0, "ARB_MIN_LIQUIDITY"),
         ("polymarket_taker_fee_rate", 1.0, "POLYMARKET_TAKER_FEE_RATE"),
@@ -71,6 +74,13 @@ def test_from_env_loads_new_edge_and_cooldown_config(tmp_path, monkeypatch):
         "PORTFOLIO_SYNC_TIMEOUT_SEC",
         "DATA_API_HOST",
         "PORTFOLIO_SYNC_USER_ADDRESS",
+        "LIVE_TRADING_ACK",
+        "LIVE_REQUIRE_PORTFOLIO_SYNC",
+        "LIVE_ALLOW_ZERO_TAKER_FEE",
+        "LIVE_MAX_ORDER_SIZE_USDC",
+        "LIVE_MAX_TOTAL_EXPOSURE_USDC",
+        "MAKER_STRATEGY_ENABLED",
+        "POLYMARKET_CLOB_CLIENT_VERSION",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -90,6 +100,13 @@ def test_from_env_loads_new_edge_and_cooldown_config(tmp_path, monkeypatch):
     assert cfg.portfolio_sync_timeout_sec == 4.0
     assert cfg.data_api_host == "https://data-api.polymarket.com"
     assert cfg.portfolio_sync_user_address == "0xabc"
+    assert cfg.live_trading_ack is False
+    assert cfg.live_require_portfolio_sync is True
+    assert cfg.live_allow_zero_taker_fee is False
+    assert cfg.live_max_order_size_usdc == 10.0
+    assert cfg.live_max_total_exposure_usdc == 100.0
+    assert cfg.maker_strategy_enabled is True
+    assert cfg.clob_client_version == "auto"
     assert cfg.edge_confidence_full_bps == 650.0
     assert cfg.edge_confidence_imbalance_weight == 0.2
     assert cfg.telemetry_record_enabled is False
@@ -108,6 +125,35 @@ def test_from_env_requires_wallet_when_requested(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="PRIVATE_KEY"):
         ArbConfig.from_env(env_path)
+
+
+def test_live_mode_requires_explicit_ack():
+    with pytest.raises(ValueError, match="LIVE_TRADING_ACK"):
+        make_test_config(dry_run=False, live_trading_ack=False)
+
+
+def test_live_mode_rejects_zero_taker_fee_without_override():
+    with pytest.raises(ValueError, match="POLYMARKET_TAKER_FEE_RATE"):
+        make_test_config(
+            dry_run=False,
+            live_trading_ack=True,
+            portfolio_sync_enabled=True,
+            polymarket_taker_fee_rate=0.0,
+        )
+
+
+def test_live_mode_allows_canary_limits_when_acknowledged():
+    cfg = make_test_config(
+        dry_run=False,
+        live_trading_ack=True,
+        portfolio_sync_enabled=True,
+        polymarket_taker_fee_rate=0.072,
+        default_order_size_usdc=1.0,
+        max_order_size_usdc=1.5,
+        max_total_exposure=3.0,
+    )
+
+    assert cfg.dry_run is False
 
 
 def test_dump_safe_masks_funder_address():

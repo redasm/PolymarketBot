@@ -27,6 +27,13 @@ class ExecutionModel(ABC):
         raise NotImplementedError
 
 
+def estimate_binary_clob_fee(price: float | None, size: float, fee_rate: float) -> float:
+    if price is None or size <= 0 or fee_rate <= 0:
+        return 0.0
+    bounded = max(0.0, min(1.0, float(price)))
+    return float(size) * float(fee_rate) * bounded * (1.0 - bounded)
+
+
 class TopOfBookExecutionModel(ExecutionModel):
     def __init__(self, config: ExecutionModelConfig | None = None, seed: int = 42):
         self._config = config or ExecutionModelConfig()
@@ -41,7 +48,7 @@ class TopOfBookExecutionModel(ExecutionModel):
         latency = self._config.latency_ms
         if self._config.latency_jitter_ms > 0:
             latency += self._rng.randint(0, self._config.latency_jitter_ms)
-        fees = (best_price or 0.0) * filled_size * self._config.fee_rate
+        fees = estimate_binary_clob_fee(best_price, filled_size, self._config.fee_rate)
         return SimulatedExecution(
             filled=filled,
             filled_size=filled_size,
@@ -89,7 +96,7 @@ class DepthVWAPExecutionModel(ExecutionModel):
         if avg_price is not None:
             avg_price *= slippage_multiplier
 
-        fees = (avg_price or 0.0) * filled_size * self._config.fee_rate
+        fees = estimate_binary_clob_fee(avg_price, filled_size, self._config.fee_rate)
         return SimulatedExecution(
             filled=filled,
             filled_size=filled_size,
@@ -156,7 +163,7 @@ class QueueAwareExecutionModel(ExecutionModel):
             multiplier = 1.0 + (total_slippage_bps / 10_000.0) if side == "BUY" else 1.0 - (total_slippage_bps / 10_000.0)
             avg_price *= multiplier
 
-        fees = (avg_price or 0.0) * filled_size * self._config.fee_rate
+        fees = estimate_binary_clob_fee(avg_price, filled_size, self._config.fee_rate)
         notes: list[str] = []
         if not filled:
             notes.append("insufficient_depth_after_queue")

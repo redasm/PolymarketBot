@@ -26,10 +26,11 @@
 **二元市场**: Polymarket 的 Yes/No token 最终必有一个结算为 $1.00。当 `ask(Yes) + ask(No) < $1.00 - fee` 时，买入双方锁定无风险利润。
 
 ```
-利润 = $1.00 - ask_yes - ask_no - taker_fee(2%)
+fee_per_leg = feeRate * price * (1 - price)
+利润 = $1.00 - ask_yes - ask_no - Σ(fee_per_leg)
 ```
 
-**多结果事件**: 一个事件（如选举）有 N 个互斥市场。当 `Σ(ask_i) < $1.00 - fee` 时，买入所有结果锁定利润。neg_risk 市场自动选择 `min(ask_yes, 1 - bid_no)` 最优路径。
+**多结果事件**: 一个事件（如选举）有 N 个互斥市场。当 `Σ(ask_i) < $1.00 - Σ(fee_i)` 时，买入所有结果锁定利润。neg_risk 市场自动选择 `min(ask_yes, 1 - bid_no)` 最优路径。
 
 **检测方式**: WebSocket 事件驱动（毫秒级）+ VWAP 深度验证防滑点。
 
@@ -107,6 +108,7 @@ polymarket_arb/
 └── strategies/
     ├── __init__.py
     ├── kelly.py                       # Kelly Criterion 最优仓位（二元/结构性/统计）
+    ├── optimal_stopping.py            # Bellman/MDP 最优退出与分批止盈阈值
     ├── cross_platform.py              # T1 跨平台套利（Polymarket vs Kalshi）
     ├── statistical_model.py           # T2 贝叶斯定价 + FairValueModel 现货锚定
     ├── maker_strategy.py              # T3 做市策略（VolEstimator 驱动 spread）
@@ -146,6 +148,20 @@ f* = (p·b - q) / b    (经典 Kelly)
 | 结构性套利 | 0.95 | 0.25 | 10% |
 | 跨平台套利 | 0.85 | 0.25 | 10% |
 | 统计套利 | 0.55-0.70 | 0.25 | 5% |
+
+### 最优退出与尾部风险折扣
+
+`optimal_stopping.py` 用有限时域 Bellman 递归求解持仓退出边界:
+
+```
+V_tau(m) = max(m, E[V_tau-1(m')])
+```
+
+输入剩余时间、当前 token 价格、模型终端概率和 Markov 转移矩阵后，输出 HOLD/STOP 和分批止盈阈值。它适合接入 T2/AI 方向性持仓，避免只会进场、不会量化退出。
+
+`StrategyOrchestrator` 还会在方向性信号入队前做两层调整:
+- **Research 共振**: 3 条以上同向、来源分散且置信度足够的研究信号会额外加权；强冲突共振会 veto。
+- **尾部风险折扣**: 地缘政治、停火、战争、单人决策等高尾部风险市场会自动降低推荐仓位和置信度，避免高概率合约的黑天鹅尾部把 Kelly 放得过大。
 
 ### 策略编排与资金分配
 

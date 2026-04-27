@@ -39,6 +39,7 @@ from typing import Any, Optional
 import requests
 
 from polymarket_arb.confidence import confidence_from_edge_pct
+from polymarket_arb.models import FeeStructure
 
 LOG = logging.getLogger(__name__)
 
@@ -242,7 +243,8 @@ class CrossPlatformScanner:
             poly_cost = pair.poly_yes_price if "poly_yes" in direction else pair.poly_no_price
             kalshi_cost = pair.kalshi_no_price if "kalshi_no" in direction else pair.kalshi_yes_price
             gross = 1.0 - cost
-            fee = (poly_fee_rate * poly_cost) + (kalshi_fee_rate * kalshi_cost)
+            poly_fee = FeeStructure(taker_fee_rate=poly_fee_rate).estimate_price_fee(poly_cost)
+            fee = poly_fee + (kalshi_fee_rate * kalshi_cost)
             net = gross - fee
 
             if net <= 0.005:

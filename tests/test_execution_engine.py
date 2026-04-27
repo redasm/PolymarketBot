@@ -289,6 +289,53 @@ def test_submit_limit_order_uses_post_only_gtc(monkeypatch):
     assert client.last_post_only is True
 
 
+def test_submit_limit_order_v2_passes_post_only(monkeypatch):
+    fake_v2 = types.ModuleType("py_clob_client_v2")
+    fake_v2.OrderType = types.SimpleNamespace(GTC="GTC", FOK="FOK", FAK="FAK")
+    fake_v2.Side = types.SimpleNamespace(BUY="BUY", SELL="SELL")
+
+    class OrderArgs:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class PartialCreateOrderOptions:
+        def __init__(self, tick_size=None, neg_risk=None):
+            self.tick_size = tick_size
+            self.neg_risk = neg_risk
+
+    fake_v2.OrderArgs = OrderArgs
+    fake_v2.PartialCreateOrderOptions = PartialCreateOrderOptions
+    monkeypatch.setitem(sys.modules, "py_clob_client_v2", fake_v2)
+
+    class _FakeV2Client:
+        def __init__(self):
+            self.last_post_only = None
+            self.last_order_type = None
+
+        def create_and_post_order(self, *, order_args, options, order_type, post_only=False):
+            self.last_post_only = post_only
+            self.last_order_type = order_type
+            return {"orderID": "oid-v2", "success": True, "status": "open"}
+
+    client = _FakeV2Client()
+    engine = ExecutionEngine(make_test_config(dry_run=False), client)
+
+    trade = engine.submit_limit_order(
+        token_id="token-1",
+        condition_id="cond-1",
+        outcome="Yes",
+        side=OrderSide.BUY,
+        price=0.41,
+        size=3,
+        post_only=True,
+        order_type_name="GTC",
+    )
+
+    assert trade.status == TradeStatus.PENDING
+    assert client.last_order_type == "GTC"
+    assert client.last_post_only is True
+
+
 def test_submit_limit_order_dry_run_post_only_stays_pending():
     engine = ExecutionEngine(make_test_config(dry_run=True), _FakeClient())
 
@@ -472,7 +519,8 @@ def test_get_pnl_summary_excludes_simulated_trades_by_default():
     assert engine.get_pnl_summary(include_simulated=True)["total_trades"] == 2
 
 
-def test_get_pnl_summary_uses_fill_size_for_filled_cost():
+def test_get_pnl_summary_uses_fill_size_for_filled_cost(monkeypatch):
+    _install_fake_clob_modules(monkeypatch)
     engine = ExecutionEngine(make_test_config(dry_run=False), _FakeClient())
     trade = TradeRecord(
         trade_id="t1",
