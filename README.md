@@ -255,6 +255,10 @@ cp .env.example .env
 | `ARB_MAX_ORDER_SIZE_USDC` | 单笔最大下单量 | 50 USDC |
 | `ORDERBOOK_SNAPSHOT_TTL_SEC` | REST 订单簿快照缓存 TTL | 0.5s |
 | `POLYMARKET_TAKER_FEE_RATE` | Polymarket taker 费率假设 | 2.0% |
+| `LIVE_MIN_NET_EDGE_BPS` | 实盘扣费后最低净 edge 安全垫 | 25 |
+| `LIVE_MIN_NET_EDGE_USD` | 实盘扣费后最低每股净 edge | 0.0025 |
+| `LIVE_MAX_ORDERBOOK_SNAPSHOT_AGE_SEC` | 实盘 WS 盘口最大年龄 | 1s |
+| `LIVE_MIN_WS_HIT_RATIO` | 实盘近期 WS 盘口命中率下限 | 0.25 |
 | `KALSHI_TAKER_FEE_RATE` | Kalshi taker 费率假设 | 0.3% |
 | `RISK_MAX_TOTAL_EXPOSURE` | 全局最大敞口 | 500 USDC |
 | `RISK_MAX_DAILY_LOSS` | 日亏损止损线 | 50 USDC |

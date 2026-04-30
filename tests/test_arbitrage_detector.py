@@ -46,6 +46,57 @@ def test_fee_structure_honors_fee_disabled_market():
     assert fees.estimate_price_fee(0.50) == 0.0
 
 
+def test_fee_structure_reads_modern_gamma_fee_schedule():
+    """`feeSchedule.rate` is the live Gamma field as of 2026-04 (older fields absent)."""
+    market = MarketInfo(
+        condition_id="c1",
+        question="Modern market",
+        slug="modern",
+        tokens=[],
+        raw={
+            "feesEnabled": True,
+            "feeSchedule": {"exponent": 1, "rate": 0.05, "rebateRate": 0.25, "takerOnly": True},
+        },
+    )
+
+    fees = FeeStructure.for_market(0.072, market)
+
+    # feeSchedule.rate=0.05 should win over the env fallback of 0.072.
+    assert fees.taker_fee_rate == pytest.approx(0.05)
+    # At p=0.5: fee = 0.05 * 0.5 * 0.5 = 0.0125 per share (CLOB shape).
+    assert fees.estimate_price_fee(0.50) == pytest.approx(0.0125)
+
+
+def test_fee_structure_falls_back_when_metadata_missing():
+    """Without feeSchedule/feeRateBps the env-configured default applies."""
+    market = MarketInfo(
+        condition_id="c1",
+        question="Bare market",
+        slug="bare",
+        tokens=[],
+        raw={"feesEnabled": True},
+    )
+
+    fees = FeeStructure.for_market(0.05, market)
+
+    assert fees.taker_fee_rate == pytest.approx(0.05)
+
+
+def test_fee_structure_takerbasefee_ppm():
+    """`takerBaseFee=1000` (ppm) → 0.001 = 10 bps."""
+    market = MarketInfo(
+        condition_id="c1",
+        question="ppm market",
+        slug="ppm",
+        tokens=[],
+        raw={"feesEnabled": True, "takerBaseFee": 1000},
+    )
+
+    fees = FeeStructure.for_market(0.05, market)
+
+    assert fees.taker_fee_rate == pytest.approx(0.001)
+
+
 class TestBinaryArbDetection:
     """二元市场套利检测."""
 

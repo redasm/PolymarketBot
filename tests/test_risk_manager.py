@@ -74,7 +74,7 @@ def test_partial_failure_does_not_book_expected_profit():
     mgr.record_execution(opp, trades)
 
     assert mgr.state.daily_pnl == 0
-    assert mgr.state.consecutive_failures == 0  # partial fill decays counter, not increment
+    assert mgr.state.consecutive_failures == 1
     assert mgr.state.total_exposure == 0.45 * 5
 
 
@@ -163,7 +163,7 @@ def test_partial_fill_exposure_is_not_released_by_pending_ttl(monkeypatch):
 
     mgr.record_execution(opp, trades)
     assert mgr.state.total_exposure == pytest.approx(0.45 * 2)
-    assert mgr.state.consecutive_failures == 0  # partial fill decays counter, not increment
+    assert mgr.state.consecutive_failures == 1
 
     monkeypatch.setattr(
         risk_manager_module.time,
@@ -254,7 +254,7 @@ def test_sync_portfolio_snapshot_overwrites_real_positions_and_realized_daily_pn
     assert len(mgr.state.positions) == 2
 
 
-def test_partial_fill_with_pending_decays_failure_counter():
+def test_partial_fill_with_pending_increments_failure_counter():
     mgr = RiskManager(make_test_config())
     opp = _make_opp()
     trades = [
@@ -264,7 +264,7 @@ def test_partial_fill_with_pending_decays_failure_counter():
 
     mgr.record_execution(opp, trades)
 
-    assert mgr.state.consecutive_failures == 0  # partial fill decays, not increments
+    assert mgr.state.consecutive_failures == 1
     assert mgr.state.is_halted is False
 
 

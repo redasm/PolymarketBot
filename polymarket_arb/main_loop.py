@@ -61,6 +61,7 @@ from polymarket_arb.portfolio_sync import PortfolioSync
 from polymarket_arb.risk_manager import RiskManager
 from polymarket_arb.strategies.cross_platform import CrossPlatformScanner, KalshiClient
 from polymarket_arb.strategies.maker_strategy import DynamicSpreadCalculator, MakerStrategy
+from polymarket_arb.strategies.t2_exit_manager import T2ExitManager
 from polymarket_arb.strategies.statistical_model import StatisticalMispricingDetector
 from polymarket_arb.strategies.strategy_orchestrator import (
     StrategyOrchestrator,
@@ -681,6 +682,20 @@ def _build_directional_opportunity_from_signal(
         _set_signal_execution_check(signal, reason="unsupported_direction", action=action)
         return None, 0.0, "unsupported_direction"
 
+    if not config.dry_run and hasattr(ob_analyzer, "feed_health"):
+        health = ob_analyzer.feed_health(
+            max_snapshot_age_sec=config.live_max_orderbook_snapshot_age_sec,
+            min_ws_hit_ratio=config.live_min_ws_hit_ratio,
+        )
+        if not bool(health.get("healthy", False)):
+            _set_signal_execution_check(
+                signal,
+                reason="orderbook_feed_unhealthy",
+                action=action,
+                feed_health_reason=health.get("reason", ""),
+            )
+            return None, 0.0, "orderbook_feed_unhealthy"
+
     if len(market.tokens) < 2:
         _set_signal_execution_check(signal, reason="non_binary_market", action=action)
         return None, 0.0, "non_binary_market"
@@ -755,6 +770,14 @@ def _build_directional_opportunity_from_signal(
     if net_edge <= 0:
         _set_signal_execution_check(signal, reason="edge_below_fee", **check_payload)
         return None, 0.0, "edge_below_fee"
+    if not config.dry_run:
+        min_edge_by_bps = float(execution_price) * (config.live_min_net_edge_bps / 10_000.0)
+        min_live_edge = max(config.live_min_net_edge_usd, min_edge_by_bps)
+        check_payload["live_min_net_edge"] = min_live_edge
+        check_payload["live_min_net_edge_bps"] = config.live_min_net_edge_bps
+        if net_edge < min_live_edge:
+            _set_signal_execution_check(signal, reason="live_edge_below_buffer", **check_payload)
+            return None, 0.0, "live_edge_below_buffer"
     _set_signal_execution_check(signal, reason="", **check_payload)
 
     opportunity = ArbOpportunity(
@@ -836,6 +859,7 @@ def _execute_strategy_signal(
     event_recorder: EventRecorder,
     maker_strategy: MakerStrategy,
     notifier: NotificationManager,
+    t2_exit_manager: "T2ExitManager | None" = None,
 ) -> tuple[bool, str, ExecutionDelta]:
     market = _find_market_for_signal(signal.market_id, active_markets)
     if signal.tier == StrategyTier.CROSS_PLATFORM:
@@ -907,6 +931,12 @@ def _execute_strategy_signal(
         # 无论 dry_run 与否都记录到 risk_mgr，保证持仓/敞口/冷却期追踪生效；
         # dry_run 下 trades 均为 simulated，不会触发真实订单。
         risk_mgr.record_execution(opportunity, trades)
+        if t2_exit_manager is not None:
+            t2_exit_manager.register_fills(
+                signal_payload=dict(signal.payload or {}),
+                market=market,
+                trades=trades,
+            )
         orchestrator.record_execution(
             signal,
             success=execution_success,
@@ -1639,7 +1669,23 @@ def main(dotenv_path: str | None = None) -> None:
     if config.data_cleanup_enabled:
         LOG.info("Data 定期清理已开启: interval=%.0fs", config.data_cleanup_interval_sec)
 
-    orchestrator = StrategyOrchestrator(total_bankroll=config.max_total_exposure)
+    orchestrator = StrategyOrchestrator(
+        total_bankroll=config.max_total_exposure,
+        max_signals_per_market_per_hour=config.t2_max_signals_per_market_per_hour,
+    )
+    t2_exit_manager = T2ExitManager(
+        config=config,
+        executor=executor,
+        ob_analyzer=ob_analyzer,
+    )
+    LOG.info(
+        "T2 退出策略: stop_loss=%.0fbps tp_capture=%.0f%% max_hold=%.0fs eval=%.0fs optimal_stopping=%s",
+        config.t2_stop_loss_bps,
+        config.t2_take_profit_capture_pct * 100,
+        config.t2_max_hold_sec,
+        config.t2_exit_eval_interval_sec,
+        config.t2_optimal_stopping_enabled,
+    )
     ctx_builder = MarketContextBuilder()
     research_signal_service: Optional["ResearchSignalService"] = _create_research_signal_service(config)
     research_signal_enabled = bool(config.research_signal_enabled and research_signal_service is not None)
@@ -2221,6 +2267,7 @@ def main(dotenv_path: str | None = None) -> None:
                 event_recorder=event_recorder,
                 maker_strategy=maker_strategy,
                 notifier=notifier,
+                t2_exit_manager=t2_exit_manager,
             )
             total_live_successes += delta.live_successes
             total_simulated_successes += delta.simulated_successes
@@ -2256,6 +2303,38 @@ def main(dotenv_path: str | None = None) -> None:
                 "total": sum(insufficient_balance_skips.values()),
             })
         cycle_timing["strategy_execution_sec"] = time.perf_counter() - phase_start
+
+        # T2 exit evaluation: stop-loss / take-profit / time-stop / optimal stopping.
+        # Runs every cycle; the manager internally rate-limits per-position via
+        # `t2_exit_eval_interval_sec`. Without this loop directional positions
+        # would ride to settlement.
+        try:
+            exit_result = t2_exit_manager.evaluate(active_markets=execution_markets)
+            if exit_result.triggered > 0 and event_recorder.is_enabled:
+                event_recorder.write_event(
+                    "strategy_executions",
+                    {
+                        "tier": StrategyTier.STATISTICAL_ARB.name,
+                        "signal_type": "t2_exit",
+                        "market_id": "",
+                        "status": "exited",
+                        "trade_count": exit_result.triggered,
+                        "exit_decisions": [
+                            {
+                                "token_id": d["token_id"][:16],
+                                "market_id": d["market_id"][:12],
+                                "outcome": d["outcome"],
+                                "reason": d["reason"],
+                                "entry_price": round(float(d["entry_price"]), 4),
+                                "exit_price": round(float(d["exit_price"]), 4),
+                                "size": round(float(d["size"]), 4),
+                            }
+                            for d in exit_result.decisions
+                        ],
+                    },
+                )
+        except Exception as exc:
+            LOG.warning("T2 退出评估异常: %s", exc)
 
         if not config.dry_run:
             try:
@@ -2382,6 +2461,8 @@ def main(dotenv_path: str | None = None) -> None:
                 "last_portfolio_sync_ts": risk_s.last_portfolio_sync_ts or None,
                 "portfolio_sync_ok": risk_s.portfolio_sync_ok,
                 "portfolio_sync_error": risk_s.portfolio_sync_error,
+                "portfolio_sync_consecutive_failures": risk_s.portfolio_sync_consecutive_failures,
+                "portfolio_sync_max_consecutive_failures": config.portfolio_sync_max_consecutive_failures,
             },
             volatility=vol_snap,
             edge_decision=edge_decision.to_dict() if edge_decision else None,

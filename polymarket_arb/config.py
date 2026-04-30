@@ -78,6 +78,10 @@ class ArbConfig:
     live_allow_zero_taker_fee: bool
     live_max_order_size_usdc: float
     live_max_total_exposure_usdc: float
+    live_min_net_edge_bps: float
+    live_min_net_edge_usd: float
+    live_max_orderbook_snapshot_age_sec: float
+    live_min_ws_hit_ratio: float
     maker_strategy_enabled: bool
     min_liquidity: float
     min_volume_24h: float
@@ -107,6 +111,7 @@ class ArbConfig:
     portfolio_sync_enabled: bool
     portfolio_sync_interval_sec: float
     portfolio_sync_timeout_sec: float
+    portfolio_sync_max_consecutive_failures: int
     data_api_host: str
     portfolio_sync_user_address: str
 
@@ -148,6 +153,13 @@ class ArbConfig:
     t2_max_spread_bps: float
     t2_min_top_depth: float
     t2_max_complement_error_bps: float
+    t2_max_signals_per_market_per_hour: int
+    # T2 exit policy
+    t2_stop_loss_bps: float
+    t2_take_profit_capture_pct: float
+    t2_max_hold_sec: float
+    t2_exit_eval_interval_sec: float
+    t2_optimal_stopping_enabled: bool
 
     # Tick 录制
     tick_record_enabled: bool
@@ -242,6 +254,14 @@ class ArbConfig:
             raise ValueError("LIVE_MAX_ORDER_SIZE_USDC 必须大于 0")
         if self.live_max_total_exposure_usdc <= 0:
             raise ValueError("LIVE_MAX_TOTAL_EXPOSURE_USDC 必须大于 0")
+        if self.live_min_net_edge_bps < 0:
+            raise ValueError("LIVE_MIN_NET_EDGE_BPS 不能为负数")
+        if self.live_min_net_edge_usd < 0:
+            raise ValueError("LIVE_MIN_NET_EDGE_USD 不能为负数")
+        if self.live_max_orderbook_snapshot_age_sec < 0:
+            raise ValueError("LIVE_MAX_ORDERBOOK_SNAPSHOT_AGE_SEC 不能为负数")
+        if not 0 <= self.live_min_ws_hit_ratio <= 1:
+            raise ValueError("LIVE_MIN_WS_HIT_RATIO 必须在 [0, 1] 区间")
         if self.min_liquidity < 0 or self.min_volume_24h < 0:
             raise ValueError("ARB_MIN_LIQUIDITY 和 ARB_MIN_VOLUME_24H 不能为负数")
         if not 0 <= self.polymarket_taker_fee_rate < 1:
@@ -286,6 +306,8 @@ class ArbConfig:
             raise ValueError("PORTFOLIO_SYNC_TIMEOUT_SEC 必须大于 0")
         if self.portfolio_sync_enabled and not self.data_api_host:
             raise ValueError("DATA_API_HOST 不能为空")
+        if self.portfolio_sync_max_consecutive_failures < 0:
+            raise ValueError("PORTFOLIO_SYNC_MAX_CONSECUTIVE_FAILURES 不能为负数")
         if self.notification_cooldown_sec < 0:
             raise ValueError("NOTIFICATION_COOLDOWN_SEC 不能为负数")
         feishu_configured = bool(self.feishu_app_id or self.feishu_app_secret or self.feishu_open_id)
@@ -347,6 +369,16 @@ class ArbConfig:
             raise ValueError("T2_MIN_TOP_DEPTH 不能为负数")
         if self.t2_max_complement_error_bps < 0:
             raise ValueError("T2_MAX_COMPLEMENT_ERROR_BPS 不能为负数")
+        if self.t2_max_signals_per_market_per_hour < 0:
+            raise ValueError("T2_MAX_SIGNALS_PER_MARKET_PER_HOUR 不能为负数")
+        if self.t2_stop_loss_bps < 0:
+            raise ValueError("T2_STOP_LOSS_BPS 不能为负数")
+        if self.t2_take_profit_capture_pct < 0:
+            raise ValueError("T2_TAKE_PROFIT_CAPTURE_PCT 不能为负数")
+        if self.t2_max_hold_sec < 0:
+            raise ValueError("T2_MAX_HOLD_SEC 不能为负数")
+        if self.t2_exit_eval_interval_sec < 0:
+            raise ValueError("T2_EXIT_EVAL_INTERVAL_SEC 不能为负数")
         if not self.dry_run:
             if not self.live_trading_ack:
                 raise ValueError("实盘前必须设置 LIVE_TRADING_ACK=true")
@@ -407,6 +439,10 @@ class ArbConfig:
             live_allow_zero_taker_fee=_env_bool("LIVE_ALLOW_ZERO_TAKER_FEE", False),
             live_max_order_size_usdc=_env_float("LIVE_MAX_ORDER_SIZE_USDC", 10.0),
             live_max_total_exposure_usdc=_env_float("LIVE_MAX_TOTAL_EXPOSURE_USDC", 100.0),
+            live_min_net_edge_bps=_env_float("LIVE_MIN_NET_EDGE_BPS", 25.0),
+            live_min_net_edge_usd=_env_float("LIVE_MIN_NET_EDGE_USD", 0.0025),
+            live_max_orderbook_snapshot_age_sec=_env_float("LIVE_MAX_ORDERBOOK_SNAPSHOT_AGE_SEC", 1.0),
+            live_min_ws_hit_ratio=_env_float("LIVE_MIN_WS_HIT_RATIO", 0.25),
             maker_strategy_enabled=_env_bool("MAKER_STRATEGY_ENABLED", True),
             min_liquidity=_env_float("ARB_MIN_LIQUIDITY", 1000.0),
             min_volume_24h=_env_float("ARB_MIN_VOLUME_24H", 500.0),
@@ -416,7 +452,7 @@ class ArbConfig:
             orderbook_retry_delay_sec=_env_float("ORDERBOOK_RETRY_DELAY_SEC", 0.15),
             orderbook_missing_cooldown_sec=_env_float("ORDERBOOK_MISSING_COOLDOWN_SEC", 300.0),
             cross_platform_pairs_json=_env("CROSS_PLATFORM_PAIRS_JSON", ""),
-            polymarket_taker_fee_rate=_env_float("POLYMARKET_TAKER_FEE_RATE", 0.02),
+            polymarket_taker_fee_rate=_env_float("POLYMARKET_TAKER_FEE_RATE", 0.05),
             kalshi_taker_fee_rate=_env_float("KALSHI_TAKER_FEE_RATE", 0.003),
             max_multi_outcome_legs=_env_int("ARB_MAX_MULTI_OUTCOME_LEGS", 20),
             t0_min_multi_outcome_median_leg_price=_env_float("T0_MIN_MULTI_OUTCOME_MEDIAN_LEG_PRICE", 0.05),
@@ -432,6 +468,7 @@ class ArbConfig:
             portfolio_sync_enabled=_env_bool("PORTFOLIO_SYNC_ENABLED", False),
             portfolio_sync_interval_sec=_env_float("PORTFOLIO_SYNC_INTERVAL_SEC", 60.0),
             portfolio_sync_timeout_sec=_env_float("PORTFOLIO_SYNC_TIMEOUT_SEC", 5.0),
+            portfolio_sync_max_consecutive_failures=_env_int("PORTFOLIO_SYNC_MAX_CONSECUTIVE_FAILURES", 3),
             data_api_host=_env("DATA_API_HOST", "https://data-api.polymarket.com"),
             portfolio_sync_user_address=_env("PORTFOLIO_SYNC_USER_ADDRESS"),
             feishu_app_id=_env("FEISHU_APP_ID"),
@@ -467,6 +504,12 @@ class ArbConfig:
             t2_max_spread_bps=_env_float("T2_MAX_SPREAD_BPS", 80.0),
             t2_min_top_depth=_env_float("T2_MIN_TOP_DEPTH", 100.0),
             t2_max_complement_error_bps=_env_float("T2_MAX_COMPLEMENT_ERROR_BPS", 150.0),
+            t2_max_signals_per_market_per_hour=_env_int("T2_MAX_SIGNALS_PER_MARKET_PER_HOUR", 2),
+            t2_stop_loss_bps=_env_float("T2_STOP_LOSS_BPS", 300.0),
+            t2_take_profit_capture_pct=_env_float("T2_TAKE_PROFIT_CAPTURE_PCT", 0.6),
+            t2_max_hold_sec=_env_float("T2_MAX_HOLD_SEC", 6 * 3600.0),
+            t2_exit_eval_interval_sec=_env_float("T2_EXIT_EVAL_INTERVAL_SEC", 30.0),
+            t2_optimal_stopping_enabled=_env_bool("T2_OPTIMAL_STOPPING_ENABLED", True),
             tick_record_enabled=_env_bool("TICK_RECORD_ENABLED", False),
             tick_record_dir=_env("TICK_RECORD_DIR", "data/ticks"),
             telemetry_record_enabled=_env_bool("TELEMETRY_RECORD_ENABLED", False),

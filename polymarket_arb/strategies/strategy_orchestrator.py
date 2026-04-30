@@ -102,11 +102,19 @@ class StrategyOrchestrator:
         StrategyTier.MARKET_MAKING: 0.15,
     }
     _MAX_SIGNAL_HISTORY = 2000
+    # Per-market-per-hour cap applies only to directional tiers; T0 / T3 are
+    # exempt because their cadence is bounded by other mechanisms (event-driven
+    # arbs, maker rest-order TTL).
+    _RATE_CAPPED_TIERS: frozenset[StrategyTier] = frozenset(
+        {StrategyTier.STATISTICAL_ARB, StrategyTier.CROSS_PLATFORM}
+    )
 
     def __init__(
         self,
         total_bankroll: float,
         allocations: Optional[dict[StrategyTier, float]] = None,
+        *,
+        max_signals_per_market_per_hour: int = 2,
     ):
         self._bankroll = total_bankroll
         alloc_map = allocations or self.DEFAULT_ALLOCATIONS
@@ -131,6 +139,13 @@ class StrategyOrchestrator:
         self._overlay_history: list[dict[str, Any]] = []
         self._last_skip_reasons: dict[str, int] = {}
         self._last_skipped_by_tier: dict[str, int] = {}
+        # Per-market signal-rate cap: (tier, market_id) -> [submission_ts, ...]
+        # Without this the bot will repeatedly fire on the same model-vs-market
+        # mispricing every scan cycle (telemetry showed 2957 signals on one
+        # market over 4 days). Submissions blocked by the cap are surfaced
+        # through `_last_skip_reasons["per_market_rate_cap"]`.
+        self._signal_history_by_market: dict[tuple[StrategyTier, str], list[float]] = {}
+        self._max_signals_per_market_per_hour = max(0, int(max_signals_per_market_per_hour))
 
     def submit_signal(
         self,
@@ -140,6 +155,15 @@ class StrategyOrchestrator:
         research_report: dict | Any | None = None,
         research_signals: list[Any] | None = None,
     ) -> bool:
+        if not self._check_per_market_rate_cap(signal):
+            self._record_process_skip(signal, "per_market_rate_cap")
+            LOG.info(
+                "策略信号被 per-market 速率上限拦截: tier=%s market=%s cap=%d/h",
+                signal.tier,
+                signal.market_id[:12] if signal.market_id else "?",
+                self._max_signals_per_market_per_hour,
+            )
+            return False
         signal_copy = replace(signal, payload=dict(signal.payload))
         overlay = self._apply_research_overlay(
             signal_copy,
@@ -163,6 +187,7 @@ class StrategyOrchestrator:
         )
         signal_copy.payload["tail_risk"] = tail_risk
         self._record_tail_risk(tail_risk)
+        self._record_per_market_submission(signal_copy)
         self._pending_signals.append(signal_copy)
         return True
 
@@ -366,6 +391,35 @@ class StrategyOrchestrator:
         self._last_skip_reasons[reason] = self._last_skip_reasons.get(reason, 0) + 1
         tier_name = getattr(signal.tier, "name", str(signal.tier))
         self._last_skipped_by_tier[tier_name] = self._last_skipped_by_tier.get(tier_name, 0) + 1
+
+    def _check_per_market_rate_cap(self, signal: StrategySignal) -> bool:
+        if self._max_signals_per_market_per_hour <= 0:
+            return True
+        if signal.tier not in self._RATE_CAPPED_TIERS:
+            return True
+        if not signal.market_id:
+            return True
+        key = (signal.tier, signal.market_id)
+        history = self._signal_history_by_market.get(key, [])
+        cutoff = time.time() - 3600.0
+        fresh = [ts for ts in history if ts >= cutoff]
+        if fresh != history:
+            self._signal_history_by_market[key] = fresh
+        return len(fresh) < self._max_signals_per_market_per_hour
+
+    def _record_per_market_submission(self, signal: StrategySignal) -> None:
+        if self._max_signals_per_market_per_hour <= 0:
+            return
+        if signal.tier not in self._RATE_CAPPED_TIERS:
+            return
+        if not signal.market_id:
+            return
+        key = (signal.tier, signal.market_id)
+        history = self._signal_history_by_market.setdefault(key, [])
+        history.append(time.time())
+        cap = self._max_signals_per_market_per_hour * 4
+        if cap > 0 and len(history) > cap:
+            del history[: len(history) - cap]
 
     def _apply_research_overlay(
         self,
