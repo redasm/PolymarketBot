@@ -691,7 +691,7 @@ class ExecutionEngine:
                             record.status.value,
                             submission.order_id[:16] if submission.order_id else "N/A",
                         )
-                except (RuntimeError, ValueError, TypeError, AttributeError, ImportError) as e:
+                except Exception as e:  # pragma: no cover - depends on remote CLOB failures
                     record.status = TradeStatus.FAILED
                     record.error = str(e)
                     LOG.error(
@@ -774,7 +774,7 @@ class ExecutionEngine:
                 payload = nested
                 break
 
-        direct_available = _coerce_fill_field(
+        direct_available = _coerce_collateral_amount(
             payload.get("available")
             or payload.get("available_balance")
             or payload.get("availableBalance")
@@ -784,12 +784,12 @@ class ExecutionEngine:
         if direct_available is not None:
             return direct_available
 
-        balance = _coerce_fill_field(
+        balance = _coerce_collateral_amount(
             payload.get("balance")
             or payload.get("balance_decimal")
             or payload.get("balanceDecimal")
         )
-        allowance = _coerce_fill_field(
+        allowance = _coerce_collateral_amount(
             payload.get("allowance")
             or payload.get("allowance_decimal")
             or payload.get("allowanceDecimal")
@@ -807,6 +807,20 @@ def _coerce_fill_field(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if parsed >= 0 else None
+
+
+def _coerce_collateral_amount(value: Any) -> float | None:
+    """Parse CLOB collateral amounts, accepting decimal USDC or raw 6-decimal units."""
+    parsed = _coerce_fill_field(value)
+    if parsed is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit() and parsed >= 1_000_000:
+            return parsed / 1_000_000.0
+    elif isinstance(value, int) and parsed >= 1_000_000:
+        return parsed / 1_000_000.0
+    return parsed
 
 
 def _parse_trade_sync_response(

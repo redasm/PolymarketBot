@@ -6,6 +6,8 @@ import sys
 import time
 import types
 
+import pytest
+
 from polymarket_arb.execution_engine import ExecutionEngine, OrderSubmissionResult
 from polymarket_arb.models import ArbLeg, ArbOpportunity, ArbType, OrderSide, TradeRecord, TradeStatus
 
@@ -377,6 +379,22 @@ def test_ensure_sufficient_collateral_rejects_when_balance_too_low(monkeypatch):
     assert ok is False
     assert "insufficient_balance" in reason
     assert available == 4.0
+
+
+def test_ensure_sufficient_collateral_converts_raw_usdc_units(monkeypatch):
+    _install_fake_clob_modules(monkeypatch)
+    client = _FakeClient()
+    client.balance_response = {
+        "balance": "9952392",
+        "allowance": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+    }
+    engine = ExecutionEngine(make_test_config(dry_run=False), client)
+
+    ok, reason, available = engine.ensure_sufficient_collateral(9.0)
+
+    assert ok is True
+    assert reason == ""
+    assert available == pytest.approx(9.952392)
 
 
 def test_sync_pending_trade_statuses_updates_filled_trade(monkeypatch):
