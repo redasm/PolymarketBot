@@ -122,6 +122,10 @@ Polymarket 由三套独立 API 组成：
 | `ARB_SCAN_INTERVAL_SEC` | float | `5.0` | 主循环扫描间隔（秒）。越小越灵敏，但 API 调用越频繁 |
 | `ARB_MARKET_FETCH_LIMIT` | int | `100` | Gamma API 拉取市场的批量大小 |
 | `ARB_DRY_RUN` | bool | `true` | `true` = 只扫描不交易。**强烈建议初次运行使用** |
+| `LIVE_MIN_NET_EDGE_BPS` | float | `25` | live 模式扣费后最低净 edge（bps），作为滑点/延迟安全垫 |
+| `LIVE_MIN_NET_EDGE_USD` | float | `0.0025` | live 模式扣费后最低每股净 edge（USDC） |
+| `LIVE_MAX_ORDERBOOK_SNAPSHOT_AGE_SEC` | float | `1` | live 模式允许的 WS 盘口最大年龄 |
+| `LIVE_MIN_WS_HIT_RATIO` | float | `0.25` | live 模式近期盘口读取最低 WS 命中率 |
 | `ARB_MIN_LIQUIDITY` | float | `1000` | 最小市场流动性（USDC），低于此值的市场被跳过 |
 | `ARB_MIN_VOLUME_24H` | float | `500` | 最小 24h 交易量（USDC），低于此值的市场被跳过 |
 | `ORDERBOOK_MISSING_COOLDOWN_SEC` | float | `300` | 当 CLOB 返回 `No orderbook exists` 时，对该 token 的冷却时间（秒），避免持续重复请求同一无盘口 token |

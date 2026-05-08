@@ -90,12 +90,13 @@ def test_submit_order_uses_fok(monkeypatch):
     result = engine._submit_order("token-1", OrderSide.BUY, 0.42, 5)
 
     assert result.order_id == "oid-123"
-    assert result.trade_status == TradeStatus.PENDING
+    assert result.trade_status == TradeStatus.FAILED
+    assert result.error == "non_gtc_not_filled"
     assert client.last_order_type == "FOK"
     assert client.last_post_only is False
 
 
-def test_submit_order_non_gtc_without_fill_status_stays_pending(monkeypatch):
+def test_submit_order_non_gtc_without_fill_status_fails_for_taker_arb(monkeypatch):
     _install_fake_clob_modules(monkeypatch)
 
     class _PendingClient(_FakeClient):
@@ -109,7 +110,8 @@ def test_submit_order_non_gtc_without_fill_status_stays_pending(monkeypatch):
 
     result = engine._submit_order("token-1", OrderSide.BUY, 0.42, 5)
 
-    assert result.trade_status == TradeStatus.PENDING
+    assert result.trade_status == TradeStatus.FAILED
+    assert "non_gtc_not_filled" in result.error
 
 
 def test_submit_order_non_gtc_partial_status_maps_to_partial(monkeypatch):

@@ -76,6 +76,24 @@ class RiskManager:
         if not can:
             return False, reason, 0.0
 
+        # Portfolio-sync circuit breaker: when sync has failed N consecutive
+        # times the in-memory exposure / position state is stale and risk caps
+        # cannot be trusted. Only enforced when portfolio_sync is required for
+        # live trading; dry-run still records the failure count for telemetry.
+        if (
+            self._config.portfolio_sync_enabled
+            and self._config.live_require_portfolio_sync
+            and self._config.portfolio_sync_max_consecutive_failures > 0
+            and self._state.portfolio_sync_consecutive_failures
+            >= self._config.portfolio_sync_max_consecutive_failures
+        ):
+            return (
+                False,
+                f"账户同步连续失败 {self._state.portfolio_sync_consecutive_failures} 次，"
+                f"已暂停开仓直到下一次成功同步",
+                0.0,
+            )
+
         event_id = opp.event_id
         if event_id in self._recent_arb_markets:
             last_ts = self._recent_arb_markets[event_id]
@@ -156,8 +174,12 @@ class RiskManager:
             self._state.consecutive_failures = 0
             self._halt_time = None
         elif has_any_fills:
-            # 部分成交：小额衰减，不触发熔断
-            self._state.consecutive_failures = max(0, self._state.consecutive_failures - 1)
+            self._state.consecutive_failures += 1
+            if self._state.consecutive_failures >= self._config.max_consecutive_failures > 0:
+                self._state.is_halted = True
+                self._halt_time = time.time()
+                self._state.halt_reason = f"连续失败 {self._state.consecutive_failures} 次"
+                LOG.error("风控熔断: %s", self._state.halt_reason)
         elif failed_trades and not (only_pending_submission and not count_pending_as_failure):
             # 零成交且有失败腿：计入连续失败
             self._state.consecutive_failures += 1
@@ -331,6 +353,12 @@ class RiskManager:
         self._state.last_portfolio_sync_ts = float(synced_at)
         self._state.portfolio_sync_ok = True
         self._state.portfolio_sync_error = ""
+        if self._state.portfolio_sync_consecutive_failures > 0:
+            LOG.info(
+                "账户同步恢复，重置连续失败计数 %d -> 0",
+                self._state.portfolio_sync_consecutive_failures,
+            )
+        self._state.portfolio_sync_consecutive_failures = 0
 
         merged_exposure = dict(actual_market_exposure)
         for condition_id, exposure, _, _ in self._pending_reservations.values():
@@ -342,8 +370,16 @@ class RiskManager:
     def mark_portfolio_sync_error(self, message: str, *, synced_at: float | None = None) -> None:
         self._state.portfolio_sync_ok = False
         self._state.portfolio_sync_error = message
+        self._state.portfolio_sync_consecutive_failures += 1
         if synced_at is not None:
             self._state.last_portfolio_sync_ts = float(synced_at)
+        cap = self._config.portfolio_sync_max_consecutive_failures
+        if cap > 0 and self._state.portfolio_sync_consecutive_failures >= cap:
+            LOG.warning(
+                "账户同步连续失败 %d 次（阈值 %d）：实盘已暂停开仓直到下次同步成功",
+                self._state.portfolio_sync_consecutive_failures,
+                cap,
+            )
 
     def apply_ai_adjustment(self, adjustments: dict) -> None:
         """应用 AI 建议的风控参数调整（受硬上限约束）.

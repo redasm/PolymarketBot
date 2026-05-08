@@ -216,6 +216,7 @@ class RiskState:
     last_portfolio_sync_ts: float = 0.0
     portfolio_sync_ok: bool = False
     portfolio_sync_error: str = ""
+    portfolio_sync_consecutive_failures: int = 0
 
     def check_can_trade(
         self,
@@ -502,6 +503,14 @@ def resolve_polymarket_fee_rate(default_taker_fee_rate: float, market: MarketInf
 
     Returns a decimal rate (`0.02` for 2%). Bps-like fields are converted from
     basis points, while decimal-looking fields are used directly.
+
+    Resolution order (newest Gamma fields first):
+      1. `feesEnabled=false` → 0.0 (no fees on this market)
+      2. `feeSchedule.rate` (decimal) — current Gamma format as of 2026-04
+      3. `takerBaseFee` (interpreted as bps × 100; e.g. 1000 → 10 bps decimal scaled)
+      4. Legacy `feeRateBps` / `baseFee` (basis points)
+      5. Legacy `feeRate` / `takerFeeRate` (decimal or bps depending on magnitude)
+      6. Fallback to the env-configured default.
     """
     raw: dict[str, Any] = {}
     if isinstance(market, MarketInfo):
@@ -512,6 +521,23 @@ def resolve_polymarket_fee_rate(default_taker_fee_rate: float, market: MarketInf
     fees_enabled = _first_present(raw, ("feesEnabled", "fees_enabled"))
     if fees_enabled is not None and not _coerce_bool(fees_enabled):
         return 0.0
+
+    schedule = _first_present(raw, ("feeSchedule", "fee_schedule"))
+    if isinstance(schedule, dict):
+        rate_value = schedule.get("rate")
+        rate = _coerce_non_negative_float(rate_value)
+        if rate is not None:
+            return rate / 10_000.0 if rate > 1.0 else rate
+
+    taker_base = _first_present(raw, ("takerBaseFee", "taker_base_fee"))
+    taker_base_value = _coerce_non_negative_float(taker_base)
+    if taker_base_value is not None:
+        # Polymarket's `takerBaseFee` field is denominated in 1/1_000_000 of
+        # notional (ppm). 1000 ppm == 0.001 == 10 bps. We treat any value
+        # >100 as ppm; smaller values are already a decimal rate.
+        if taker_base_value > 100:
+            return taker_base_value / 1_000_000.0
+        return taker_base_value / 10_000.0 if taker_base_value > 1.0 else taker_base_value
 
     bps_value = _first_present(
         raw,

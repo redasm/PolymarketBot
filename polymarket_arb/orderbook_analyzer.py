@@ -87,6 +87,45 @@ class OrderBookAnalyzer:
                 self._stats = {key: 0 for key in _ORDERBOOK_STAT_KEYS}
             return snap
 
+    def feed_health(
+        self,
+        *,
+        max_snapshot_age_sec: float,
+        min_ws_hit_ratio: float,
+    ) -> dict[str, Any]:
+        """Return live-trading orderbook health from recent source stats."""
+        if self._live_mirror is None:
+            return {"healthy": False, "reason": "ws_mirror_unavailable"}
+
+        stats = self.snapshot_stats(reset=False)
+        requests = max(0, int(stats.get("requests", 0)))
+        ws_hits = max(0, int(stats.get("ws_hit", 0)))
+        rest_errors = max(0, int(stats.get("rest_error", 0)))
+        missing = max(0, int(stats.get("missing_orderbook", 0)))
+        ws_hit_ratio = (ws_hits / requests) if requests > 0 else 0.0
+        if requests > 0 and ws_hit_ratio < min_ws_hit_ratio:
+            return {
+                "healthy": False,
+                "reason": "ws_hit_ratio_low",
+                "ws_hit_ratio": ws_hit_ratio,
+                "stats": stats,
+            }
+        if rest_errors > 0:
+            return {"healthy": False, "reason": "rest_errors_present", "stats": stats}
+        if missing > 0:
+            return {"healthy": False, "reason": "missing_orderbooks_present", "stats": stats}
+
+        now = time.time()
+        for snap in self._live_mirror.all().values():
+            snap_ts = float(getattr(snap, "timestamp", 0.0) or 0.0)
+            if snap_ts > 0 and (now - snap_ts) > max_snapshot_age_sec:
+                return {
+                    "healthy": False,
+                    "reason": "stale_ws_snapshot",
+                    "snapshot_age_sec": now - snap_ts,
+                }
+        return {"healthy": True, "reason": "", "ws_hit_ratio": ws_hit_ratio, "stats": stats}
+
     def get_snapshot(
         self,
         token_id: str,

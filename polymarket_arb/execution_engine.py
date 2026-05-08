@@ -311,10 +311,12 @@ class ExecutionEngine:
             trade_status = TradeStatus.PARTIAL
         elif success and remote_status in _FAILED_REMOTE_STATUSES:
             trade_status = TradeStatus.FAILED
+        elif success and execution_type != self._gtc_order_type:
+            trade_status = TradeStatus.FAILED
+            if not error_msg:
+                error_msg = "non_gtc_not_filled"
         elif success and remote_status in _PENDING_REMOTE_STATUSES:
             trade_status = TradeStatus.PENDING
-        elif success and execution_type != self._gtc_order_type:
-            trade_status = TradeStatus.PENDING if order_id else TradeStatus.FAILED
         elif success and remote_status:
             trade_status = TradeStatus.PENDING
         elif success and order_id:

@@ -1266,6 +1266,88 @@ def test_build_directional_opportunity_uses_clob_fee_shape():
     assert signal.payload["execution_check"]["net_edge_bps"] == pytest.approx(20.0)
 
 
+def test_live_directional_opportunity_rejects_edge_below_live_buffer():
+    class _Snapshot:
+        best_ask = 0.50
+        best_bid = 0.49
+        asks = [type("Level", (), {"price": 0.50, "size": 100.0})()]
+        bids = [type("Level", (), {"price": 0.49, "size": 100.0})()]
+
+    class _StubOrderBookAnalyzer:
+        def get_snapshot(self, token_id):
+            return _Snapshot()
+
+        def get_executable_ask_price(self, token_id, target_size):
+            return (0.50, target_size)
+
+    market = MarketInfo(
+        condition_id="cond-1",
+        question="Will BTC rise?",
+        slug="btc-rise",
+        tokens=[TokenInfo("yes-1", "Yes"), TokenInfo("no-1", "No")],
+    )
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id="cond-1",
+        description="test",
+        expected_edge=200.0,
+        confidence=0.8,
+        recommended_size_usdc=1.0,
+        payload={"deviation": 0.0205, "model_prob": 0.5205, "market_prob": 0.50},
+    )
+
+    opportunity, _, reason = _build_directional_opportunity_from_signal(
+        config=make_test_config(
+            dry_run=False,
+            polymarket_taker_fee_rate=0.072,
+            live_min_net_edge_bps=30.0,
+            live_min_net_edge_usd=0.003,
+        ),
+        signal=signal,
+        market=market,
+        ob_analyzer=_StubOrderBookAnalyzer(),
+    )
+
+    assert opportunity is None
+    assert reason == "live_edge_below_buffer"
+    assert signal.payload["execution_check"]["reason"] == "live_edge_below_buffer"
+
+
+def test_live_directional_opportunity_rejects_unhealthy_orderbook_feed():
+    class _StubOrderBookAnalyzer:
+        def feed_health(self, **kwargs):
+            return {"healthy": False, "reason": "ws_hit_ratio_low"}
+
+    market = MarketInfo(
+        condition_id="cond-1",
+        question="Will BTC rise?",
+        slug="btc-rise",
+        tokens=[TokenInfo("yes-1", "Yes"), TokenInfo("no-1", "No")],
+    )
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id="cond-1",
+        description="test",
+        expected_edge=500.0,
+        confidence=0.8,
+        recommended_size_usdc=1.0,
+        payload={"deviation": 0.05},
+    )
+
+    opportunity, _, reason = _build_directional_opportunity_from_signal(
+        config=make_test_config(dry_run=False),
+        signal=signal,
+        market=market,
+        ob_analyzer=_StubOrderBookAnalyzer(),
+    )
+
+    assert opportunity is None
+    assert reason == "orderbook_feed_unhealthy"
+    assert signal.payload["execution_check"]["feed_health_reason"] == "ws_hit_ratio_low"
+
+
 def test_collect_maker_strategy_signals_use_snapshot_tick_size():
     class _Snapshot:
         def __init__(self, best_bid, best_ask, bid_size, ask_size, tick_size):
