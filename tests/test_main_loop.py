@@ -176,7 +176,13 @@ def test_create_research_signal_service_gracefully_disables_on_import_error(monk
             raise ImportError("broken module")
         raise AssertionError(f"unexpected import: {name}")
 
-    monkeypatch.setattr("polymarket_arb.main_loop.importlib.import_module", _raise_import_error)
+    # The helper now lives in `main_helpers.cli_setup`; `main_loop` keeps
+    # only the underscore-aliased re-import. Patching the original module
+    # ensures the import failure is exercised wherever the real call site is.
+    monkeypatch.setattr(
+        "polymarket_arb.main_helpers.cli_setup.importlib.import_module",
+        _raise_import_error,
+    )
 
     assert _create_research_signal_service(config) is None
 
