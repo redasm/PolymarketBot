@@ -238,6 +238,10 @@ class ArbConfig:
             raise ValueError("CLOB_HOST 和 GAMMA_HOST 不能为空")
         if self.clob_client_version not in {"auto", "v1", "v2"}:
             raise ValueError("POLYMARKET_CLOB_CLIENT_VERSION 必须是 auto / v1 / v2")
+        if self.signature_type not in {0, 1, 2, 3}:
+            raise ValueError("POLYMARKET_SIGNATURE_TYPE 必须是 0 / 1 / 2 / 3")
+        if self.signature_type == 3 and self.clob_client_version == "v1":
+            raise ValueError("POLYMARKET_SIGNATURE_TYPE=3 需要 POLYMARKET_CLOB_CLIENT_VERSION=auto 或 v2")
         if self.market_fetch_limit <= 0:
             raise ValueError("ARB_MARKET_FETCH_LIMIT 必须大于 0")
         if self.min_edge_usd < 0:
@@ -405,12 +409,12 @@ class ArbConfig:
             load_dotenv(override=True)
 
         private_key = _env("PRIVATE_KEY") or _env("POLYMARKET_PRIVATE_KEY")
-        funder = _env("POLYMARKET_FUNDER")
+        funder = _env("POLYMARKET_FUNDER") or _env("POLYMARKET_DEPOSIT_WALLET")
         if require_wallet:
             if not private_key:
                 raise ValueError("必须设置 PRIVATE_KEY 或 POLYMARKET_PRIVATE_KEY")
             if not funder:
-                raise ValueError("必须设置 POLYMARKET_FUNDER（代理钱包地址）")
+                raise ValueError("必须设置 POLYMARKET_FUNDER 或 POLYMARKET_DEPOSIT_WALLET")
         else:
             private_key = private_key or "research-mode"
             funder = funder or "research-mode"

@@ -118,7 +118,8 @@ Copy `.env.example` (or `polymarket_only_live.env.example`) to `.env`. Key flags
 |----------|---------|--------|
 | `ARB_DRY_RUN` | `true` | Scan only, no real orders |
 | `PRIVATE_KEY` | (required for live) | Wallet private key |
-| `POLYMARKET_FUNDER` | (required for live) | Proxy wallet address |
+| `POLYMARKET_FUNDER` | (required for live) | Proxy/Safe address or deposit wallet address |
+| `POLYMARKET_SIGNATURE_TYPE` | `2` | Use `3` for deposit wallet / `POLY_1271` |
 | `ARB_MIN_EDGE_USD` | `0.005` | Minimum net profit threshold |
 | `TICK_RECORD_ENABLED` | `false` | Record orderbook ticks for backtesting |
 | `AI_ENABLED` | `false` | Enable LLM decision layer |

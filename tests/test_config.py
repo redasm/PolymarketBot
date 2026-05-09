@@ -51,6 +51,33 @@ def test_config_validate_rejects_default_order_above_max_order():
         make_test_config(default_order_size_usdc=60.0, max_order_size_usdc=50.0)
 
 
+def test_deposit_wallet_requires_v2_client():
+    with pytest.raises(ValueError, match="POLYMARKET_CLOB_CLIENT_VERSION"):
+        make_test_config(signature_type=3, clob_client_version="v1")
+
+
+def test_from_env_accepts_deposit_wallet_alias(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env.deposit-wallet"
+    env_path.write_text(
+        "\n".join(
+            [
+                "PRIVATE_KEY=0xabc",
+                "POLYMARKET_DEPOSIT_WALLET=0xdeposit",
+                "POLYMARKET_SIGNATURE_TYPE=3",
+                "POLYMARKET_CLOB_CLIENT_VERSION=v2",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("POLYMARKET_FUNDER", raising=False)
+
+    cfg = ArbConfig.from_env(env_path)
+
+    assert cfg.funder_address == "0xdeposit"
+    assert cfg.signature_type == 3
+    assert cfg.clob_client_version == "v2"
+
+
 def test_from_env_loads_new_edge_and_cooldown_config(tmp_path, monkeypatch):
     env_path = write_test_env(tmp_path)
     env_path.write_text(

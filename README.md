@@ -247,7 +247,9 @@ cp .env.example .env
 | 变量 | 说明 | 默认 |
 |------|------|------|
 | `PRIVATE_KEY` | 钱包私钥 | (必填) |
-| `POLYMARKET_FUNDER` | 代理钱包地址 | (必填) |
+| `POLYMARKET_FUNDER` | 交易资金钱包地址；老用户填 proxy/Safe，新 deposit wallet 用户填 deposit wallet | (必填) |
+| `POLYMARKET_DEPOSIT_WALLET` | deposit wallet 地址别名；留空时使用 `POLYMARKET_FUNDER` | 空 |
+| `POLYMARKET_SIGNATURE_TYPE` | `0` EOA / `1` Proxy / `2` Safe / `3` Deposit Wallet (`POLY_1271`) | `2` |
 | `ARB_DRY_RUN` | true=只扫描不交易 | true |
 | `ARB_MIN_EDGE_USD` | 最小净利润门槛 | 0.005 |
 | `ARB_MIN_EDGE_PCT` | 最小利润率门槛 | 0.3% |

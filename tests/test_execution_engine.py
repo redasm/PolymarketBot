@@ -38,6 +38,7 @@ class _FakeClient:
         self.last_order_type = None
         self.cancelled: list[str] = []
         self.last_post_only = None
+        self.last_balance_params = None
         self.balance_response = {"balance": "100.0", "allowance": "100.0"}
         self.order_responses: dict[str, dict] = {}
 
@@ -53,6 +54,7 @@ class _FakeClient:
         self.cancelled.append(order_id)
 
     def get_balance_allowance(self, params=None):
+        self.last_balance_params = params
         return self.balance_response
 
     def get_order(self, order_id):
@@ -397,6 +399,38 @@ def test_ensure_sufficient_collateral_converts_raw_usdc_units(monkeypatch):
     assert ok is True
     assert reason == ""
     assert available == pytest.approx(9.952392)
+
+
+def test_deposit_wallet_balance_check_uses_signature_type_3(monkeypatch):
+    poly_1271 = object()
+    collateral = object()
+
+    class BalanceAllowanceParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    fake_v2 = types.ModuleType("py_clob_client_v2")
+    fake_v2.AssetType = types.SimpleNamespace(COLLATERAL=collateral)
+    fake_v2.BalanceAllowanceParams = BalanceAllowanceParams
+    fake_v2.OrderType = types.SimpleNamespace(GTC="GTC", FOK="FOK", FAK="FAK")
+    fake_v2.SignatureTypeV2 = types.SimpleNamespace(POLY_1271=poly_1271)
+    monkeypatch.setitem(sys.modules, "py_clob_client_v2", fake_v2)
+
+    client = _FakeClient()
+    engine = ExecutionEngine(
+        make_test_config(dry_run=False, clob_client_version="v2", signature_type=3),
+        client,
+    )
+
+    ok, reason, available = engine.ensure_sufficient_collateral(10.0)
+
+    assert ok is True
+    assert reason == ""
+    assert available == 100.0
+    assert client.last_balance_params.kwargs == {
+        "asset_type": collateral,
+        "signature_type": poly_1271,
+    }
 
 
 def test_sync_pending_trade_statuses_updates_filled_trade(monkeypatch):

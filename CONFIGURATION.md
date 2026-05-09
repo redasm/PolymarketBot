@@ -29,9 +29,9 @@
 ## 前置条件
 
 1. **Python 3.11+**
-2. **Polygon 链钱包**：需要私钥和代理钱包地址
-3. **Polymarket 账户**：在 [polymarket.com](https://polymarket.com) 登录一次，系统会自动部署 Gnosis Safe 代理钱包
-4. **USDC.e 余额**：代理钱包中需要有 USDC.e（Polygon 上的 USDC）用于交易
+2. **Polygon 链钱包**：需要私钥和交易资金钱包地址
+3. **Polymarket 账户**：老用户可继续使用 Safe/Proxy；新 API 用户使用 deposit wallet
+4. **余额**：Safe/Proxy 用户确保 proxy/Safe 有交易资金；deposit wallet 用户确保 pUSD 在 deposit wallet 中
 5. **网络环境**：Polymarket 有[地理封锁](https://docs.polymarket.com/api-reference/geoblock)，部分地区（含美国）无法交易
 
 ## 快速开始
@@ -51,7 +51,7 @@ pip install -r requirements.txt
 
 # 3. 配置环境变量
 cp .env.example .env
-# 编辑 .env 填写 PRIVATE_KEY 和 POLYMARKET_FUNDER
+# 编辑 .env 填写 PRIVATE_KEY 和 POLYMARKET_FUNDER / POLYMARKET_DEPOSIT_WALLET
 
 # 4. 运行（默认 dry run 模式，只扫描不交易）
 python run_arb_bot.py
@@ -90,7 +90,8 @@ Polymarket 由三套独立 API 组成：
 | 环境变量 | 类型 | 默认值 | 必填 | 说明 |
 |----------|------|--------|------|------|
 | `PRIVATE_KEY` | str | — | **是** | 钱包私钥（hex 格式，`0x` 开头）。也可用 `POLYMARKET_PRIVATE_KEY` |
-| `POLYMARKET_FUNDER` | str | — | **是** | 代理钱包地址（在 [polymarket.com/settings](https://polymarket.com/settings) 查看） |
+| `POLYMARKET_FUNDER` | str | — | **是** | 交易资金钱包地址。老用户填 proxy/Safe；deposit wallet 用户填 deposit wallet |
+| `POLYMARKET_DEPOSIT_WALLET` | str | — | 否 | `POLYMARKET_FUNDER` 的别名，便于新 deposit wallet 用户显式配置 |
 | `POLYMARKET_SIGNATURE_TYPE` | int | `2` | 否 | 签名类型，见下表 |
 | `CHAIN_ID` | int | `137` | 否 | 链 ID，137 = Polygon 主网 |
 
@@ -100,7 +101,8 @@ Polymarket 由三套独立 API 组成：
 |----|------|----------|
 | `0` | EOA | MetaMask 等标准钱包。需要 POL 付 gas |
 | `1` | POLY_PROXY | Magic Link（邮箱/Google）登录用户。需从 Polymarket.com 导出私钥 |
-| `2` | GNOSIS_SAFE | Gnosis Safe 代理钱包。**绝大多数用户使用此类型** |
+| `2` | GNOSIS_SAFE | 既有 Browser/Gnosis Safe 代理钱包 |
+| `3` | POLY_1271 | 新 deposit wallet。要求 `POLYMARKET_CLOB_CLIENT_VERSION=auto` 或 `v2` |
 
 ### API 端点
 
@@ -399,11 +401,14 @@ CLOB API 采用两层认证模型，`client_factory.py` 已封装了完整流程
 ClobClient(host, chain_id=137)
 
 # 交易客户端 — L1 派生凭证 + L2 初始化
-temp = ClobClient(host, key=PRIVATE_KEY, chain_id=137)
+temp = ClobClient(host, key=PRIVATE_KEY, chain_id=137,
+                  signature_type=SIGNATURE_TYPE, funder=FUNDER)
 creds = temp.derive_api_key()  # L1 → 获取 apiKey/secret/passphrase
 client = ClobClient(host, key=PRIVATE_KEY, chain_id=137,
-                    creds=creds, signature_type=2, funder=FUNDER)
+                    creds=creds, signature_type=SIGNATURE_TYPE, funder=FUNDER)
 ```
+
+deposit wallet 用户需要设置 `POLYMARKET_SIGNATURE_TYPE=3`。代码会优先使用 `py-clob-client-v2` 的 `SignatureTypeV2.POLY_1271`，余额检查也会带 `signature_type=3`。
 
 ---
 
@@ -513,11 +518,12 @@ ARB_SCAN_INTERVAL_SEC=10
 
 ### Q: `assert "必须设置 POLYMARKET_FUNDER"` 报错
 
-你需要先在 [polymarket.com](https://polymarket.com) 登录一次，系统会自动部署代理钱包。然后在 Settings 页面找到钱包地址，填入 `POLYMARKET_FUNDER`。
+老 Safe/Proxy 用户在 Settings 页面找到钱包地址后填入 `POLYMARKET_FUNDER`。新 deposit wallet 用户填入 deposit wallet 地址，或者使用 `POLYMARKET_DEPOSIT_WALLET`。
 
 ### Q: 签名类型怎么选？
 
-- 全新的 Polymarket 用户 → `2`（Gnosis Safe）
+- 新 deposit wallet 用户 → `3`（POLY_1271，必须使用 v2 CLOB 客户端）
+- 既有 Browser/Gnosis Safe 用户 → `2`
 - 用邮箱/Google 登录的老用户 → `1`（Poly Proxy）
 - 用 MetaMask 直连的用户 → `0`（EOA）
 

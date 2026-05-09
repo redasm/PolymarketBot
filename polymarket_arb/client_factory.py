@@ -18,11 +18,24 @@ def _load_clob_client_class(config: ArbConfig) -> tuple[Any, str]:
 
             return ClobClient, "v2"
         except ImportError:
+            if config.signature_type == 3:
+                raise ImportError("POLYMARKET_SIGNATURE_TYPE=3 需要安装 py-clob-client-v2")
             if preferred == "v2":
                 raise
     from py_clob_client.client import ClobClient
 
     return ClobClient, "v1"
+
+
+def _resolve_signature_type(config: ArbConfig, version: str) -> Any:
+    if version != "v2" or config.signature_type != 3:
+        return config.signature_type
+
+    try:
+        from py_clob_client_v2 import SignatureTypeV2
+    except ImportError:
+        return config.signature_type
+    return getattr(SignatureTypeV2, "POLY_1271", config.signature_type)
 
 
 def _build_client(clob_client: Any, config: ArbConfig, **kwargs: Any) -> Any:
@@ -63,6 +76,7 @@ def build_trading_client(config: ArbConfig) -> Any:
     clob_client, version = _load_clob_client_class(config)
     if version == "v2":
         _force_py_clob_http1()
+    signature_type = _resolve_signature_type(config, version)
 
     temp_client = _build_l1_client(config, clob_client=clob_client)
     try:
@@ -89,7 +103,7 @@ def build_trading_client(config: ArbConfig) -> Any:
         config,
         key=config.private_key,
         creds=creds,
-        signature_type=config.signature_type,
+        signature_type=signature_type,
         funder=config.funder_address,
     )
     LOG.info(
@@ -103,13 +117,16 @@ def build_trading_client(config: ArbConfig) -> Any:
 
 
 def _build_l1_client(config: ArbConfig, *, clob_client: Any | None = None):
+    version = None
     if clob_client is None:
-        clob_client, _ = _load_clob_client_class(config)
+        clob_client, version = _load_clob_client_class(config)
+    if version is None:
+        version = "v2" if config.signature_type == 3 else "v1"
     return _build_client(
         clob_client,
         config,
         key=config.private_key,
-        signature_type=config.signature_type,
+        signature_type=_resolve_signature_type(config, version),
         funder=config.funder_address,
     )
 

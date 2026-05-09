@@ -13,9 +13,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from py_clob_client.signer import Signer
-from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-
 from polymarket_arb.client_factory import build_readonly_client, build_trading_client
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.execution_engine import ExecutionEngine
@@ -57,8 +54,7 @@ def _build_config(dotenv_path: str | None, *, signature_type_override: int | Non
 
 
 def _check_signer(config: ArbConfig) -> dict[str, Any]:
-    signer = Signer(config.private_key, config.chain_id)
-    owner = signer.address()
+    owner = _owner_address_from_private_key(config.private_key, config.chain_id)
     return _ok_result(
         "signer",
         {
@@ -105,14 +101,16 @@ def _check_available_balance(config: ArbConfig, trading_client: Any) -> dict[str
     available = engine.get_available_collateral_balance()
     raw_response = None
     try:
-        raw_response = trading_client.get_balance_allowance(
-            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-        )
+        balance_params = _build_balance_allowance_params(config)
+        if balance_params is None:
+            raw_response = trading_client.get_balance_allowance()
+        else:
+            raw_response = trading_client.get_balance_allowance(balance_params)
     except TypeError:
         try:
-            raw_response = trading_client.get_balance_allowance(
-                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=-1)
-            )
+            if config.signature_type == 3:
+                raise
+            raw_response = trading_client.get_balance_allowance(_build_legacy_balance_allowance_params(-1))
         except Exception as exc:
             raw_response = {"error": str(exc)}
     except Exception as exc:
@@ -125,6 +123,39 @@ def _check_available_balance(config: ArbConfig, trading_client: Any) -> dict[str
     if available is None:
         return _err_result("available_balance", "balance_check_unavailable", details)
     return _ok_result("available_balance", details)
+
+
+def _owner_address_from_private_key(private_key: str, chain_id: int) -> str:
+    try:
+        from py_clob_client.signer import Signer
+
+        return Signer(private_key, chain_id).address()
+    except ImportError:
+        from eth_account import Account
+
+        return Account.from_key(private_key).address
+
+
+def _build_balance_allowance_params(config: ArbConfig) -> Any | None:
+    if config.signature_type == 3:
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams, SignatureTypeV2
+
+        return BalanceAllowanceParams(
+            asset_type=AssetType.COLLATERAL,
+            signature_type=getattr(SignatureTypeV2, "POLY_1271", 3),
+        )
+
+    try:
+        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+    except ImportError:
+        return None
+    return BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+
+
+def _build_legacy_balance_allowance_params(signature_type: int) -> Any:
+    from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+    return BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=signature_type)
 
 
 def _check_portfolio_sync(config: ArbConfig) -> dict[str, Any]:

@@ -449,27 +449,46 @@ class ExecutionEngine:
         self._balance_cache_ts = 0.0
 
     def _fetch_collateral_balance_uncached(self) -> float | None:
+        balance_params = self._build_collateral_balance_params()
         try:
-            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-        except Exception:
-            return self._parse_balance_response(
-                getattr(self._client, "get_balance_allowance", lambda *args, **kwargs: None)()
-            )
-
-        try:
-            response = self._client.get_balance_allowance(
-                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            )
+            if balance_params is None:
+                response = self._client.get_balance_allowance()
+            else:
+                response = self._client.get_balance_allowance(balance_params)
         except TypeError:
+            if self._config.signature_type == 3:
+                return None
             try:
-                response = self._client.get_balance_allowance(
-                    BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=-1)
-                )
+                fallback_params = self._build_legacy_balance_params_with_signature(-1)
+                response = self._client.get_balance_allowance(fallback_params)
             except Exception:
                 return None
         except Exception:
             return None
         return self._parse_balance_response(response)
+
+    def _build_collateral_balance_params(self) -> Any | None:
+        if self._config.signature_type == 3:
+            from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+
+            return BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=_resolve_poly_1271_signature_type(),
+            )
+
+        try:
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        except Exception:
+            return None
+        return BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+
+    def _build_legacy_balance_params_with_signature(self, signature_type: int) -> Any:
+        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+        return BalanceAllowanceParams(
+            asset_type=AssetType.COLLATERAL,
+            signature_type=signature_type,
+        )
 
     def get_recent_trades(self, limit: int = 20, *, include_simulated: bool = False) -> list[TradeRecord]:
         history = self._trade_history if not include_simulated else self._trade_history + self._simulated_trade_history
@@ -823,6 +842,14 @@ def _coerce_collateral_amount(value: Any) -> float | None:
     elif isinstance(value, int) and parsed >= 1_000_000:
         return parsed / 1_000_000.0
     return parsed
+
+
+def _resolve_poly_1271_signature_type() -> Any:
+    try:
+        from py_clob_client_v2 import SignatureTypeV2
+    except ImportError:
+        return 3
+    return getattr(SignatureTypeV2, "POLY_1271", 3)
 
 
 def _parse_trade_sync_response(
