@@ -191,6 +191,33 @@ def test_reconnect_jitter_stays_within_expected_range():
     assert 10.0 <= delay <= 13.0
 
 
+def test_apply_delta_buffers_until_snapshot_arrives():
+    """Pre-snapshot deltas must be replayed once the snapshot lands.
+
+    Previously they were silently dropped, which caused the first few price
+    movements after a reconnect to be invisible to downstream tiers.
+    """
+    mirror = OrderBookMirror()
+
+    # delta arrives first — must NOT be applied to a non-existent book
+    mirror.apply_delta("token-late", "buy", 0.41, 100.0)
+    assert mirror.get("token-late") is None
+
+    # snapshot arrives — buffered delta should be replayed on top
+    mirror.apply_snapshot(
+        "token-late",
+        bids=[{"price": "0.40", "size": "50"}],
+        asks=[{"price": "0.45", "size": "50"}],
+    )
+
+    snap = mirror.get("token-late")
+    assert snap is not None
+    bid_prices = sorted(level.price for level in snap.bids)
+    # Replayed delta added a 0.41 level to the snapshot's [0.40] bids.
+    assert 0.41 in bid_prices
+    assert 0.40 in bid_prices
+
+
 def test_callback_queue_drops_oldest_snapshot_when_backlogged():
     mirror = OrderBookMirror()
     with mirror._callbacks_lock:

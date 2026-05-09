@@ -32,6 +32,14 @@ LOG = logging.getLogger(__name__)
 
 POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 _MAX_PENDING_CALLBACKS = 1024
+# Buffer size for deltas that arrive before a snapshot. Bounded so a runaway
+# delta stream against an un-synced token cannot exhaust memory; old entries
+# fall off FIFO when the buffer overflows.
+_PRE_SNAPSHOT_DELTA_BUFFER = 64
+# WebSocket close codes that should NOT trigger an indefinite reconnect loop:
+# they signal a configuration/authorization problem the bot cannot recover
+# from on its own. The remaining codes are treated as transient.
+_FATAL_WS_CLOSE_CODES = frozenset({4000, 4001, 4003})
 
 
 class OrderBookMirror:
@@ -49,6 +57,10 @@ class OrderBookMirror:
         self._callback_queue: queue.Queue[tuple[str, OrderBookSnapshot] | None] = queue.Queue(maxsize=_MAX_PENDING_CALLBACKS)
         self._callback_worker: Optional[threading.Thread] = None
         self._callback_worker_running = False
+        # Deltas that arrive before the first snapshot for a token are buffered
+        # here and replayed once the snapshot lands. Without this we silently
+        # drop the early increments after every reconnect.
+        self._pending_deltas: dict[str, list[tuple[str, float, float]]] = {}
 
     def register_callback(self, cb: Callable[[str, OrderBookSnapshot], None]) -> None:
         should_start = False
@@ -97,6 +109,17 @@ class OrderBookMirror:
 
         with self._lock:
             self._books[token_id] = snap
+            buffered = self._pending_deltas.pop(token_id, [])
+
+        if buffered:
+            LOG.info(
+                "回放快照前缓存的 %d 条 delta: token=%s",
+                len(buffered),
+                token_id[:16],
+            )
+            for side, price, new_size in buffered:
+                self.apply_delta(token_id, side, price, new_size)
+            return
 
         self._fire_callbacks(token_id, snap)
 
@@ -105,10 +128,22 @@ class OrderBookMirror:
 
         side: "buy" 或 "sell"
         new_size: 0 表示该价位已消失
+
+        If a snapshot has not yet arrived for `token_id` the delta is buffered
+        (FIFO, capped) and replayed once the snapshot lands.
         """
         with self._lock:
             snap = self._books.get(token_id)
             if snap is None:
+                buffer = self._pending_deltas.setdefault(token_id, [])
+                buffer.append((side, price, new_size))
+                if len(buffer) > _PRE_SNAPSHOT_DELTA_BUFFER:
+                    del buffer[: len(buffer) - _PRE_SNAPSHOT_DELTA_BUFFER]
+                    LOG.warning(
+                        "丢弃过旧的 pre-snapshot delta: token=%s buffer=%d",
+                        token_id[:16],
+                        len(buffer),
+                    )
                 return
 
             if side == "buy":
@@ -257,6 +292,7 @@ class WebSocketFeed:
     def _run_loop(self) -> None:
         """WebSocket 主循环：连接 → 订阅 → 接收 → 重连."""
         import websockets.sync.client as ws_sync
+        from websockets.exceptions import ConnectionClosed
 
         while self._running:
             try:
@@ -282,19 +318,44 @@ class WebSocketFeed:
 
                         self._handle_message(raw)
 
-            except Exception as e:
+            except ConnectionClosed as exc:
+                if not self._running:
+                    break
+                if self._enhanced_store is not None:
+                    self._enhanced_store.set_connected(False)
+                code = getattr(getattr(exc, "rcvd", None), "code", None) or getattr(
+                    getattr(exc, "sent", None), "code", None
+                )
+                if code in _FATAL_WS_CLOSE_CODES:
+                    LOG.error(
+                        "WebSocket 收到 fatal close code=%s（鉴权/订阅 schema 错误），停止重连",
+                        code,
+                    )
+                    self._running = False
+                    break
+                LOG.warning(
+                    "WebSocket 关闭 code=%s reason=%r，%.1f 秒后重连",
+                    code,
+                    getattr(exc, "reason", ""),
+                    self._reconnect_delay,
+                )
+                self._sleep_with_backoff()
+            except Exception as exc:
                 if not self._running:
                     break
                 if self._enhanced_store is not None:
                     self._enhanced_store.set_connected(False)
                 LOG.warning(
                     "WebSocket 断开: %s，%.1f 秒后重连",
-                    e,
+                    exc,
                     self._reconnect_delay,
                 )
-                sleep_for = self._with_reconnect_jitter(self._reconnect_delay)
-                time.sleep(sleep_for)
-                self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
+                self._sleep_with_backoff()
+
+    def _sleep_with_backoff(self) -> None:
+        sleep_for = self._with_reconnect_jitter(self._reconnect_delay)
+        time.sleep(sleep_for)
+        self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
 
     def _handle_message(self, raw: str | bytes) -> None:
         """解析 WebSocket 消息并更新镜像 + EnhancedBookStore."""

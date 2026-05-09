@@ -1,3 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polymarket-arb"
+version = "0.1.0"
+description = "Polymarket multi-tier arbitrage and market-making bot"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "py-clob-client==0.34.6",
+    # Pinned upper bound: ExecutionEngine relies on `_force_py_clob_http1` to
+    # toggle the module-private `_http_client` attribute. New majors of the
+    # client may rename or relocate that hook (see contract test in
+    # `tests/test_client_factory.py`); upgrade only after re-validating.
+    "py-clob-client-v2>=1.0.0,<2.0.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31.0",
+    "websockets>=12.0",
+    "aiohttp>=3.9.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+]
+
+[project.optional-dependencies]
+ai = [
+    "openai>=1.30.0",
+    "anthropic>=0.30.0",
+    "httpx>=0.27.0",
+]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["polymarket_arb*", "research*", "research_signal*"]
+exclude = ["tests*", "data*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

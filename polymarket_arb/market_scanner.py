@@ -5,13 +5,19 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import requests
 
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.models import EventInfo, MarketInfo, ResearchSignal, ResearchSignalReport, TokenInfo
-from research_signal.service import ResearchSignalService
+
+if TYPE_CHECKING:
+    # research_signal is an optional sub-package; main_loop.py guards its
+    # import behind ArbConfig.research_signal_enabled. Keep this module
+    # importable even when the sub-package is missing or broken so the bot
+    # still boots in the default (disabled) configuration.
+    from research_signal.service import ResearchSignalService
 
 LOG = logging.getLogger(__name__)
 
@@ -315,7 +321,7 @@ class MarketScanner:
     def enrich_markets_with_research(
         self,
         markets: list[MarketInfo],
-        signal_service: ResearchSignalService | None,
+        signal_service: "ResearchSignalService | None",
         *,
         window_sec: int = 86400,
         signals: list[ResearchSignal] | None = None,

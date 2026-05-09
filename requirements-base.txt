@@ -1,5 +1,7 @@
 py-clob-client==0.34.6
-py-clob-client-v2>=1.0.0
+# Pinned upper bound: client_factory._force_py_clob_http1 monkey-patches a
+# module-private attribute. Validate the contract test before relaxing.
+py-clob-client-v2>=1.0.0,<2.0.0
 python-dotenv>=1.0.0
 requests>=2.31.0
 websockets>=12.0

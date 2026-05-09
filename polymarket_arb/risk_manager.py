@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from dataclasses import dataclass
 
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.models import (
@@ -26,25 +28,50 @@ from polymarket_arb.models import (
 LOG = logging.getLogger(__name__)
 
 
+@dataclass
+class PendingReservation:
+    """Capital reserved against a still-open order.
+
+    Replaces the prior 4-tuple `(condition_id, exposure, ts, consumes_slot)`,
+    which forced positional unpacking everywhere and made adding fields a
+    silent breakage.
+    """
+
+    condition_id: str
+    exposure: float
+    created_ts: float
+    consumes_slot: bool
+
+
 class RiskManager:
-    """全局风险管理."""
+    """全局风险管理.
+
+    Thread-safety: dashboard_api reads state from the HTTP thread while the
+    main loop mutates it from the scan/exec path. All public methods take
+    `_lock` (an RLock so internal helpers can recurse), and `state` returns a
+    cheap shallow copy so readers never observe a half-applied update.
+    """
 
     def __init__(self, config: ArbConfig):
         self._config = config
         self._state = RiskState()
         self._market_exposure: dict[str, float] = {}  # condition_id -> 敞口
         self._recent_arb_markets: dict[str, float] = {}  # event_id -> 最后执行时间
-        self._pending_reservations: dict[str, tuple[str, float, float, bool]] = {}
+        self._pending_reservations: dict[str, PendingReservation] = {}
         self._daily_reset_ts: float = _start_of_day()
         self._effective_max_total_exposure = config.max_total_exposure
         self._effective_max_daily_loss = config.max_daily_loss
         self._pending_reservation_ttl_sec = config.risk_pending_reservation_ttl_sec
         self._halt_time: float | None = None
+        # RLock so e.g. `pre_trade_check` can call `_reconcile_pending_reservations`
+        # without deadlocking on itself.
+        self._lock = threading.RLock()
 
     @property
     def state(self) -> RiskState:
-        self._reconcile_pending_reservations()
-        return self._state
+        with self._lock:
+            self._reconcile_pending_reservations()
+            return _snapshot_risk_state(self._state)
 
     def pre_trade_check(self, opp: ArbOpportunity, proposed_size: float) -> tuple[bool, str, float]:
         """交易前风控检查.
@@ -52,6 +79,10 @@ class RiskManager:
         Returns:
             (允许交易, 原因, 调整后的数量)
         """
+        with self._lock:
+            return self._pre_trade_check_locked(opp, proposed_size)
+
+    def _pre_trade_check_locked(self, opp: ArbOpportunity, proposed_size: float) -> tuple[bool, str, float]:
         self._maybe_reset_daily()
         self._reconcile_pending_reservations()
 
@@ -151,6 +182,22 @@ class RiskManager:
         count_pending_as_failure: bool = True,
     ) -> None:
         """记录交易执行结果，更新风险状态."""
+        with self._lock:
+            self._record_execution_locked(
+                opp,
+                trades,
+                realized_pnl=realized_pnl,
+                count_pending_as_failure=count_pending_as_failure,
+            )
+
+    def _record_execution_locked(
+        self,
+        opp: ArbOpportunity,
+        trades: list[TradeRecord],
+        *,
+        realized_pnl: float | None,
+        count_pending_as_failure: bool,
+    ) -> None:
         filled_trades = [t for t in trades if t.status == TradeStatus.FILLED]
         partially_filled_trades = [t for t in trades if t.status == TradeStatus.PARTIAL]
         pending_trades = [t for t in trades if t.status == TradeStatus.PENDING]
@@ -213,11 +260,11 @@ class RiskManager:
             exposure = leg_cost * t.size
             self._market_exposure[cid] = self._market_exposure.get(cid, 0.0) + exposure
             reservation_key = t.order_id or t.trade_id
-            self._pending_reservations[reservation_key] = (
-                cid,
-                exposure,
-                time.time(),
-                not bool(getattr(t, "post_only", False)),
+            self._pending_reservations[reservation_key] = PendingReservation(
+                condition_id=cid,
+                exposure=exposure,
+                created_ts=time.time(),
+                consumes_slot=not bool(getattr(t, "post_only", False)),
             )
 
         self._state.open_positions = self._compute_open_positions()
@@ -238,15 +285,16 @@ class RiskManager:
 
     def record_settlement(self, condition_id: str, pnl: float) -> None:
         """记录市场结算后的盈亏."""
-        self._state.daily_pnl += pnl
-        exposure = self._market_exposure.pop(condition_id, 0.0)
-        self._state.total_exposure = max(0, self._state.total_exposure - exposure)
-        self._pending_reservations = {
-            key: value
-            for key, value in self._pending_reservations.items()
-            if value[0] != condition_id
-        }
-        self._state.open_positions = self._compute_open_positions()
+        with self._lock:
+            self._state.daily_pnl += pnl
+            exposure = self._market_exposure.pop(condition_id, 0.0)
+            self._state.total_exposure = max(0, self._state.total_exposure - exposure)
+            self._pending_reservations = {
+                key: reservation
+                for key, reservation in self._pending_reservations.items()
+                if reservation.condition_id != condition_id
+            }
+            self._state.open_positions = self._compute_open_positions()
 
     def reconcile_pending_order_statuses(self, trades: list[TradeRecord]) -> None:
         """根据订单状态同步结果修正 pending 预留敞口.
@@ -256,66 +304,66 @@ class RiskManager:
         - `FILLED`: 释放预留并按最终成交数量落地真实敞口
         - `FAILED` / `CANCELLED`: 释放预留
         """
-        now = time.time()
-        updated = False
+        with self._lock:
+            now = time.time()
+            updated = False
 
-        for trade in trades:
-            reservation_key = trade.order_id or trade.trade_id
-            if not reservation_key:
-                continue
+            for trade in trades:
+                reservation_key = trade.order_id or trade.trade_id
+                if not reservation_key:
+                    continue
 
-            reservation = self._pending_reservations.get(reservation_key)
-            if reservation is None:
-                continue
+                reservation = self._pending_reservations.get(reservation_key)
+                if reservation is None:
+                    continue
 
-            condition_id, reserved_exposure, _, consumes_slot = reservation
-            if trade.status in (TradeStatus.PENDING, TradeStatus.PARTIAL):
-                self._pending_reservations[reservation_key] = (
-                    condition_id,
-                    reserved_exposure,
-                    now,
-                    consumes_slot or trade.status == TradeStatus.PARTIAL,
+                if trade.status in (TradeStatus.PENDING, TradeStatus.PARTIAL):
+                    self._pending_reservations[reservation_key] = PendingReservation(
+                        condition_id=reservation.condition_id,
+                        exposure=reservation.exposure,
+                        created_ts=now,
+                        consumes_slot=reservation.consumes_slot or trade.status == TradeStatus.PARTIAL,
+                    )
+                    continue
+
+                self._pending_reservations.pop(reservation_key, None)
+                current = self._market_exposure.get(reservation.condition_id, 0.0)
+                leg_cost = trade.economic_cost if trade.economic_cost is not None else trade.price
+
+                terminal_fill_exposure = leg_cost * _resolved_exposure_size(trade)
+                if trade.status == TradeStatus.FILLED:
+                    final_exposure = terminal_fill_exposure
+                    delta = final_exposure - reservation.exposure
+                    action = "成交落地"
+                elif terminal_fill_exposure > 0:
+                    # A resting order can partially fill and then be cancelled.
+                    # Release only the unfilled reservation; keep filled inventory
+                    # booked as live exposure.
+                    final_exposure = leg_cost * _resolved_exposure_size(trade)
+                    delta = final_exposure - reservation.exposure
+                    action = "部分成交后释放剩余挂单"
+                else:
+                    delta = -reservation.exposure
+                    action = "释放挂单"
+
+                remaining = max(0.0, current + delta)
+                if remaining > 0:
+                    self._market_exposure[reservation.condition_id] = remaining
+                else:
+                    self._market_exposure.pop(reservation.condition_id, None)
+                self._state.total_exposure = max(0.0, self._state.total_exposure + delta)
+                updated = True
+                LOG.info(
+                    "同步订单后修正敞口: action=%s key=%s market=%s delta=$%.4f status=%s",
+                    action,
+                    reservation_key[:16],
+                    reservation.condition_id[:12],
+                    delta,
+                    trade.status.value,
                 )
-                continue
 
-            self._pending_reservations.pop(reservation_key, None)
-            current = self._market_exposure.get(condition_id, 0.0)
-            leg_cost = trade.economic_cost if trade.economic_cost is not None else trade.price
-
-            terminal_fill_exposure = leg_cost * _resolved_exposure_size(trade)
-            if trade.status == TradeStatus.FILLED:
-                final_exposure = terminal_fill_exposure
-                delta = final_exposure - reserved_exposure
-                action = "成交落地"
-            elif terminal_fill_exposure > 0:
-                # A resting order can partially fill and then be cancelled.
-                # Release only the unfilled reservation; keep filled inventory
-                # booked as live exposure.
-                final_exposure = leg_cost * _resolved_exposure_size(trade)
-                delta = final_exposure - reserved_exposure
-                action = "部分成交后释放剩余挂单"
-            else:
-                delta = -reserved_exposure
-                action = "释放挂单"
-
-            remaining = max(0.0, current + delta)
-            if remaining > 0:
-                self._market_exposure[condition_id] = remaining
-            else:
-                self._market_exposure.pop(condition_id, None)
-            self._state.total_exposure = max(0.0, self._state.total_exposure + delta)
-            updated = True
-            LOG.info(
-                "同步订单后修正敞口: action=%s key=%s market=%s delta=$%.4f status=%s",
-                action,
-                reservation_key[:16],
-                condition_id[:12],
-                delta,
-                trade.status.value,
-            )
-
-        if updated:
-            self._state.open_positions = self._compute_open_positions()
+            if updated:
+                self._state.open_positions = self._compute_open_positions()
 
     def sync_portfolio_snapshot(
         self,
@@ -325,61 +373,65 @@ class RiskManager:
         synced_at: float,
     ) -> None:
         """用账户真实状态刷新持仓和已实现日盈亏."""
-        self._reconcile_pending_reservations()
+        with self._lock:
+            self._reconcile_pending_reservations()
 
-        actual_market_exposure: dict[str, float] = {}
-        normalized_positions: list[PositionSnapshot] = []
-        for position in positions:
-            size = max(0.0, float(position.size))
-            if size <= 0:
-                continue
-            avg_price = max(0.0, float(position.avg_price))
-            normalized = PositionSnapshot(
-                token_id=position.token_id,
-                condition_id=position.condition_id,
-                outcome=position.outcome,
-                size=size,
-                avg_price=avg_price,
-                current_value=max(0.0, float(position.current_value)),
-                unrealized_pnl=float(position.unrealized_pnl),
-            )
-            normalized_positions.append(normalized)
-            actual_market_exposure[normalized.condition_id] = (
-                actual_market_exposure.get(normalized.condition_id, 0.0) + (normalized.avg_price * normalized.size)
-            )
+            actual_market_exposure: dict[str, float] = {}
+            normalized_positions: list[PositionSnapshot] = []
+            for position in positions:
+                size = max(0.0, float(position.size))
+                if size <= 0:
+                    continue
+                avg_price = max(0.0, float(position.avg_price))
+                normalized = PositionSnapshot(
+                    token_id=position.token_id,
+                    condition_id=position.condition_id,
+                    outcome=position.outcome,
+                    size=size,
+                    avg_price=avg_price,
+                    current_value=max(0.0, float(position.current_value)),
+                    unrealized_pnl=float(position.unrealized_pnl),
+                )
+                normalized_positions.append(normalized)
+                actual_market_exposure[normalized.condition_id] = (
+                    actual_market_exposure.get(normalized.condition_id, 0.0) + (normalized.avg_price * normalized.size)
+                )
 
-        self._state.positions = normalized_positions
-        self._state.daily_pnl = float(realized_daily_pnl)
-        self._state.last_portfolio_sync_ts = float(synced_at)
-        self._state.portfolio_sync_ok = True
-        self._state.portfolio_sync_error = ""
-        if self._state.portfolio_sync_consecutive_failures > 0:
-            LOG.info(
-                "账户同步恢复，重置连续失败计数 %d -> 0",
-                self._state.portfolio_sync_consecutive_failures,
-            )
-        self._state.portfolio_sync_consecutive_failures = 0
+            self._state.positions = normalized_positions
+            self._state.daily_pnl = float(realized_daily_pnl)
+            self._state.last_portfolio_sync_ts = float(synced_at)
+            self._state.portfolio_sync_ok = True
+            self._state.portfolio_sync_error = ""
+            if self._state.portfolio_sync_consecutive_failures > 0:
+                LOG.info(
+                    "账户同步恢复，重置连续失败计数 %d -> 0",
+                    self._state.portfolio_sync_consecutive_failures,
+                )
+            self._state.portfolio_sync_consecutive_failures = 0
 
-        merged_exposure = dict(actual_market_exposure)
-        for condition_id, exposure, _, _ in self._pending_reservations.values():
-            merged_exposure[condition_id] = merged_exposure.get(condition_id, 0.0) + exposure
-        self._market_exposure = merged_exposure
-        self._state.total_exposure = sum(merged_exposure.values())
-        self._state.open_positions = self._compute_open_positions()
+            merged_exposure = dict(actual_market_exposure)
+            for reservation in self._pending_reservations.values():
+                merged_exposure[reservation.condition_id] = (
+                    merged_exposure.get(reservation.condition_id, 0.0) + reservation.exposure
+                )
+            self._market_exposure = merged_exposure
+            self._state.total_exposure = sum(merged_exposure.values())
+            self._state.open_positions = self._compute_open_positions()
 
     def mark_portfolio_sync_error(self, message: str, *, synced_at: float | None = None) -> None:
-        self._state.portfolio_sync_ok = False
-        self._state.portfolio_sync_error = message
-        self._state.portfolio_sync_consecutive_failures += 1
-        if synced_at is not None:
-            self._state.last_portfolio_sync_ts = float(synced_at)
-        cap = self._config.portfolio_sync_max_consecutive_failures
-        if cap > 0 and self._state.portfolio_sync_consecutive_failures >= cap:
-            LOG.warning(
-                "账户同步连续失败 %d 次（阈值 %d）：实盘已暂停开仓直到下次同步成功",
-                self._state.portfolio_sync_consecutive_failures,
-                cap,
-            )
+        with self._lock:
+            self._state.portfolio_sync_ok = False
+            self._state.portfolio_sync_error = message
+            self._state.portfolio_sync_consecutive_failures += 1
+            if synced_at is not None:
+                self._state.last_portfolio_sync_ts = float(synced_at)
+            cap = self._config.portfolio_sync_max_consecutive_failures
+            if cap > 0 and self._state.portfolio_sync_consecutive_failures >= cap:
+                LOG.warning(
+                    "账户同步连续失败 %d 次（阈值 %d）：实盘已暂停开仓直到下次同步成功",
+                    self._state.portfolio_sync_consecutive_failures,
+                    cap,
+                )
 
     def apply_ai_adjustment(self, adjustments: dict) -> None:
         """应用 AI 建议的风控参数调整（受硬上限约束）.
@@ -393,28 +445,30 @@ class RiskManager:
         if not adjustments:
             return
 
-        base_exposure = self._config.max_total_exposure
-        base_daily_loss = self._config.max_daily_loss
+        with self._lock:
+            base_exposure = self._config.max_total_exposure
+            base_daily_loss = self._config.max_daily_loss
 
-        if "max_exposure_factor" in adjustments:
-            factor = max(0.5, min(1.5, float(adjustments["max_exposure_factor"])))
-            new_val = base_exposure * factor
-            LOG.info("AI 风控调整: max_total_exposure %.2f -> %.2f (factor=%.2f)", base_exposure, new_val, factor)
-            self._effective_max_total_exposure = new_val
+            if "max_exposure_factor" in adjustments:
+                factor = max(0.5, min(1.5, float(adjustments["max_exposure_factor"])))
+                new_val = base_exposure * factor
+                LOG.info("AI 风控调整: max_total_exposure %.2f -> %.2f (factor=%.2f)", base_exposure, new_val, factor)
+                self._effective_max_total_exposure = new_val
 
-        if "daily_loss_factor" in adjustments:
-            factor = max(0.5, min(1.5, float(adjustments["daily_loss_factor"])))
-            new_val = base_daily_loss * factor
-            LOG.info("AI 风控调整: max_daily_loss %.2f -> %.2f (factor=%.2f)", base_daily_loss, new_val, factor)
-            self._effective_max_daily_loss = new_val
+            if "daily_loss_factor" in adjustments:
+                factor = max(0.5, min(1.5, float(adjustments["daily_loss_factor"])))
+                new_val = base_daily_loss * factor
+                LOG.info("AI 风控调整: max_daily_loss %.2f -> %.2f (factor=%.2f)", base_daily_loss, new_val, factor)
+                self._effective_max_daily_loss = new_val
 
     def reset_halt(self) -> None:
         """手动解除熔断."""
-        self._state.is_halted = False
-        self._state.halt_reason = ""
-        self._state.consecutive_failures = 0
-        self._halt_time = None
-        LOG.info("风控熔断已手动解除")
+        with self._lock:
+            self._state.is_halted = False
+            self._state.halt_reason = ""
+            self._state.consecutive_failures = 0
+            self._halt_time = None
+            LOG.info("风控熔断已手动解除")
 
     def _format_cooldown_label(self) -> str:
         seconds = self._config.risk_event_cooldown_sec
@@ -433,28 +487,35 @@ class RiskManager:
     def _reconcile_pending_reservations(self) -> None:
         now = time.time()
         expired_keys = [
-            key for key, (_, _, created_ts, _) in self._pending_reservations.items()
-            if now - created_ts >= self._pending_reservation_ttl_sec
+            key for key, reservation in self._pending_reservations.items()
+            if now - reservation.created_ts >= self._pending_reservation_ttl_sec
         ]
         for key in expired_keys:
-            condition_id, exposure, _, _ = self._pending_reservations.pop(key)
-            current = self._market_exposure.get(condition_id, 0.0)
-            remaining = max(0.0, current - exposure)
+            reservation = self._pending_reservations.pop(key)
+            current = self._market_exposure.get(reservation.condition_id, 0.0)
+            remaining = max(0.0, current - reservation.exposure)
             if remaining > 0:
-                self._market_exposure[condition_id] = remaining
+                self._market_exposure[reservation.condition_id] = remaining
             else:
-                self._market_exposure.pop(condition_id, None)
-            self._state.total_exposure = max(0.0, self._state.total_exposure - exposure)
-            LOG.info("释放过期预留敞口: key=%s, market=%s, exposure=$%.4f", key[:16], condition_id[:12], exposure)
+                self._market_exposure.pop(reservation.condition_id, None)
+            self._state.total_exposure = max(0.0, self._state.total_exposure - reservation.exposure)
+            LOG.info(
+                "释放过期预留敞口: key=%s, market=%s, exposure=$%.4f",
+                key[:16],
+                reservation.condition_id[:12],
+                reservation.exposure,
+            )
 
         self._state.open_positions = self._compute_open_positions()
 
     def _compute_open_positions(self) -> int:
         slotless_pending_by_market: dict[str, float] = {}
-        for condition_id, exposure, _, consumes_slot in self._pending_reservations.values():
-            if consumes_slot:
+        for reservation in self._pending_reservations.values():
+            if reservation.consumes_slot:
                 continue
-            slotless_pending_by_market[condition_id] = slotless_pending_by_market.get(condition_id, 0.0) + exposure
+            slotless_pending_by_market[reservation.condition_id] = (
+                slotless_pending_by_market.get(reservation.condition_id, 0.0) + reservation.exposure
+            )
 
         count = 0
         for condition_id, exposure in self._market_exposure.items():
@@ -475,6 +536,28 @@ class RiskManager:
             f"状态: {'🔴 已暂停 - ' + s.halt_reason if s.is_halted else '🟢 正常'}",
         ]
         return "\n".join(lines)
+
+
+def _snapshot_risk_state(state: RiskState) -> RiskState:
+    """Return a shallow copy so HTTP readers cannot observe a half-applied write.
+
+    Lists/dicts inside RiskState are recreated; nested dataclasses
+    (PositionSnapshot) are immutable enough at the field level to share by
+    reference without confusing the dashboard.
+    """
+    return RiskState(
+        total_exposure=state.total_exposure,
+        open_positions=state.open_positions,
+        daily_pnl=state.daily_pnl,
+        consecutive_failures=state.consecutive_failures,
+        is_halted=state.is_halted,
+        halt_reason=state.halt_reason,
+        positions=list(state.positions),
+        last_portfolio_sync_ts=state.last_portfolio_sync_ts,
+        portfolio_sync_ok=state.portfolio_sync_ok,
+        portfolio_sync_error=state.portfolio_sync_error,
+        portfolio_sync_consecutive_failures=state.portfolio_sync_consecutive_failures,
+    )
 
 
 def _start_of_day() -> float:

@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from polymarket_arb.ai_context import MarketContextBuilder
@@ -47,7 +48,10 @@ class AIAdvisor:
         self._temperature = config.ai_temperature
 
         self._daily_cost_usd = 0.0
-        self._daily_cost_reset_ts = time.time()
+        # Reset key tracks the UTC calendar day, not a 24h sliding window. A
+        # bot started at 23:59 UTC must reset its budget at the very next
+        # 00:00 UTC, not 24h later.
+        self._daily_cost_reset_day = _utc_day_key(time.time())
         self._call_count = 0
         self._consecutive_losses = 0
         self._degraded = False
@@ -270,10 +274,16 @@ class AIAdvisor:
 
     def _check_budget(self) -> bool:
         """检查是否超出日成本上限."""
-        now = time.time()
-        if now - self._daily_cost_reset_ts > 86400:
+        today = _utc_day_key(time.time())
+        if today != self._daily_cost_reset_day:
+            LOG.info(
+                "AI 日成本已跨日重置: %s -> %s, 累计 $%.4f -> 0",
+                self._daily_cost_reset_day,
+                today,
+                self._daily_cost_usd,
+            )
             self._daily_cost_usd = 0.0
-            self._daily_cost_reset_ts = now
+            self._daily_cost_reset_day = today
 
         if self._daily_cost_usd >= self._config.ai_max_cost_per_day:
             LOG.warning(
@@ -378,6 +388,11 @@ class AIAdvisor:
         self._decision_history.append(entry)
         if len(self._decision_history) > 200:
             self._decision_history = self._decision_history[-200:]
+
+
+def _utc_day_key(timestamp: float) -> str:
+    """Return YYYY-MM-DD (UTC) for use as a calendar-day budget reset key."""
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
 def create_ai_advisor(config: ArbConfig) -> Optional[AIAdvisor]:

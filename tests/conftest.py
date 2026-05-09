@@ -2,12 +2,35 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.models import OrderBookLevel, OrderBookSnapshot
+
+
+@pytest.fixture(autouse=True)
+def _isolate_env_pollution():
+    """Snapshot `os.environ` so dotenv writes in one test cannot leak into the next.
+
+    `ArbConfig.from_env` calls `load_dotenv(override=True)`, which mutates
+    `os.environ` directly and bypasses pytest's `monkeypatch` rollback. Without
+    this fixture, e.g. `test_from_env_accepts_deposit_wallet_alias` writes
+    `POLYMARKET_DEPOSIT_WALLET=0xdeposit` into the global env, and a later test
+    that calls `from_env` in research mode silently picks it up.
+    """
+    snapshot = dict(os.environ)
+    try:
+        yield
+    finally:
+        for key in list(os.environ.keys()):
+            if key not in snapshot:
+                del os.environ[key]
+        for key, value in snapshot.items():
+            if os.environ.get(key) != value:
+                os.environ[key] = value
 
 
 @pytest.fixture()

@@ -5,7 +5,7 @@ import types
 
 import pytest
 
-from polymarket_arb.client_factory import build_trading_client
+from polymarket_arb.client_factory import _force_py_clob_http1, build_trading_client
 from tests.conftest import make_test_config
 
 
@@ -188,3 +188,53 @@ def test_build_trading_client_retries_with_http1_after_request_exception(monkeyp
 
     assert client is not None
     assert "http2=False" in calls
+
+
+def test_force_py_clob_http1_contract_attribute_present(monkeypatch):
+    """Lock in the contract: the helper module exposes a writable
+    `_http_client` attribute that we can swap out for an HTTP/1.1 httpx client.
+
+    If a future `py_clob_client_v2` release renames or removes that attribute
+    this test must fail loudly so we re-validate the live deposit-wallet flow
+    before bumping the dependency.
+    """
+    import httpx
+
+    fake_helpers = types.ModuleType("py_clob_client_v2.http_helpers.helpers")
+    fake_helpers._http_client = httpx.Client(http2=False)
+    monkeypatch.setitem(sys.modules, "py_clob_client_v2.http_helpers.helpers", fake_helpers)
+    # Make sure the v1 path is missing so we only count the v2 patch.
+    monkeypatch.setitem(sys.modules, "py_clob_client.http_helpers.helpers", types.ModuleType("dummy"))
+
+    captured: list[bool] = []
+
+    class _SpyClient:
+        def __init__(self, http2=False):
+            captured.append(http2)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(httpx, "Client", _SpyClient)
+
+    patched = _force_py_clob_http1()
+
+    # v2 module patched ok, v1 module had no `_http_client` -> skipped.
+    assert patched == 1
+    assert captured == [False]
+    assert isinstance(fake_helpers._http_client, _SpyClient)
+
+
+def test_force_py_clob_http1_contract_warns_when_attribute_missing(monkeypatch, caplog):
+    """If a future SDK version removes `_http_client`, surface a WARNING
+    rather than silently shipping HTTP/2 in production.
+    """
+    fake_helpers = types.ModuleType("py_clob_client_v2.http_helpers.helpers")
+    monkeypatch.setitem(sys.modules, "py_clob_client_v2.http_helpers.helpers", fake_helpers)
+    monkeypatch.setitem(sys.modules, "py_clob_client.http_helpers.helpers", types.ModuleType("dummy"))
+
+    with caplog.at_level("WARNING"):
+        patched = _force_py_clob_http1()
+
+    assert patched == 0
+    assert any("_http_client" in record.getMessage() for record in caplog.records)

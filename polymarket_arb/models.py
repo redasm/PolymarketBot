@@ -76,6 +76,16 @@ class OrderBookSnapshot:
 
 
 @dataclass
+class TokenInfo:
+    """市场中单个结果对应的 token."""
+
+    token_id: str
+    outcome: str
+    price: float = 0.0
+    winner: Optional[bool] = None
+
+
+@dataclass
 class MarketInfo:
     """从 Gamma API 获取的市场元数据."""
 
@@ -96,16 +106,6 @@ class MarketInfo:
     neg_risk: bool = False
     end_date: str = ""
     raw: dict = field(default_factory=dict)
-
-
-@dataclass
-class TokenInfo:
-    """市场中单个结果对应的 token."""
-
-    token_id: str
-    outcome: str
-    price: float = 0.0
-    winner: Optional[bool] = None
 
 
 @dataclass

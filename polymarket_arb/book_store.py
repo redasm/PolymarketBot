@@ -132,13 +132,25 @@ class EnhancedBookStore:
         self._last_update_ms = 0
 
     def set_market(self, market_id: str, yes_token_id: str, no_token_id: str) -> None:
+        # EnhancedBookStore is single-market by design: changing the market
+        # discards yes/no books that downstream tiers (T0/T2/edge_engine) may
+        # still be reading. Surface the swap loudly so callers don't silently
+        # observe stale or empty books after a primary-market rotation.
         with self._lock:
+            previous_market_id = self._market_id
             self._market_id = market_id
             self._yes_token_id = yes_token_id
             self._no_token_id = no_token_id
             self._yes = OrderbookSide()
             self._no = OrderbookSide()
-        LOG.info("book_store market set: %s", market_id)
+        if previous_market_id and previous_market_id != market_id:
+            LOG.warning(
+                "EnhancedBookStore 切换市场: %s -> %s (yes/no 已重置)",
+                previous_market_id,
+                market_id,
+            )
+        else:
+            LOG.info("book_store market set: %s", market_id)
 
     def set_connected(self, connected: bool) -> None:
         with self._lock:

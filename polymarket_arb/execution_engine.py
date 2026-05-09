@@ -19,7 +19,7 @@ import concurrent.futures
 import logging
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from polymarket_arb.config import ArbConfig
@@ -71,6 +71,20 @@ class OrderSyncResult:
     changed: list[TradeRecord]
 
 
+@dataclass
+class RollbackResult:
+    """Best-effort cancel outcome split by failure mode.
+
+    `cancelled` — order acknowledged as cancelled by the remote CLOB.
+    `transient_failed` — network/transport error; remote order may still be
+    live, caller MUST keep the trade in PENDING and trigger a forced
+    portfolio reconcile so the next risk check sees ground truth.
+    """
+
+    cancelled: set[str] = field(default_factory=set)
+    transient_failed: set[str] = field(default_factory=set)
+
+
 class ExecutionEngine:
     """套利交易执行引擎."""
 
@@ -86,6 +100,10 @@ class ExecutionEngine:
         self._gtc_order_type = self._resolve_named_order_type("GTC")
         self._balance_cache: float | None = None
         self._balance_cache_ts: float = 0.0
+        # Set whenever a rollback hits a transient (network) failure, so the
+        # main loop can force a portfolio sync before approving new trades.
+        # Cleared by `consume_force_portfolio_resync()`.
+        self._force_portfolio_resync_ts: float | None = None
 
     @property
     def trade_history(self) -> list[TradeRecord]:
@@ -133,12 +151,28 @@ class ExecutionEngine:
         ]
         if not all_success and cancellable_order_ids:
             LOG.warning("[cid=%s] 套利部分失败，尝试撤销已提交的订单…", arb_id)
-            cancelled_order_ids = self._rollback_orders(cancellable_order_ids)
-            if cancelled_order_ids:
+            outcome = self._rollback_orders(cancellable_order_ids)
+            cancelled_ids, transient_ids = _coerce_rollback_outcome(outcome)
+            if cancelled_ids:
                 for record in records:
-                    if record.order_id in cancelled_order_ids:
+                    if record.order_id in cancelled_ids:
                         record.status = TradeStatus.CANCELLED
                         record.rolled_back = True
+            if transient_ids:
+                # Transient (network) cancel failures: order may still be live
+                # on the CLOB. Keep it in PENDING so reconcile_pending_order_statuses
+                # can poll it next cycle, append a tag for forensics, and arm
+                # a forced portfolio resync before any new trade approval.
+                for record in records:
+                    if record.order_id in transient_ids:
+                        record.status = TradeStatus.PENDING
+                        record.error = (record.error + "|" if record.error else "") + "rollback_transient_failed"
+                self._force_portfolio_resync_ts = time.time()
+                LOG.error(
+                    "[cid=%s] 部分腿撤单失败 (transport): order_ids=%s — 已请求 portfolio 强制同步",
+                    arb_id,
+                    sorted(transient_ids),
+                )
 
         if not all_success:
             for record in records:
@@ -146,6 +180,17 @@ class ExecutionEngine:
                     record.error = "hedge_incomplete"
 
         return records
+
+    def consume_force_portfolio_resync(self) -> bool:
+        """Pop the force-resync flag set after a transient rollback failure.
+
+        Returns True exactly once per failure event so the main loop can
+        prioritise a portfolio_sync.refresh() before its next risk check.
+        """
+        if self._force_portfolio_resync_ts is None:
+            return False
+        self._force_portfolio_resync_ts = None
+        return True
 
     def is_successful_execution(
         self, opp: ArbOpportunity, trades: list[TradeRecord]
@@ -156,8 +201,12 @@ class ExecutionEngine:
         )
 
     def _resolve_execution_order_type(self) -> Any:
+        # In dry-run we never reach `_submit_order_v1/v2`; the orchestrator
+        # short-circuits into `_simulate_dry_run_arbitrage`. Returning None
+        # here keeps the contract uniform: live callers always see an Enum
+        # (or get a hard ValueError); dry-run callers must not consume it.
         if self._config.dry_run:
-            return "FOK"
+            return None
 
         for candidate in ("FOK", "FAK", "GTC"):
             resolved = self._resolve_named_order_type(candidate)
@@ -166,8 +215,11 @@ class ExecutionEngine:
         raise ValueError("py_clob_client OrderType 缺少 FOK/FAK/GTC，无法初始化 ExecutionEngine")
 
     def _resolve_named_order_type(self, name: str) -> Any:
+        # Live path: always resolve to the underlying Enum member; downstream
+        # CLOB clients reject raw strings on the v2 API. Dry-run callers
+        # should never consult this.
         if self._config.dry_run:
-            return name
+            return None
         try:
             from py_clob_client_v2 import OrderType
         except ImportError:
@@ -333,17 +385,39 @@ class ExecutionEngine:
             fill_price=fill_price,
         )
 
-    def _rollback_orders(self, order_ids: list[str]) -> set[str]:
-        """尽最大努力撤销已提交的订单."""
-        cancelled: set[str] = set()
+    def _rollback_orders(self, order_ids: list[str]) -> RollbackResult:
+        """Cancel orders best-effort, classifying failures by mode.
+
+        Two outcomes matter to the caller:
+        - cancelled: client confirmed the cancel.
+        - transient_failed: cancel raised a transport/network error; the
+          order may still be live on the CLOB. Caller MUST keep the
+          corresponding TradeRecord in PENDING and force a portfolio resync.
+
+        Logical errors (AttributeError / ValueError / RuntimeError) signal
+        local programmer mistakes — we treat them as cancelled-on-our-side
+        because retrying won't help and the order most likely never went
+        through; this preserves the original behaviour for those classes.
+        """
+        result = RollbackResult()
         for oid in order_ids:
             try:
                 self._client.cancel(oid)
-                LOG.info("回滚: 已撤销订单 %s", oid[:16])
-                cancelled.add(oid)
-            except (AttributeError, RuntimeError, ValueError) as e:
-                LOG.error("回滚: 撤销订单 %s 失败: %s", oid[:16], e)
-        return cancelled
+            except (AttributeError, RuntimeError, ValueError) as exc:
+                # Programming/contract bugs — keep prior semantics: order
+                # almost certainly never landed; do not pessimistically
+                # block downstream tiers.
+                LOG.error("回滚: 撤销订单 %s 失败 (logical): %s", oid[:16], exc)
+                continue
+            except Exception as exc:
+                # Anything else — requests.RequestException, httpx errors,
+                # OSError, timeouts. Order may still be alive on the CLOB.
+                LOG.error("回滚: 撤销订单 %s 失败 (transport): %s", oid[:16], exc)
+                result.transient_failed.add(oid)
+                continue
+            LOG.info("回滚: 已撤销订单 %s", oid[:16])
+            result.cancelled.add(oid)
+        return result
 
     def submit_limit_order(
         self,
@@ -818,6 +892,21 @@ class ExecutionEngine:
         if balance is not None and allowance is not None:
             return min(balance, allowance)
         return balance if balance is not None else allowance
+
+
+def _coerce_rollback_outcome(outcome: Any) -> tuple[set[str], set[str]]:
+    """Bridge between the new `RollbackResult` and legacy `set[str]` mocks.
+
+    Existing tests stub `_rollback_orders` with `lambda ids: set(ids)`; this
+    keeps the call sites working without forcing every test to migrate.
+    """
+    if isinstance(outcome, RollbackResult):
+        return outcome.cancelled, outcome.transient_failed
+    if isinstance(outcome, set):
+        return outcome, set()
+    if outcome is None:
+        return set(), set()
+    return set(outcome), set()
 
 
 def _coerce_fill_field(value: Any) -> float | None:

@@ -29,6 +29,10 @@ class DashboardState:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        # Public read-only field grouped from `_lock`. API endpoints can grab
+        # it without reaching into the private attribute, while writers in
+        # this module keep a single lock identity.
+        self.lock = self._lock
         self.bot_start_ts: float = time.time()
         self.cycle_count: int = 0
         self.is_running: bool = True
@@ -161,7 +165,7 @@ async def api_status() -> JSONResponse:
 @app.get("/api/opportunities")
 async def api_opportunities() -> JSONResponse:
     state = _get_state()
-    with state._lock:
+    with state.lock:
         data = list(state.recent_opportunities)
     return JSONResponse({"opportunities": data, "total": len(data)})
 
@@ -169,7 +173,7 @@ async def api_opportunities() -> JSONResponse:
 @app.get("/api/trades")
 async def api_trades() -> JSONResponse:
     state = _get_state()
-    with state._lock:
+    with state.lock:
         data = list(state.recent_trades)
     return JSONResponse({"trades": data, "total": len(data)})
 
@@ -177,7 +181,7 @@ async def api_trades() -> JSONResponse:
 @app.get("/api/pnl")
 async def api_pnl() -> JSONResponse:
     state = _get_state()
-    with state._lock:
+    with state.lock:
         data = list(state.pnl_history)
     return JSONResponse({"pnl_history": data, "total": len(data)})
 
@@ -185,7 +189,7 @@ async def api_pnl() -> JSONResponse:
 @app.get("/api/risk")
 async def api_risk() -> JSONResponse:
     state = _get_state()
-    with state._lock:
+    with state.lock:
         data = dict(state.risk_state)
     return JSONResponse(data)
 
@@ -193,7 +197,7 @@ async def api_risk() -> JSONResponse:
 @app.get("/api/strategies")
 async def api_strategies() -> JSONResponse:
     state = _get_state()
-    with state._lock:
+    with state.lock:
         data = dict(state.strategy_status)
     return JSONResponse(data)
 
@@ -201,7 +205,7 @@ async def api_strategies() -> JSONResponse:
 @app.get("/api/positions")
 async def api_positions() -> JSONResponse:
     state = _get_state()
-    with state._lock:
+    with state.lock:
         data = list(state.current_positions)
     return JSONResponse({"positions": data})
 
@@ -209,7 +213,7 @@ async def api_positions() -> JSONResponse:
 @app.get("/api/volatility")
 async def api_volatility() -> JSONResponse:
     state = _get_state()
-    with state._lock:
+    with state.lock:
         data = dict(state.volatility) if state.volatility else {}
     return JSONResponse(data)
 
@@ -217,7 +221,7 @@ async def api_volatility() -> JSONResponse:
 @app.get("/api/edge")
 async def api_edge() -> JSONResponse:
     state = _get_state()
-    with state._lock:
+    with state.lock:
         data = dict(state.edge_decision) if state.edge_decision else {}
     return JSONResponse(data)
 
@@ -225,7 +229,7 @@ async def api_edge() -> JSONResponse:
 @app.get("/api/book")
 async def api_book() -> JSONResponse:
     state = _get_state()
-    with state._lock:
+    with state.lock:
         data = dict(state.book_summary) if state.book_summary else {}
     return JSONResponse(data)
 
@@ -233,7 +237,7 @@ async def api_book() -> JSONResponse:
 @app.get("/api/ws")
 async def api_ws() -> JSONResponse:
     state = _get_state()
-    with state._lock:
+    with state.lock:
         data = dict(state.ws_status) if state.ws_status else {}
     return JSONResponse(data)
 
@@ -241,7 +245,7 @@ async def api_ws() -> JSONResponse:
 @app.get("/api/ai")
 async def api_ai() -> JSONResponse:
     state = _get_state()
-    with state._lock:
+    with state.lock:
         market_catalog = dict(state.market_catalog)
         return JSONResponse({
             "status": dict(state.ai_status) if state.ai_status else None,
@@ -255,7 +259,7 @@ async def api_ai() -> JSONResponse:
 @app.get("/api/research-signals")
 async def api_research_signals() -> JSONResponse:
     state = _get_state()
-    with state._lock:
+    with state.lock:
         data = dict(state.research_signal_status) if state.research_signal_status else {}
     return JSONResponse(data)
 
@@ -263,7 +267,7 @@ async def api_research_signals() -> JSONResponse:
 @app.get("/api/backtest-report")
 async def api_backtest_report() -> JSONResponse:
     state = _get_state()
-    with state._lock:
+    with state.lock:
         data = dict(state.backtest_last_report) if state.backtest_last_report else {}
     return JSONResponse(data)
 

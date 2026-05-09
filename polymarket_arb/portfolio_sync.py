@@ -15,6 +15,8 @@ from polymarket_arb.models import PositionSnapshot
 
 LOG = logging.getLogger(__name__)
 
+_DEFAULT_MAX_PAGES = 50
+
 
 @dataclass
 class PortfolioSnapshot:
@@ -65,8 +67,11 @@ class PortfolioSync:
         realized = 0.0
         offset = 0
         limit = 200
-
-        while True:
+        # Bounded pagination: a runaway maker session could otherwise fill
+        # `/closed-positions` with thousands of rows and stall the main loop.
+        # 50 × 200 = 10 000 closed positions per day is well above any realistic
+        # bot cadence; if we hit it we WARN and surface incomplete daily PnL.
+        for page_index in range(_DEFAULT_MAX_PAGES):
             rows = self._request_rows(
                 "/closed-positions",
                 {
@@ -78,7 +83,7 @@ class PortfolioSync:
                 },
             )
             if not rows:
-                break
+                return realized
 
             reached_older_rows = False
             for row in rows:
@@ -91,25 +96,36 @@ class PortfolioSync:
                 realized += _coerce_float(row.get("realizedPnl"))
 
             if reached_older_rows or len(rows) < limit:
-                break
+                return realized
             offset += limit
-
+        else:
+            LOG.warning(
+                "Portfolio sync 已达分页上限 %d × %d，daily PnL 可能不完整",
+                _DEFAULT_MAX_PAGES,
+                limit,
+            )
         return realized
 
     def _paginate(self, *, endpoint: str, base_params: dict[str, Any], limit: int) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         offset = 0
-        while True:
+        for _ in range(_DEFAULT_MAX_PAGES):
             params = dict(base_params)
             params["limit"] = limit
             params["offset"] = offset
             rows = self._request_rows(endpoint, params)
             if not rows:
-                break
+                return results
             results.extend(row for row in rows if isinstance(row, dict))
             if len(rows) < limit:
-                break
+                return results
             offset += limit
+        LOG.warning(
+            "Portfolio sync %s 已达分页上限 %d × %d，结果可能不完整",
+            endpoint,
+            _DEFAULT_MAX_PAGES,
+            limit,
+        )
         return results
 
     def _request_rows(self, endpoint: str, params: dict[str, Any]) -> list[dict[str, Any]]:

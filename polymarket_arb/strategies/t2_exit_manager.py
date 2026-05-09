@@ -22,6 +22,7 @@ matches live behaviour.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -47,6 +48,9 @@ from polymarket_arb.strategies.optimal_stopping import (
 LOG = logging.getLogger(__name__)
 
 
+_MAX_EXIT_RETRIES = 3
+
+
 @dataclass
 class T2OpenPosition:
     token_id: str
@@ -63,6 +67,10 @@ class T2OpenPosition:
     last_eval_ts: float = 0.0
     exit_attempted: bool = False
     last_decision_reason: str = ""
+    # Number of failed `_issue_exit` calls. Without a cap a transport error
+    # would silently abandon the position; without retries a transient blip
+    # would mark the position closed even though no SELL ever landed.
+    exit_failure_count: int = 0
 
     def add_fill(self, price: float, size: float) -> None:
         if size <= 0:
@@ -106,10 +114,20 @@ class T2ExitManager:
         self._max_hold_sec = float(config.t2_max_hold_sec)
         self._eval_interval_sec = max(0.0, float(config.t2_exit_eval_interval_sec))
         self._optimal_stopping_enabled = bool(config.t2_optimal_stopping_enabled)
+        # Serialises register_fills + evaluate. Both are called from the
+        # main loop today, but evaluate could be triggered from a separate
+        # exit-only thread in the future and we don't want concurrent
+        # _issue_exit calls firing two SELL orders for the same token.
+        self._lock = threading.RLock()
+        # Tokens currently mid-exit. Belt-and-braces against re-entry inside
+        # the same evaluate() pass when `_decide_exit` matches multiple
+        # rules at once.
+        self._exiting_tokens: set[str] = set()
 
     @property
     def open_positions(self) -> dict[str, T2OpenPosition]:
-        return dict(self._positions)
+        with self._lock:
+            return dict(self._positions)
 
     def register_fills(
         self,
@@ -127,6 +145,26 @@ class T2ExitManager:
         model_prob = float(signal_payload.get("model_prob") or 0.5)
         deviation = abs(float(signal_payload.get("deviation") or 0.0))
 
+        with self._lock:
+            self._register_fills_locked(
+                trades=trades,
+                market=market,
+                outcome_label=outcome_label,
+                deadline_ts=deadline_ts,
+                model_prob=model_prob,
+                deviation=deviation,
+            )
+
+    def _register_fills_locked(
+        self,
+        *,
+        trades: list[TradeRecord],
+        market: MarketInfo,
+        outcome_label: str,
+        deadline_ts: Optional[float],
+        model_prob: float,
+        deviation: float,
+    ) -> None:
         for trade in trades:
             if trade.side != OrderSide.BUY:
                 continue
@@ -180,57 +218,77 @@ class T2ExitManager:
         markets_by_cid = {m.condition_id: m for m in active_markets}
         now = time.time()
 
-        for token_id in list(self._positions.keys()):
-            pos = self._positions[token_id]
-            if pos.exit_attempted:
-                self._positions.pop(token_id, None)
-                continue
-            if now - pos.last_eval_ts < self._eval_interval_sec:
-                continue
-            pos.last_eval_ts = now
+        with self._lock:
+            for token_id in list(self._positions.keys()):
+                pos = self._positions[token_id]
+                if pos.exit_attempted:
+                    self._positions.pop(token_id, None)
+                    continue
+                if token_id in self._exiting_tokens:
+                    # Another evaluate() call is already mid-flight for this
+                    # position. Skip to avoid double-SELL.
+                    continue
+                if now - pos.last_eval_ts < self._eval_interval_sec:
+                    continue
+                pos.last_eval_ts = now
 
-            snap = self._ob.get_snapshot(token_id)
-            if snap is None or snap.best_bid is None or snap.best_bid <= 0:
-                continue
-            current_price = float(snap.best_bid)
+                snap = self._ob.get_snapshot(token_id)
+                if snap is None or snap.best_bid is None or snap.best_bid <= 0:
+                    continue
+                current_price = float(snap.best_bid)
 
-            reason = self._decide_exit(pos, current_price, now)
-            pos.last_decision_reason = reason
-            if reason == "hold":
-                continue
+                reason = self._decide_exit(pos, current_price, now)
+                pos.last_decision_reason = reason
+                if reason == "hold":
+                    continue
 
-            market = markets_by_cid.get(pos.condition_id)
-            if market is None:
-                LOG.warning(
-                    "T2 退出无法构造 opportunity（缺市场 %s），跳过",
-                    pos.condition_id[:12],
-                )
-                continue
+                market = markets_by_cid.get(pos.condition_id)
+                if market is None:
+                    LOG.warning(
+                        "T2 退出无法构造 opportunity（缺市场 %s），跳过",
+                        pos.condition_id[:12],
+                    )
+                    continue
 
-            decision = {
-                "token_id": token_id,
-                "market_id": pos.market_id,
-                "outcome": pos.outcome_label,
-                "entry_price": pos.entry_price,
-                "exit_price": current_price,
-                "size": pos.size_remaining,
-                "reason": reason,
-                "ts": now,
+                decision = {
+                    "token_id": token_id,
+                    "market_id": pos.market_id,
+                    "outcome": pos.outcome_label,
+                    "entry_price": pos.entry_price,
+                    "exit_price": current_price,
+                    "size": pos.size_remaining,
+                    "reason": reason,
+                    "ts": now,
+                }
+                self._exiting_tokens.add(token_id)
+                try:
+                    issued_ok = self._issue_exit(pos, market, current_price)
+                finally:
+                    self._exiting_tokens.discard(token_id)
+
+                if issued_ok:
+                    pos.exit_attempted = True
+                    result.decisions.append(decision)
+                    result.triggered += 1
+                else:
+                    pos.exit_failure_count += 1
+                    if pos.exit_failure_count >= _MAX_EXIT_RETRIES:
+                        LOG.error(
+                            "T2 退出失败 %d 次，放弃: token=%s — 仓位需要人工干预",
+                            pos.exit_failure_count,
+                            token_id[:16],
+                        )
+                        pos.exit_attempted = True
+
+            self._positions = {
+                k: v for k, v in self._positions.items()
+                if not v.exit_attempted and v.size_remaining > 1e-6
             }
-            result.decisions.append(decision)
-            self._issue_exit(pos, market, current_price)
-            pos.exit_attempted = True
-            result.triggered += 1
-
-        # Remove fully-exited positions.
-        self._positions = {
-            k: v for k, v in self._positions.items()
-            if not v.exit_attempted and v.size_remaining > 1e-6
-        }
         return result
 
     def remove_position(self, token_id: str) -> None:
-        self._positions.pop(token_id, None)
+        with self._lock:
+            self._positions.pop(token_id, None)
 
     def _decide_exit(self, pos: T2OpenPosition, current_price: float, now: float) -> str:
         # 1. Time stop.
@@ -289,8 +347,14 @@ class T2ExitManager:
         pos: T2OpenPosition,
         market: MarketInfo,
         current_price: float,
-    ) -> None:
-        """Submit a single-leg SELL via ExecutionEngine."""
+    ) -> bool:
+        """Submit a single-leg SELL via ExecutionEngine.
+
+        Returns True when the executor accepted the order (regardless of
+        fill status — that's the executor's problem to track), False on a
+        client transport error so the caller can keep the position and
+        retry next eval cycle.
+        """
         opp = ArbOpportunity(
             arb_type=ArbType.DIRECTIONAL,
             event_id=market.event_id or market.condition_id,
@@ -316,14 +380,6 @@ class T2ExitManager:
         )
         try:
             trades = self._executor.execute_arbitrage(opp, pos.size_remaining)
-            LOG.info(
-                "T2 退出已提交: token=%s reason=%s size=%.2f price=%.4f trades=%d",
-                pos.token_id[:16],
-                pos.last_decision_reason,
-                pos.size_remaining,
-                current_price,
-                len(trades),
-            )
         except Exception as exc:  # pragma: no cover - depends on live client
             LOG.warning(
                 "T2 退出失败: token=%s reason=%s err=%s",
@@ -331,6 +387,17 @@ class T2ExitManager:
                 pos.last_decision_reason,
                 exc,
             )
+            return False
+
+        LOG.info(
+            "T2 退出已提交: token=%s reason=%s size=%.2f price=%.4f trades=%d",
+            pos.token_id[:16],
+            pos.last_decision_reason,
+            pos.size_remaining,
+            current_price,
+            len(trades),
+        )
+        return True
 
 
 def _parse_iso_to_ts(value: str | None) -> Optional[float]:

@@ -131,20 +131,42 @@ def _build_l1_client(config: ArbConfig, *, clob_client: Any | None = None):
     )
 
 
-def _force_py_clob_http1() -> None:
+_CLOB_HTTP_HELPER_MODULES = (
+    "py_clob_client_v2.http_helpers.helpers",
+    "py_clob_client.http_helpers.helpers",
+)
+
+
+def _force_py_clob_http1() -> int:
+    """Replace the module-private `_http_client` of the CLOB SDK with an HTTP/1.1 client.
+
+    Returns the count of modules successfully patched. The contract here is
+    fragile by design: it pokes a private attribute on a third-party module
+    because the published API offers no transport switch. If a future
+    py_clob_client release renames or relocates `_http_client`, this returns 0
+    and emits a WARNING — `tests/test_client_factory.py` then drives the
+    contract test that catches such a regression at PR review.
+    """
     import sys
     import httpx
 
-    for module_name in (
-        "py_clob_client_v2.http_helpers.helpers",
-        "py_clob_client.http_helpers.helpers",
-    ):
+    patched = 0
+    seen_modules = 0
+    for module_name in _CLOB_HTTP_HELPER_MODULES:
         http_helpers = sys.modules.get(module_name)
         if http_helpers is None:
             try:
                 http_helpers = __import__(module_name, fromlist=["helpers"])
             except Exception:
                 continue
+
+        seen_modules += 1
+        if not hasattr(http_helpers, "_http_client"):
+            LOG.warning(
+                "%s 已升级，缺少 `_http_client` 属性，HTTP/1.1 强制失败 — 检查 py_clob_client API",
+                module_name,
+            )
+            continue
 
         current = getattr(http_helpers, "_http_client", None)
         if current is not None:
@@ -155,8 +177,15 @@ def _force_py_clob_http1() -> None:
         try:
             http_helpers._http_client = httpx.Client(http2=False)
             LOG.debug("已将 %s 切换为 HTTP/1.1 client", module_name)
+            patched += 1
         except Exception as exc:
-            LOG.debug("切换 %s 到 HTTP/1.1 失败: %s", module_name, exc)
+            LOG.warning("切换 %s 到 HTTP/1.1 失败: %s", module_name, exc)
+
+    if seen_modules and patched == 0:
+        LOG.error(
+            "py_clob_client* 已加载但所有 _http_client 强制 HTTP/1.1 都失败 — 实盘可能受 HTTP/2 影响"
+        )
+    return patched
 
 
 def _create_or_derive_with_transport_fallback(temp_client: Any, config: ArbConfig):

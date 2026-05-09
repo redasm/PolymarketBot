@@ -52,6 +52,7 @@ from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from typing import Any, Optional
 
+from polymarket_arb.strategies.signal_policies import TailRiskClassifier
 from research_signal.normalizers.topic import topic_overlap_score
 
 LOG = logging.getLogger(__name__)
@@ -115,6 +116,7 @@ class StrategyOrchestrator:
         allocations: Optional[dict[StrategyTier, float]] = None,
         *,
         max_signals_per_market_per_hour: int = 2,
+        tail_risk_classifier: Optional[TailRiskClassifier] = None,
     ):
         self._bankroll = total_bankroll
         alloc_map = allocations or self.DEFAULT_ALLOCATIONS
@@ -122,6 +124,7 @@ class StrategyOrchestrator:
         self._allocations: dict[StrategyTier, StrategyAllocation] = {}
         for tier, pct in alloc_map.items():
             self._allocations[tier] = StrategyAllocation(tier=tier, allocation_pct=pct)
+        self._tail_risk_classifier = tail_risk_classifier or TailRiskClassifier()
 
         self._pending_signals: list[StrategySignal] = []
         self._executed_signals: list[StrategySignal] = []
@@ -587,15 +590,15 @@ class StrategyOrchestrator:
 
         market = self._find_market(signal.market_id, active_markets)
         text = self._tail_risk_text(signal, market)
-        risk_class, multiplier, confidence_delta, reasons = self._classify_tail_risk(text)
-        signal.recommended_size_usdc = max(0.0, signal.recommended_size_usdc * multiplier)
-        signal.confidence = max(0.0, min(1.0, signal.confidence + confidence_delta))
+        classification = self._tail_risk_classifier.classify(text)
+        signal.recommended_size_usdc = max(0.0, signal.recommended_size_usdc * classification.size_multiplier)
+        signal.confidence = max(0.0, min(1.0, signal.confidence + classification.confidence_delta))
         return {
             "applied": True,
-            "risk_class": risk_class,
-            "size_multiplier": round(multiplier, 3),
-            "confidence_delta": round(confidence_delta, 3),
-            "reasons": reasons,
+            "risk_class": classification.risk_class,
+            "size_multiplier": round(classification.size_multiplier, 3),
+            "confidence_delta": round(classification.confidence_delta, 3),
+            "reasons": classification.reasons,
         }
 
     def _tail_risk_text(self, signal: StrategySignal, market: Any | None) -> str:
@@ -611,29 +614,6 @@ class StrategyOrchestrator:
             for key in ("description", "category", "tags", "game_start_time", "resolutionSource"):
                 parts.append(str(raw.get(key, "")))
         return " ".join(part for part in parts if part).lower()
-
-    def _classify_tail_risk(self, text: str) -> tuple[str, float, float, list[str]]:
-        high_keywords = (
-            "war", "ceasefire", "missile", "invasion", "iran", "israel", "russia", "ukraine",
-            "china", "taiwan", "geopolit", "hostage", "terror", "coup", "nuclear", "assassination",
-            "supreme court", "resign", "death", "fired", "will trump", "will biden",
-        )
-        medium_keywords = (
-            "election", "president", "nominee", "crypto", "bitcoin", "btc", "ethereum", "eth",
-            "solana", "fed", "fomc", "rate cut", "cpi", "inflation", "sec", "lawsuit",
-        )
-        low_keywords = (
-            "economic data", "jobless", "payroll", "unemployment", "gdp", "pce", "cpi",
-            "sports", "nba", "nfl", "mlb", "nhl", "weather",
-        )
-
-        if any(keyword in text for keyword in high_keywords):
-            return "high_tail", 0.50, -0.10, ["tail_risk_high", "kelly_fraction_discount"]
-        if any(keyword in text for keyword in medium_keywords):
-            return "medium_tail", 1.0, 0.0, ["tail_risk_medium"]
-        if any(keyword in text for keyword in low_keywords):
-            return "data_driven", 1.0, 0.0, ["tail_risk_low"]
-        return "unknown", 1.0, 0.0, ["tail_risk_unknown"]
 
     def _record_tail_risk(self, tail_risk: dict[str, Any]) -> None:
         if not tail_risk.get("applied"):
