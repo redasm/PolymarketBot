@@ -50,6 +50,19 @@ def _merge_levels(levels: list[OrderBookLevel], *, reverse: bool) -> list[OrderB
     ]
 
 
+def _live_mirror_snapshots(live_mirror: Any) -> dict[str, OrderBookSnapshot]:
+    """Return all live mirror snapshots across supported mirror interfaces."""
+    if hasattr(live_mirror, "get_all"):
+        snapshots = live_mirror.get_all()
+    elif hasattr(live_mirror, "all"):
+        snapshots = live_mirror.all()
+    elif isinstance(live_mirror, dict):
+        snapshots = live_mirror
+    else:
+        return {}
+    return snapshots if isinstance(snapshots, dict) else {}
+
+
 class OrderBookAnalyzer:
     """从 CLOB 客户端拉取订单簿并构建结构化快照."""
 
@@ -116,7 +129,7 @@ class OrderBookAnalyzer:
             return {"healthy": False, "reason": "missing_orderbooks_present", "stats": stats}
 
         now = time.time()
-        for snap in self._live_mirror.all().values():
+        for snap in _live_mirror_snapshots(self._live_mirror).values():
             snap_ts = float(getattr(snap, "timestamp", 0.0) or 0.0)
             if snap_ts > 0 and (now - snap_ts) > max_snapshot_age_sec:
                 return {

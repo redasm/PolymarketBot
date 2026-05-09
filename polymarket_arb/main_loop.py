@@ -159,6 +159,85 @@ def _signal_handler(sig: int, frame: Any) -> None:
     _SHUTDOWN_EVENT.set()
 
 
+def _refresh_portfolio_snapshot(
+    *,
+    portfolio_sync: PortfolioSync | None,
+    risk_mgr: RiskManager,
+    event_recorder: EventRecorder,
+    last_portfolio_sync_ts: float,
+    forced: bool = False,
+) -> tuple[float, bool]:
+    """Refresh account ground truth and reconcile risk state.
+
+    Returns `(last_sync_ts, ok)`. Forced refreshes are used after rollback
+    transport failures, where a remote order may still be live and the next
+    opening trade should not proceed against stale in-memory exposure.
+    """
+    if portfolio_sync is None:
+        if forced:
+            message = "forced_portfolio_resync_requested_but_not_configured"
+            risk_mgr.mark_portfolio_sync_error(message)
+            LOG.error("强制账户同步失败: portfolio_sync 未配置")
+            if event_recorder.is_enabled:
+                event_recorder.write_event("risk_events", {
+                    "event": "portfolio_sync_error",
+                    "forced": True,
+                    "error": message,
+                    "ts": time.time(),
+                })
+            return last_portfolio_sync_ts, False
+        return last_portfolio_sync_ts, True
+
+    try:
+        snapshot = portfolio_sync.refresh()
+        risk_mgr.sync_portfolio_snapshot(
+            snapshot.positions,
+            realized_daily_pnl=snapshot.realized_daily_pnl,
+            synced_at=snapshot.synced_at,
+        )
+        if event_recorder.is_enabled:
+            event_recorder.write_event("risk_events", {
+                "event": "portfolio_sync",
+                "forced": forced,
+                "source_address": snapshot.source_address,
+                "positions": len(snapshot.positions),
+                "realized_daily_pnl": snapshot.realized_daily_pnl,
+                "synced_at": snapshot.synced_at,
+            })
+        return snapshot.synced_at, True
+    except Exception as exc:
+        risk_mgr.mark_portfolio_sync_error(str(exc))
+        LOG.warning("账户同步失败%s: %s", " (forced)" if forced else "", exc)
+        if event_recorder.is_enabled:
+            event_recorder.write_event("risk_events", {
+                "event": "portfolio_sync_error",
+                "forced": forced,
+                "error": str(exc),
+                "ts": time.time(),
+            })
+        return last_portfolio_sync_ts, False
+
+
+def _handle_forced_portfolio_resync(
+    *,
+    executor: ExecutionEngine,
+    portfolio_sync: PortfolioSync | None,
+    risk_mgr: RiskManager,
+    event_recorder: EventRecorder,
+    last_portfolio_sync_ts: float,
+) -> tuple[float, bool]:
+    if not executor.consume_force_portfolio_resync():
+        return last_portfolio_sync_ts, True
+    LOG.warning("检测到回滚撤单 transport 失败，先强制同步账户状态")
+    return _refresh_portfolio_snapshot(
+        portfolio_sync=portfolio_sync,
+        risk_mgr=risk_mgr,
+        event_recorder=event_recorder,
+        last_portfolio_sync_ts=last_portfolio_sync_ts,
+        forced=True,
+    )
+
+
 # Startup / parsing / boot helpers (build_run_instance_id, log_startup_summary,
 # parse_extra_rss_feeds, parse_http_json_sources, create_research_signal_service,
 # create_cross_platform_scanner, round_timing, get_or_create_event_loop,
@@ -715,6 +794,7 @@ def main(dotenv_path: str | None = None) -> None:
         cycle_timing["strategy_sec"] += time.perf_counter() - phase_start
 
         phase_start = time.perf_counter()
+        execution_blocked_by_forced_sync = False
         for opp in opportunities:
             if _SHUTDOWN_EVENT.is_set():
                 break
@@ -733,6 +813,17 @@ def main(dotenv_path: str | None = None) -> None:
             total_simulated_successes += t0_delta.simulated_successes
             total_live_expected_profit += t0_delta.live_profit_total
             total_simulated_expected_profit += t0_delta.simulated_profit_total
+            if not config.dry_run:
+                last_portfolio_sync_ts, forced_sync_ok = _handle_forced_portfolio_resync(
+                    executor=executor,
+                    portfolio_sync=portfolio_sync,
+                    risk_mgr=risk_mgr,
+                    event_recorder=event_recorder,
+                    last_portfolio_sync_ts=last_portfolio_sync_ts,
+                )
+                if not forced_sync_ok:
+                    execution_blocked_by_forced_sync = True
+                    break
         cycle_timing["execution_sec"] += time.perf_counter() - phase_start
 
         if ai_advisor and ai_advisor.should_evaluate():
@@ -764,7 +855,8 @@ def main(dotenv_path: str | None = None) -> None:
         ]
         insufficient_balance_skips: dict[str, int] = {}
         insufficient_balance_last_reason: str = ""
-        processed_signals = orchestrator.process_signals()
+        processed_signals = [] if execution_blocked_by_forced_sync else orchestrator.process_signals()
+        total_theoretical_opportunities += len(processed_signals)
         process_skip_summary = orchestrator.get_last_skip_reasons()
         if process_skip_summary.get("total") and event_recorder.is_enabled:
             event_recorder.write_event("strategy_executions", {
@@ -798,6 +890,16 @@ def main(dotenv_path: str | None = None) -> None:
             total_simulated_submissions += delta.simulated_submissions
             total_live_expected_profit += delta.live_profit_total
             total_simulated_expected_profit += delta.simulated_profit_total
+            if executed and not config.dry_run:
+                last_portfolio_sync_ts, forced_sync_ok = _handle_forced_portfolio_resync(
+                    executor=executor,
+                    portfolio_sync=portfolio_sync,
+                    risk_mgr=risk_mgr,
+                    event_recorder=event_recorder,
+                    last_portfolio_sync_ts=last_portfolio_sync_ts,
+                )
+                if not forced_sync_ok:
+                    break
             if executed:
                 continue
             orchestrator.record_processed(processed_signal)
@@ -877,31 +979,12 @@ def main(dotenv_path: str | None = None) -> None:
             portfolio_sync is not None
             and (time.time() - last_portfolio_sync_ts) >= config.portfolio_sync_interval_sec
         ):
-            try:
-                snapshot = portfolio_sync.refresh()
-                risk_mgr.sync_portfolio_snapshot(
-                    snapshot.positions,
-                    realized_daily_pnl=snapshot.realized_daily_pnl,
-                    synced_at=snapshot.synced_at,
-                )
-                last_portfolio_sync_ts = snapshot.synced_at
-                if event_recorder.is_enabled:
-                    event_recorder.write_event("risk_events", {
-                        "event": "portfolio_sync",
-                        "source_address": snapshot.source_address,
-                        "positions": len(snapshot.positions),
-                        "realized_daily_pnl": snapshot.realized_daily_pnl,
-                        "synced_at": snapshot.synced_at,
-                    })
-            except Exception as exc:
-                risk_mgr.mark_portfolio_sync_error(str(exc))
-                LOG.warning("账户同步失败: %s", exc)
-                if event_recorder.is_enabled:
-                    event_recorder.write_event("risk_events", {
-                        "event": "portfolio_sync_error",
-                        "error": str(exc),
-                        "ts": time.time(),
-                    })
+            last_portfolio_sync_ts, _ = _refresh_portfolio_snapshot(
+                portfolio_sync=portfolio_sync,
+                risk_mgr=risk_mgr,
+                event_recorder=event_recorder,
+                last_portfolio_sync_ts=last_portfolio_sync_ts,
+            )
 
         risk_s = risk_mgr.state
         vol_snap = vol_estimator.snapshot()
@@ -1056,4 +1139,3 @@ def main(dotenv_path: str | None = None) -> None:
 # cycle were extracted to `polymarket_arb.main_helpers.{dashboard_serializers,
 # cycle_runners, ai_cycle}` and re-imported above under their underscore
 # aliases so the call graph here stays unchanged.
-

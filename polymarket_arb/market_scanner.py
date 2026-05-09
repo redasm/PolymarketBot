@@ -49,6 +49,15 @@ def _load_json_payload(resp: requests.Response, *, expected_type: type, endpoint
     return payload
 
 
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _normalize_text(value: Any) -> str:
     if value is None:
         return ""
@@ -116,14 +125,20 @@ def _parse_market(raw: dict) -> Optional[MarketInfo]:
             outcome_prices_raw = json.loads(outcome_prices_raw)
         except Exception:
             outcome_prices_raw = []
-    outcome_prices = [float(p) for p in outcome_prices_raw if p is not None]
+    outcome_prices = [
+        _coerce_float(p)
+        for p in outcome_prices_raw
+        if p is not None
+    ]
 
     tokens_raw = raw.get("tokens") or []
     tokens: list[TokenInfo] = []
     for t in tokens_raw:
+        if not isinstance(t, dict):
+            continue
         token_id = t.get("token_id") or t.get("tokenId") or t.get("clobTokenId") or ""
         outcome = _normalize_text(t.get("outcome") or "")
-        price = float(t.get("price") or 0)
+        price = _coerce_float(t.get("price"))
         winner = t.get("winner")
         if winner is not None:
             winner = bool(winner)
@@ -142,7 +157,7 @@ def _parse_market(raw: dict) -> Optional[MarketInfo]:
             outcome = _normalize_text(outcomes[idx]) if idx < len(outcomes) else f"Outcome {idx + 1}"
             price = outcome_prices[idx] if idx < len(outcome_prices) else 0.0
             if token_id:
-                tokens.append(TokenInfo(token_id=str(token_id), outcome=str(outcome), price=float(price)))
+                tokens.append(TokenInfo(token_id=str(token_id), outcome=str(outcome), price=_coerce_float(price)))
 
     neg_risk = raw.get("neg_risk") or raw.get("negRisk") or False
     if isinstance(neg_risk, str):
@@ -155,8 +170,8 @@ def _parse_market(raw: dict) -> Optional[MarketInfo]:
         tokens=tokens,
         active=bool(raw.get("active", True)),
         closed=bool(raw.get("closed", False)),
-        volume_24h=float(raw.get("volume_num_24hr") or raw.get("volume24hr") or 0),
-        liquidity=float(raw.get("liquidity") or 0),
+        volume_24h=_coerce_float(raw.get("volume_num_24hr") or raw.get("volume24hr")),
+        liquidity=_coerce_float(raw.get("liquidity")),
         event_id=str(event_id),
         event_slug=event_slug,
         event_title=event_title,
@@ -167,6 +182,18 @@ def _parse_market(raw: dict) -> Optional[MarketInfo]:
         end_date=_normalize_text(raw.get("end_date_iso") or raw.get("endDate") or ""),
         raw=raw,
     )
+
+
+def _safe_parse_market(raw: Any, *, context: str) -> Optional[MarketInfo]:
+    if not isinstance(raw, dict):
+        LOG.warning("%s 跳过非对象 market 行: type=%s", context, type(raw).__name__)
+        return None
+    try:
+        return _parse_market(raw)
+    except Exception as exc:
+        condition_id = raw.get("condition_id") or raw.get("conditionId") or ""
+        LOG.warning("%s 跳过无法解析的 market 行 condition=%s: %s", context, condition_id, exc)
+        return None
 
 
 def _parse_event(raw: dict) -> Optional[EventInfo]:
@@ -181,7 +208,7 @@ def _parse_event(raw: dict) -> Optional[EventInfo]:
     markets_raw = raw.get("markets") or []
     markets: list[MarketInfo] = []
     for m in markets_raw:
-        parsed = _parse_market(m)
+        parsed = _safe_parse_market(m, context=f"Gamma /events event={event_id}")
         if parsed:
             if not parsed.event_id:
                 parsed.event_id = event_id
@@ -249,7 +276,7 @@ class MarketScanner:
                 break
 
             for raw in rows:
-                market = _parse_market(raw)
+                market = _safe_parse_market(raw, context=f"Gamma /markets offset={offset}")
                 if market is None:
                     continue
                 if min_liquidity > 0 and market.liquidity < min_liquidity:
@@ -297,6 +324,9 @@ class MarketScanner:
                 break
 
             for raw in rows:
+                if not isinstance(raw, dict):
+                    LOG.warning("Gamma /events 跳过非对象 event 行: type=%s", type(raw).__name__)
+                    continue
                 event = _parse_event(raw)
                 if event is None:
                     continue

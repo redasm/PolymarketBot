@@ -78,20 +78,24 @@ def build_trading_client(config: ArbConfig) -> Any:
         _force_py_clob_http1()
     signature_type = _resolve_signature_type(config, version)
 
-    temp_client = _build_l1_client(config, clob_client=clob_client)
-    try:
-        creds = _create_or_derive_with_transport_fallback(temp_client, config)
-    except Exception as exc:
-        LOG.error(
-            "创建/派生 API 凭证失败: host=%s sig_type=%d funder=%s… error=%s",
-            config.clob_host,
-            config.signature_type,
-            config.funder_address[:10] if config.funder_address else "",
-            exc,
-        )
-        if isinstance(exc, PolyApiException):
+    creds = _api_creds_from_config(config, version=version)
+    if creds is not None:
+        LOG.info("使用 .env 中已有 CLOB API 凭证")
+    else:
+        temp_client = _build_l1_client(config, clob_client=clob_client)
+        try:
+            creds = _create_or_derive_with_transport_fallback(temp_client, config)
+        except Exception as exc:
+            LOG.error(
+                "创建/派生 API 凭证失败: host=%s sig_type=%d funder=%s… error=%s",
+                config.clob_host,
+                config.signature_type,
+                config.funder_address[:10] if config.funder_address else "",
+                exc,
+            )
+            if isinstance(exc, PolyApiException):
+                raise
             raise
-        raise
     if creds is None:
         raise ValueError(
             "无法创建或派生 CLOB API 凭证，请检查 PRIVATE_KEY / POLYMARKET_FUNDER / SIGNATURE_TYPE"
@@ -129,6 +133,33 @@ def _build_l1_client(config: ArbConfig, *, clob_client: Any | None = None):
         signature_type=_resolve_signature_type(config, version),
         funder=config.funder_address,
     )
+
+
+def _api_creds_from_config(config: ArbConfig, *, version: str) -> Any | None:
+    if not (config.clob_api_key and config.clob_api_secret and config.clob_api_passphrase):
+        return None
+
+    api_creds_cls = None
+    if version == "v2":
+        try:
+            from py_clob_client_v2 import ApiCreds as api_creds_cls
+        except ImportError:
+            api_creds_cls = None
+
+    if api_creds_cls is None:
+        try:
+            from py_clob_client.clob_types import ApiCreds as api_creds_cls
+        except ImportError:
+            api_creds_cls = None
+
+    payload = {
+        "api_key": config.clob_api_key,
+        "api_secret": config.clob_api_secret,
+        "api_passphrase": config.clob_api_passphrase,
+    }
+    if api_creds_cls is None:
+        return payload
+    return api_creds_cls(**payload)
 
 
 _CLOB_HTTP_HELPER_MODULES = (

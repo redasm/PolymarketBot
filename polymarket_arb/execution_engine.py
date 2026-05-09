@@ -20,6 +20,8 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from math import gcd
 from typing import Any
 
 from polymarket_arb.config import ArbConfig
@@ -31,6 +33,8 @@ from polymarket_arb.models import (
 )
 
 LOG = logging.getLogger(__name__)
+_PRICE_QUANT = Decimal("0.01")
+_SIZE_QUANT = Decimal("0.00001")
 _PENDING_REMOTE_STATUSES = {
     "accepted",
     "live",
@@ -238,6 +242,13 @@ class ExecutionEngine:
         post_only: bool = False,
     ) -> OrderSubmissionResult:
         """提交单笔订单到 CLOB."""
+        price, size = _quantize_clob_order_args(price, size)
+        if price <= 0 or size <= 0:
+            return OrderSubmissionResult(
+                order_id="",
+                trade_status=TradeStatus.FAILED,
+                error="invalid_quantized_order_args",
+            )
         if hasattr(self._client, "create_and_post_order"):
             return self._submit_order_v2(
                 token_id,
@@ -434,20 +445,21 @@ class ExecutionEngine:
     ) -> TradeRecord:
         """提交单笔限价单，供做市/单腿策略复用."""
         arb_ref = arb_id or str(uuid.uuid4())[:12]
+        normalized_price, normalized_size = _quantize_clob_order_args(price, size)
         trade = TradeRecord(
             trade_id=str(uuid.uuid4())[:12],
             arb_id=arb_ref,
             token_id=token_id,
             condition_id=condition_id,
             side=side,
-            price=float(price),
-            size=float(size),
-            economic_cost=float(price),
+            price=normalized_price,
+            size=normalized_size,
+            economic_cost=normalized_price,
             post_only=post_only,
             order_type_name=order_type_name,
         )
 
-        if size <= 0 or price <= 0:
+        if normalized_size <= 0 or normalized_price <= 0:
             trade.status = TradeStatus.FAILED
             trade.error = "invalid_order_args"
             self._append_trade_record(trade, simulated=self._config.dry_run)
@@ -457,8 +469,8 @@ class ExecutionEngine:
             trade.status = TradeStatus.PENDING if post_only else TradeStatus.FILLED
             trade.simulated = True
             if trade.status == TradeStatus.FILLED:
-                trade.fill_price = float(price)
-                trade.fill_size = float(size)
+                trade.fill_price = normalized_price
+                trade.fill_size = normalized_size
             self._append_trade_record(trade, simulated=True)
             return trade
 
@@ -466,8 +478,8 @@ class ExecutionEngine:
             submission = self._submit_order(
                 token_id,
                 side,
-                float(price),
-                float(size),
+                normalized_price,
+                normalized_size,
                 order_type=self._resolve_named_order_type(order_type_name),
                 post_only=post_only,
             )
@@ -479,9 +491,9 @@ class ExecutionEngine:
             if submission.fill_size is not None:
                 trade.fill_size = submission.fill_size
             if trade.status == TradeStatus.FILLED and trade.fill_price is None:
-                trade.fill_price = float(price)
+                trade.fill_price = normalized_price
             if trade.status == TradeStatus.FILLED and trade.fill_size is None:
-                trade.fill_size = float(size)
+                trade.fill_size = normalized_size
         except Exception as exc:  # pragma: no cover - defensive around client transport
             trade.status = TradeStatus.FAILED
             trade.error = str(exc)
@@ -713,19 +725,23 @@ class ExecutionEngine:
         arb_id: str,
         actual_size: float,
     ) -> list[TradeRecord]:
-        records = [
-            TradeRecord(
+        records: list[TradeRecord] = []
+        leg_prices = [
+            _quantize_clob_price(leg.execution_price if leg.execution_price is not None else leg.price)
+            for leg in opp.legs
+        ]
+        quantized_size = _quantize_common_clob_order_size(leg_prices, actual_size)
+        for leg, quantized_price in zip(opp.legs, leg_prices):
+            records.append(TradeRecord(
                 trade_id=str(uuid.uuid4())[:12],
                 arb_id=arb_id,
                 token_id=leg.token_id,
                 condition_id=leg.condition_id,
                 side=leg.side,
-                price=leg.execution_price if leg.execution_price is not None else leg.price,
-                size=actual_size,
+                price=quantized_price,
+                size=quantized_size,
                 economic_cost=leg.economic_cost if leg.economic_cost is not None else leg.price,
-            )
-            for leg in opp.legs
-        ]
+            ))
         if len(records) != len(opp.legs):
             raise RuntimeError("套利腿与交易记录数量不一致")
 
@@ -736,7 +752,7 @@ class ExecutionEngine:
                     leg.token_id,
                     leg.side,
                     record.price,
-                    actual_size,
+                    record.size,
                 ): (index, leg, record)
                 # `zip(strict=True)` 仅在较新的 Python 版本可用；这里前面已经做过长度一致性校验，
                 # 因此直接使用普通 zip 以兼容部署环境中的旧版本解释器。
@@ -751,7 +767,7 @@ class ExecutionEngine:
                     record.error = submission.error or ""
                     if submission.trade_status == TradeStatus.FILLED:
                         record.fill_price = submission.fill_price if submission.fill_price is not None else record.price
-                        record.fill_size = submission.fill_size if submission.fill_size is not None else actual_size
+                        record.fill_size = submission.fill_size if submission.fill_size is not None else record.size
                         LOG.info(
                             "  腿 %d/%d 成功: %s %s @ $%.4f x %.2f, order=%s",
                             index + 1,
@@ -759,7 +775,7 @@ class ExecutionEngine:
                             leg.side.value,
                             leg.outcome,
                             record.price,
-                            actual_size,
+                            record.size,
                             submission.order_id[:16] if submission.order_id else "N/A",
                         )
                     elif submission.trade_status == TradeStatus.PARTIAL:
@@ -907,6 +923,67 @@ def _coerce_rollback_outcome(outcome: Any) -> tuple[set[str], set[str]]:
     if outcome is None:
         return set(), set()
     return set(outcome), set()
+
+
+def _quantize_clob_order_args(price: float, size: float) -> tuple[float, float]:
+    """Normalize order args to CLOB decimal precision.
+
+    CLOB rejects market buy orders when maker amount has >2 decimals or taker
+    amount has >5 decimals. For OrderArgs that means both share size and the
+    derived USDC notional (`price * size`) must be representable exactly at
+    their allowed precision.
+    """
+    quantized_price = _quantize_clob_price(price)
+    quantized_size = _quantize_clob_size(size)
+    if quantized_price <= 0 or quantized_size <= 0:
+        return 0.0, 0.0
+
+    legal_size = _quantize_common_clob_order_size([quantized_price], quantized_size)
+    if legal_size <= 0:
+        return 0.0, 0.0
+    return quantized_price, legal_size
+
+
+def _quantize_clob_price(price: float) -> float:
+    return _quantize_decimal(price, _PRICE_QUANT, rounding=ROUND_HALF_UP)
+
+
+def _quantize_clob_size(size: float) -> float:
+    return _quantize_decimal(size, _SIZE_QUANT, rounding=ROUND_DOWN)
+
+
+def _quantize_common_clob_order_size(prices: list[float], size: float) -> float:
+    quantized_size = _quantize_clob_size(size)
+    size_units = int((Decimal(str(quantized_size)) * 100000).to_integral_value(rounding=ROUND_DOWN))
+    if size_units <= 0:
+        return 0.0
+
+    size_unit_step = 1
+    for price in prices:
+        price_cents = int((Decimal(str(price)) * 100).to_integral_value())
+        if price_cents <= 0:
+            return 0.0
+        step = 100000 // gcd(price_cents, 100000)
+        size_unit_step = _lcm(size_unit_step, step)
+
+    legal_size_units = (size_units // size_unit_step) * size_unit_step
+    if legal_size_units <= 0:
+        return 0.0
+    return float(Decimal(legal_size_units) / Decimal(100000))
+
+
+def _lcm(left: int, right: int) -> int:
+    return abs(left * right) // gcd(left, right)
+
+
+def _quantize_decimal(value: float, quantum: Decimal, *, rounding: str) -> float:
+    try:
+        decimal_value = Decimal(str(value))
+    except Exception:
+        return 0.0
+    if decimal_value <= 0:
+        return 0.0
+    return float(decimal_value.quantize(quantum, rounding=rounding))
 
 
 def _coerce_fill_field(value: Any) -> float | None:

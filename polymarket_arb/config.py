@@ -60,6 +60,9 @@ class ArbConfig:
     clob_host: str
     gamma_host: str
     clob_client_version: str
+    clob_api_key: str
+    clob_api_secret: str
+    clob_api_passphrase: str
 
     # 套利参数
     min_edge_usd: float
@@ -238,6 +241,13 @@ class ArbConfig:
             raise ValueError("CLOB_HOST 和 GAMMA_HOST 不能为空")
         if self.clob_client_version not in {"auto", "v1", "v2"}:
             raise ValueError("POLYMARKET_CLOB_CLIENT_VERSION 必须是 auto / v1 / v2")
+        api_cred_parts = [
+            bool(self.clob_api_key),
+            bool(self.clob_api_secret),
+            bool(self.clob_api_passphrase),
+        ]
+        if any(api_cred_parts) and not all(api_cred_parts):
+            raise ValueError("CLOB_API_KEY / CLOB_SECRET / CLOB_PASS_PHRASE 必须同时设置，或全部留空")
         if self.signature_type not in {0, 1, 2, 3}:
             raise ValueError("POLYMARKET_SIGNATURE_TYPE 必须是 0 / 1 / 2 / 3")
         if self.signature_type == 3 and self.clob_client_version == "v1":
@@ -409,12 +419,12 @@ class ArbConfig:
             load_dotenv(override=True)
 
         private_key = _env("PRIVATE_KEY") or _env("POLYMARKET_PRIVATE_KEY")
-        funder = _env("POLYMARKET_FUNDER") or _env("POLYMARKET_DEPOSIT_WALLET")
+        funder = _env("POLYMARKET_FUNDER")
         if require_wallet:
             if not private_key:
                 raise ValueError("必须设置 PRIVATE_KEY 或 POLYMARKET_PRIVATE_KEY")
             if not funder:
-                raise ValueError("必须设置 POLYMARKET_FUNDER 或 POLYMARKET_DEPOSIT_WALLET")
+                raise ValueError("必须设置 POLYMARKET_FUNDER")
         else:
             private_key = private_key or "research-mode"
             funder = funder or "research-mode"
@@ -427,6 +437,14 @@ class ArbConfig:
             clob_host=_env("CLOB_HOST", "https://clob.polymarket.com"),
             gamma_host=_env("GAMMA_HOST", "https://gamma-api.polymarket.com"),
             clob_client_version=_env("POLYMARKET_CLOB_CLIENT_VERSION", "auto").lower() or "auto",
+            clob_api_key=_env("CLOB_API_KEY") or _env("POLYMARKET_CLOB_API_KEY"),
+            clob_api_secret=_env("CLOB_SECRET") or _env("CLOB_API_SECRET") or _env("POLYMARKET_CLOB_SECRET"),
+            clob_api_passphrase=(
+                _env("CLOB_PASS_PHRASE")
+                or _env("CLOB_API_PASSPHRASE")
+                or _env("CLOB_API_PASS_PHRASE")
+                or _env("POLYMARKET_CLOB_PASS_PHRASE")
+            ),
             min_edge_usd=_env_float("ARB_MIN_EDGE_USD", 0.005),
             min_edge_pct=_env_float("ARB_MIN_EDGE_PCT", 0.3),
             max_order_size_usdc=_env_float("ARB_MAX_ORDER_SIZE_USDC", 50.0),
