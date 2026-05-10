@@ -149,6 +149,7 @@ class StrategyOrchestrator:
         # through `_last_skip_reasons["per_market_rate_cap"]`.
         self._signal_history_by_market: dict[tuple[StrategyTier, str], list[float]] = {}
         self._max_signals_per_market_per_hour = max(0, int(max_signals_per_market_per_hour))
+        self._rate_cap_log_state: dict[tuple[StrategyTier, str], tuple[float, int]] = {}
 
     def submit_signal(
         self,
@@ -160,12 +161,7 @@ class StrategyOrchestrator:
     ) -> bool:
         if not self._check_per_market_rate_cap(signal):
             self._record_process_skip(signal, "per_market_rate_cap")
-            LOG.info(
-                "策略信号被 per-market 速率上限拦截: tier=%s market=%s cap=%d/h",
-                signal.tier,
-                signal.market_id[:12] if signal.market_id else "?",
-                self._max_signals_per_market_per_hour,
-            )
+            self._log_rate_cap_skip(signal)
             return False
         signal_copy = replace(signal, payload=dict(signal.payload))
         overlay = self._apply_research_overlay(
@@ -409,6 +405,22 @@ class StrategyOrchestrator:
         if fresh != history:
             self._signal_history_by_market[key] = fresh
         return len(fresh) < self._max_signals_per_market_per_hour
+
+    def _log_rate_cap_skip(self, signal: StrategySignal) -> None:
+        key = (signal.tier, signal.market_id)
+        now = time.time()
+        last_ts, suppressed = self._rate_cap_log_state.get(key, (0.0, 0))
+        if now - last_ts < 60.0:
+            self._rate_cap_log_state[key] = (last_ts, suppressed + 1)
+            return
+        LOG.info(
+            "策略信号被 per-market 速率上限拦截: tier=%s market=%s cap=%d/h suppressed=%d",
+            signal.tier,
+            signal.market_id[:12] if signal.market_id else "?",
+            self._max_signals_per_market_per_hour,
+            suppressed,
+        )
+        self._rate_cap_log_state[key] = (now, 0)
 
     def _record_per_market_submission(self, signal: StrategySignal) -> None:
         if self._max_signals_per_market_per_hour <= 0:

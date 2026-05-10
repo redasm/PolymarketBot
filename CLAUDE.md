@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Setup
+# Setup (Python >=3.10 per pyproject.toml; README recommends 3.11+)
 python -m venv .venv
 source .venv/bin/activate  # Linux/Mac
 # .venv\Scripts\activate   # Windows
@@ -86,6 +86,7 @@ Before queueing directional signals, `StrategyOrchestrator` applies two adjustme
 - **`notifier.py` + `feishu_notifier.py`** — Unified notification routing (trade success/failure, fatal errors, PnL alerts, daily summary) via Feishu app-bot OpenAPI
 - **`portfolio_sync.py`** — Low-frequency real-account sync (positions + daily realized PnL → dashboard/risk state); does not touch the high-frequency scan/execute path
 - **`research_signal/`** — Collectors / normalizers / scorers package feeding the orchestrator's research overlay (RSS, optional local JSONL knowledge base under `data/research_signal/knowledge/`)
+- **`research/backtest/`** — Separate offline backtest runner package (distinct from `research_signal/`); driven by `python -m research.backtest.run`
 
 ### AI Layer
 
@@ -103,22 +104,62 @@ T3 market making: $200 (20%)
 ### Data & Telemetry
 
 - Tick recording: `TICK_RECORD_ENABLED=true` → `data/ticks/YYYY-MM-DD.ndjson` (rolls at 200MB)
-- Strategy signals: `data/telemetry/*.strategy_signals.ndjson` — T1/T2/T3 signals written here even when no T0 arb fires. Seeing "0 arbs" in T0 does not mean the other tiers have no signals; check this file too.
+- Strategy signals: `data/telemetry/*.strategy_signals.ndjson` — T1/T2/T3 signals written here even when no T0 arb fires. **Seeing "0 arbs" in T0 does not mean the other tiers have no signals; check this file too.** The cycle metric `arbs_found_total` only counts T0 structural opportunities.
+- Cycle metrics: `data/telemetry/*.cycle_metrics.ndjson` — one row per scan cycle with `book_stats` (ws_hit / cache_hit / rest_fallback breakdown), `timing_stats`, exposure, position count.
+- Strategy executions: `data/telemetry/*.strategy_executions.ndjson` — entries, exits, and orchestrator-skipped aggregates (`skip_reasons` includes `per_market_rate_cap`, `tier_budget_below_min_order`).
+- Risk events: `data/telemetry/*.risk_events.ndjson` — currently also captures `cycle_summary` and `portfolio_sync` rows (i.e., it's a superset, not just trip events).
+- Notification state: `data/telemetry/notification_state.json` — daily counts and last-sent timestamps; survives restart.
 - Dashboard: FastAPI on `http://127.0.0.1:8077`. Loopback-only by design — do **not** rebind to `0.0.0.0`. Remote access is via SSH port-forward (e.g., `ssh -N -L 18077:127.0.0.1:8077 user@host`).
 
 ### Kelly Criterion
 
 All strategies use Quarter-Kelly (`f = 0.25 × f*`) to reduce variance 75% while retaining 75% of expected return. T0/T1 use `win_prob=0.95/0.85`, T2 uses `0.55-0.70`.
 
+## Cross-cutting design contracts
+
+These rules span multiple files and aren't obvious from any single one. Past bugs hit each of them.
+
+### Order type by side
+
+`ExecutionEngine._resolve_execution_order_type` picks `FOK > FAK > GTC` as a fallback chain and uses the result for entries unless the caller passes an explicit order type.
+
+- **T0 multi-leg entries**: must be FOK — partial fills break the structural-arb invariant.
+- **T2 single-leg entries**: FOK is fine — a non-fill is just a missed opportunity.
+- **T2 exits (`t2_exit_manager._issue_exit`)**: pass FAK explicitly. With FOK, any thin level on the bid side rejects the whole exit, leaving the position open and making partial exits unreachable.
+- **T3 maker / GTC**: `_gtc_order_type` is resolved separately and passed through `order_type=` on the maker path.
+
+### Position outcome must be resolved from the trade, not the signal
+
+`t2_exit_manager._resolve_trade_outcome_label` looks up `market.tokens[token_id].outcome` first; the signal-payload `action` is only a fallback. A historical bug bypassed this and defaulted to `BUY_YES`, which silently registered every BUY NO position as a YES holding and made every exit FOK-fail (selling YES we never owned). Never short-circuit this with the signal alone.
+
+### Risk state synchronization windows
+
+- `RiskManager.record_execution` adds exposure for BUY fills and releases booked exposure for SELL fills.
+- T2 exits update `pos.size_remaining` inside `T2ExitManager` and call `RiskManager.release_market_exposure` on confirmed SELL fills, so `RISK_MAX_OPEN_POSITIONS` and `RISK_MAX_TOTAL_EXPOSURE` no longer wait for the next portfolio sync to clear.
+- `_maybe_reset_daily` zeroes `daily_pnl` at UTC midnight and immediately recomputes `total_pnl = unrealized_pnl`.
+
+### Per-market signal rate cap and log noise
+
+`StrategyOrchestrator._check_per_market_rate_cap` caps T2 (and other `_RATE_CAPPED_TIERS`) signals at `T2_MAX_SIGNALS_PER_MARKET_PER_HOUR=5/h` per market. The upstream T2 collector (`signal_collectors.collect_statistical_strategy_signals`) does **not** know about the cap and re-emits the same signal every scan cycle on stable orderbooks. `StrategySignalTelemetryCompressor` (`main_helpers/signal_telemetry.py`) deduplicates NDJSON writes, and the orchestrator throttles the matching per-market rate-cap log line to keep `arb_bot.log` readable.
+
+### Config defaults vs canary defaults
+
+There are three coexisting env templates:
+- `.env.example` — full reference with broad observation defaults
+- `polymarket_only_live.env.example` — go-live baseline
+- `polymarket_only_canary_10usd.env.example` — $10 small-capital canary (very tight: `RISK_MAX_OPEN_POSITIONS=1`, `RISK_MAX_TOTAL_EXPOSURE=8.0`, `WS_MAX_MARKETS=10`, crypto-only focus keywords)
+
+The canary template is intentionally restrictive — under it the bot can hold one position at a time, so any orphaned exit stalls the bot until manual cleanup or restart. Don't relax these caps without reason; don't assume defaults from `.env.example` apply.
+
 ## Configuration
 
-Copy `.env.example` (or `polymarket_only_live.env.example`) to `.env`. Key flags:
+Copy `.env.example` (or `polymarket_only_live.env.example` / `polymarket_only_canary_10usd.env.example`) to `.env`. Key flags:
 
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `ARB_DRY_RUN` | `true` | Scan only, no real orders |
 | `PRIVATE_KEY` | (required for live) | Wallet private key |
-| `POLYMARKET_FUNDER` | (required for live) | Proxy/Safe address or deposit wallet address |
+| `POLYMARKET_FUNDER` | (required for live) | Proxy/Safe address or deposit wallet address (`POLYMARKET_DEPOSIT_WALLET` is an accepted alias) |
 | `POLYMARKET_SIGNATURE_TYPE` | `2` | Use `3` for deposit wallet / `POLY_1271` |
 | `ARB_MIN_EDGE_USD` | `0.005` | Minimum net profit threshold |
 | `TICK_RECORD_ENABLED` | `false` | Record orderbook ticks for backtesting |
@@ -126,6 +167,12 @@ Copy `.env.example` (or `polymarket_only_live.env.example`) to `.env`. Key flags
 | `RESEARCH_SIGNAL_ENABLED` | `false` | Enable research signal aggregation |
 
 For observation mode (before going live), broaden scanning with `ARB_MARKET_FOCUS_KEYWORDS=`, `ARB_HOT_MARKET_POOL_SIZE=150`, `T2_MIN_DEVIATION=0.01`. Full parameter reference in `CONFIGURATION.md`.
+
+## Operational notes
+
+- **Run ID and restart**: `arb_bot.log` and every telemetry row carry `run_id=run-<pid>-<UTC start>`. Code edits do not take effect until the bot is restarted; if you change a module and the run_id stays constant, the running process is still on the old code regardless of what's on disk.
+- **`py-clob-client` is version-pinned**: `pyproject.toml` pins `py-clob-client==0.34.6` and `py-clob-client-v2>=1.0.0,<2.0.0` because `ExecutionEngine` reaches into the module-private `_http_client` via `_force_py_clob_http1`. Any client upgrade needs `tests/test_client_factory.py` re-validated.
+- **Windows is the primary dev environment**: working directory is `E:\AppProject\PolymarketBot` on Windows; tmux instructions in `README.md` are for the Linux deployment target.
 
 ## Companion docs
 

@@ -26,7 +26,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.execution_engine import ExecutionEngine
@@ -46,6 +46,10 @@ from polymarket_arb.strategies.optimal_stopping import (
 )
 
 LOG = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from polymarket_arb.notifier import NotificationManager
+    from polymarket_arb.risk_manager import RiskManager
 
 
 _MAX_EXIT_RETRIES = 3
@@ -71,10 +75,20 @@ class T2OpenPosition:
     # would silently abandon the position; without retries a transient blip
     # would mark the position closed even though no SELL ever landed.
     exit_failure_count: int = 0
+    next_exit_retry_ts: float = 0.0
 
-    def add_fill(self, price: float, size: float) -> None:
+    def add_fill(
+        self,
+        price: float,
+        size: float,
+        *,
+        now_ts: float | None = None,
+        model_prob: float | None = None,
+        deviation: float | None = None,
+    ) -> None:
         if size <= 0:
             return
+        old_size = self.size_remaining
         total = self.size_remaining + size
         if total <= 0:
             self.entry_price = price
@@ -83,6 +97,16 @@ class T2OpenPosition:
         self.entry_price = (
             (self.entry_price * self.size_remaining) + (price * size)
         ) / total
+        if now_ts is not None:
+            self.entry_ts = ((self.entry_ts * old_size) + (float(now_ts) * size)) / total
+        if model_prob is not None:
+            self.model_prob_at_entry = (
+                (self.model_prob_at_entry * old_size) + (float(model_prob) * size)
+            ) / total
+        if deviation is not None:
+            self.deviation_at_entry = (
+                (self.deviation_at_entry * old_size) + (float(deviation) * size)
+            ) / total
         self.size_remaining = total
 
 
@@ -90,7 +114,10 @@ class T2OpenPosition:
 class T2ExitResult:
     """Result of one evaluate() pass — used for telemetry / dashboard."""
 
+    attempted: int = 0
     triggered: int = 0
+    partial: int = 0
+    failed: int = 0
     decisions: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -103,10 +130,14 @@ class T2ExitManager:
         config: ArbConfig,
         executor: ExecutionEngine,
         ob_analyzer: OrderBookAnalyzer,
+        risk_manager: "RiskManager | None" = None,
+        notifier: "NotificationManager | None" = None,
     ):
         self._config = config
         self._executor = executor
         self._ob = ob_analyzer
+        self._risk_manager = risk_manager
+        self._notifier = notifier
         self._positions: dict[str, T2OpenPosition] = {}
         self._policy_cache: dict[float, OptimalStoppingPolicy] = {}
         self._stop_loss_bps = float(config.t2_stop_loss_bps)
@@ -139,30 +170,28 @@ class T2ExitManager:
         """Register every filled (or partially filled) T2 leg."""
         if not trades:
             return
-        action = str(signal_payload.get("action") or "BUY_YES").upper()
-        outcome_label = "Yes" if action == "BUY_YES" else "No"
         deadline_ts = _parse_iso_to_ts(market.end_date)
-        model_prob = float(signal_payload.get("model_prob") or 0.5)
+        model_prob_yes = float(signal_payload.get("model_prob") or 0.5)
         deviation = abs(float(signal_payload.get("deviation") or 0.0))
 
         with self._lock:
             self._register_fills_locked(
+                signal_payload=signal_payload,
                 trades=trades,
                 market=market,
-                outcome_label=outcome_label,
                 deadline_ts=deadline_ts,
-                model_prob=model_prob,
+                model_prob_yes=model_prob_yes,
                 deviation=deviation,
             )
 
     def _register_fills_locked(
         self,
         *,
+        signal_payload: dict[str, Any],
         trades: list[TradeRecord],
         market: MarketInfo,
-        outcome_label: str,
         deadline_ts: Optional[float],
-        model_prob: float,
+        model_prob_yes: float,
         deviation: float,
     ) -> None:
         for trade in trades:
@@ -177,9 +206,17 @@ class T2ExitManager:
             if fill_price is None or fill_price <= 0:
                 continue
 
+            outcome_label = _resolve_trade_outcome_label(signal_payload, market, trade)
+            model_prob = _resolve_position_model_prob(model_prob_yes, outcome_label)
             existing = self._positions.get(trade.token_id)
             if existing is not None:
-                existing.add_fill(float(fill_price), float(fill_size))
+                existing.add_fill(
+                    float(fill_price),
+                    float(fill_size),
+                    now_ts=time.time(),
+                    model_prob=model_prob,
+                    deviation=deviation,
+                )
                 continue
 
             self._positions[trade.token_id] = T2OpenPosition(
@@ -228,6 +265,8 @@ class T2ExitManager:
                     # Another evaluate() call is already mid-flight for this
                     # position. Skip to avoid double-SELL.
                     continue
+                if pos.next_exit_retry_ts > now:
+                    continue
                 if now - pos.last_eval_ts < self._eval_interval_sec:
                     continue
                 pos.last_eval_ts = now
@@ -262,23 +301,37 @@ class T2ExitManager:
                 }
                 self._exiting_tokens.add(token_id)
                 try:
-                    issued_ok = self._issue_exit(pos, market, current_price)
+                    issued_status, fill_size = self._issue_exit(pos, market, current_price)
                 finally:
                     self._exiting_tokens.discard(token_id)
 
-                if issued_ok:
+                decision["status"] = issued_status
+                decision["fill_size"] = fill_size
+                decision["remaining_size"] = pos.size_remaining
+                result.attempted += 1
+                result.decisions.append(decision)
+
+                if issued_status == "exited":
                     pos.exit_attempted = True
-                    result.decisions.append(decision)
                     result.triggered += 1
+                elif issued_status == "partial_exit":
+                    pos.exit_failure_count = 0
+                    pos.next_exit_retry_ts = 0.0
+                    result.partial += 1
                 else:
                     pos.exit_failure_count += 1
+                    pos.next_exit_retry_ts = now + _exit_retry_backoff_sec(
+                        self._eval_interval_sec,
+                        pos.exit_failure_count,
+                    )
+                    result.failed += 1
                     if pos.exit_failure_count >= _MAX_EXIT_RETRIES:
                         LOG.error(
-                            "T2 退出失败 %d 次，放弃: token=%s — 仓位需要人工干预",
+                            "T2 退出失败 %d 次: token=%s — 仓位仍在追踪，可能需要人工干预",
                             pos.exit_failure_count,
                             token_id[:16],
                         )
-                        pos.exit_attempted = True
+                        self._notify_fatal_exit_failure(pos)
 
             self._positions = {
                 k: v for k, v in self._positions.items()
@@ -347,13 +400,12 @@ class T2ExitManager:
         pos: T2OpenPosition,
         market: MarketInfo,
         current_price: float,
-    ) -> bool:
+    ) -> tuple[str, float]:
         """Submit a single-leg SELL via ExecutionEngine.
 
-        Returns True when the executor accepted the order (regardless of
-        fill status — that's the executor's problem to track), False on a
-        client transport error so the caller can keep the position and
-        retry next eval cycle.
+        Returns (`status`, `filled_size`). The position is removed only when
+        the exit leg is actually filled; failed FOK/transport attempts must
+        remain tracked so the next eval cycle can retry.
         """
         opp = ArbOpportunity(
             arb_type=ArbType.DIRECTIONAL,
@@ -379,7 +431,11 @@ class T2ExitManager:
             max_executable_size=pos.size_remaining,
         )
         try:
-            trades = self._executor.execute_arbitrage(opp, pos.size_remaining)
+            trades = self._executor.execute_arbitrage(
+                opp,
+                pos.size_remaining,
+                order_type_name="FAK",
+            )
         except Exception as exc:  # pragma: no cover - depends on live client
             LOG.warning(
                 "T2 退出失败: token=%s reason=%s err=%s",
@@ -387,17 +443,84 @@ class T2ExitManager:
                 pos.last_decision_reason,
                 exc,
             )
-            return False
+            self._notify_exit_failure(pos, f"exception={exc}")
+            return "exit_failed", 0.0
 
-        LOG.info(
-            "T2 退出已提交: token=%s reason=%s size=%.2f price=%.4f trades=%d",
+        fill_size = _sell_fill_size(trades, pos.token_id)
+        if fill_size > 0:
+            pos.size_remaining = max(0.0, pos.size_remaining - fill_size)
+            self._release_exit_exposure(pos, current_price, fill_size)
+
+        successful = _is_successful_exit(self._executor, opp, trades)
+        if successful and pos.size_remaining <= 1e-6:
+            LOG.info(
+                "T2 退出成交: token=%s reason=%s filled=%.2f price=%.4f trades=%d",
+                pos.token_id[:16],
+                pos.last_decision_reason,
+                fill_size,
+                current_price,
+                len(trades),
+            )
+            return "exited", fill_size
+
+        if fill_size > 0:
+            LOG.warning(
+                "T2 退出部分成交: token=%s reason=%s filled=%.2f remaining=%.2f price=%.4f trades=%d",
+                pos.token_id[:16],
+                pos.last_decision_reason,
+                fill_size,
+                pos.size_remaining,
+                current_price,
+                len(trades),
+            )
+            return "partial_exit", fill_size
+
+        statuses = ",".join(str(t.status.value) for t in trades) if trades else "none"
+        errors = "; ".join(
+            str(t.error).strip()
+            for t in trades
+            if str(t.error or "").strip()
+        )
+        LOG.warning(
+            "T2 退出未成交: token=%s reason=%s price=%.4f trades=%d statuses=%s%s",
             pos.token_id[:16],
             pos.last_decision_reason,
-            pos.size_remaining,
             current_price,
             len(trades),
+            statuses,
+            f" errors={errors}" if errors else "",
         )
-        return True
+        self._notify_exit_failure(pos, f"statuses={statuses}" + (f" errors={errors}" if errors else ""))
+        return "exit_failed", 0.0
+
+    def _release_exit_exposure(self, pos: T2OpenPosition, fill_price: float, fill_size: float) -> None:
+        if self._risk_manager is None:
+            return
+        self._risk_manager.release_market_exposure(pos.condition_id, max(0.0, fill_price * fill_size))
+
+    def _notify_exit_failure(self, pos: T2OpenPosition, details: str) -> None:
+        if self._notifier is None:
+            return
+        self._notifier.notify_trade_failure(
+            event_title=pos.market_question,
+            filled_legs=0,
+            total_legs=1,
+            simulated=self._config.dry_run,
+            details=f"T2 exit failed token={pos.token_id[:16]} reason={pos.last_decision_reason} {details}".strip(),
+        )
+
+    def _notify_fatal_exit_failure(self, pos: T2OpenPosition) -> None:
+        if self._notifier is None:
+            return
+        self._notifier.notify_fatal_error(
+            (
+                "T2 退出连续失败，仓位仍在追踪并进入退避重试。\n"
+                f"市场: {pos.market_question}\n"
+                f"token: {pos.token_id[:16]}\n"
+                f"失败次数: {pos.exit_failure_count}"
+            ),
+            error_key=f"t2_exit:{pos.token_id}",
+        )
 
 
 def _parse_iso_to_ts(value: str | None) -> Optional[float]:
@@ -412,9 +535,89 @@ def _parse_iso_to_ts(value: str | None) -> Optional[float]:
         return None
 
 
+def _resolve_trade_outcome_label(
+    signal_payload: dict[str, Any],
+    market: MarketInfo,
+    trade: TradeRecord,
+) -> str:
+    for token in market.tokens:
+        if token.token_id == trade.token_id and token.outcome:
+            return str(token.outcome)
+
+    action = _resolve_signal_action(signal_payload)
+    if action == "BUY_NO":
+        return "No"
+    return "Yes"
+
+
+def _resolve_signal_action(signal_payload: dict[str, Any]) -> str:
+    direct = str(signal_payload.get("action") or "").upper()
+    if direct:
+        return direct
+    execution_check = signal_payload.get("execution_check")
+    if isinstance(execution_check, dict):
+        action = str(execution_check.get("action") or "").upper()
+        if action:
+            return action
+    research_overlay = signal_payload.get("research_overlay")
+    if isinstance(research_overlay, dict):
+        action = str(research_overlay.get("action") or "").upper()
+        if action:
+            return action
+    signal_type = str(signal_payload.get("signal_type") or "").upper()
+    if signal_type.endswith("_NO") or "BUY_NO" in signal_type:
+        return "BUY_NO"
+    if signal_type.endswith("_YES") or "BUY_YES" in signal_type:
+        return "BUY_YES"
+    return "BUY_YES"
+
+
+def _resolve_position_model_prob(model_prob_yes: float, outcome_label: str) -> float:
+    model_prob_yes = max(0.0, min(1.0, float(model_prob_yes)))
+    if str(outcome_label).strip().lower() == "no":
+        return 1.0 - model_prob_yes
+    return model_prob_yes
+
+
+def _sell_fill_size(trades: list[TradeRecord], token_id: str) -> float:
+    total = 0.0
+    for trade in trades:
+        if trade.token_id != token_id or trade.side != OrderSide.SELL:
+            continue
+        fill_size = trade.fill_size
+        if fill_size is None and trade.status in (TradeStatus.FILLED, TradeStatus.PARTIAL):
+            fill_size = trade.size
+        if fill_size and fill_size > 0:
+            total += float(fill_size)
+    return total
+
+
+def _exit_retry_backoff_sec(eval_interval_sec: float, failure_count: int) -> float:
+    base = max(30.0, float(eval_interval_sec or 0.0))
+    exponent = max(0, int(failure_count) - 1)
+    return min(3600.0, base * (2 ** exponent))
+
+
+def _is_successful_exit(
+    executor: ExecutionEngine,
+    opp: ArbOpportunity,
+    trades: list[TradeRecord],
+) -> bool:
+    checker = getattr(executor, "is_successful_execution", None)
+    if callable(checker):
+        return bool(checker(opp, trades))
+    return (
+        len(trades) == len(opp.legs)
+        and all(t.status == TradeStatus.FILLED for t in trades)
+    )
+
+
 def t2_exit_telemetry(result: T2ExitResult, open_count: int) -> dict[str, Any]:
     return {
+        "attempted": result.attempted,
         "triggered": result.triggered,
+        "partial": result.partial,
+        "failed": result.failed,
         "open_positions": open_count,
         "decisions": [
             {
@@ -422,9 +625,12 @@ def t2_exit_telemetry(result: T2ExitResult, open_count: int) -> dict[str, Any]:
                 "market_id": d["market_id"][:12],
                 "outcome": d["outcome"],
                 "reason": d["reason"],
+                "status": d.get("status", ""),
                 "entry_price": round(float(d["entry_price"]), 4),
                 "exit_price": round(float(d["exit_price"]), 4),
                 "size": round(float(d["size"]), 4),
+                "fill_size": round(float(d.get("fill_size") or 0.0), 4),
+                "remaining_size": round(float(d.get("remaining_size") or 0.0), 4),
             }
             for d in result.decisions
         ],

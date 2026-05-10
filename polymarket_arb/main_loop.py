@@ -91,6 +91,7 @@ from polymarket_arb.main_helpers.signal_helpers import (
     spread_bps_from_snapshot as _spread_bps_from_snapshot,
     sum_trade_exposure as _sum_trade_exposure,
 )
+from polymarket_arb.main_helpers.signal_telemetry import StrategySignalTelemetryCompressor
 from polymarket_arb.main_helpers.strategy_execution import (
     ExecutionDelta,
     execute_strategy_signal as _execute_strategy_signal,
@@ -134,7 +135,7 @@ from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
 from polymarket_arb.portfolio_sync import PortfolioSync
 from polymarket_arb.risk_manager import RiskManager
 from polymarket_arb.strategies.maker_strategy import DynamicSpreadCalculator, MakerStrategy
-from polymarket_arb.strategies.t2_exit_manager import T2ExitManager
+from polymarket_arb.strategies.t2_exit_manager import T2ExitManager, t2_exit_telemetry
 from polymarket_arb.strategies.statistical_model import StatisticalMispricingDetector
 from polymarket_arb.strategies.strategy_orchestrator import (
     StrategyOrchestrator,
@@ -373,6 +374,8 @@ def main(dotenv_path: str | None = None) -> None:
         config=config,
         executor=executor,
         ob_analyzer=ob_analyzer,
+        risk_manager=risk_mgr,
+        notifier=notifier,
     )
     LOG.info(
         "T2 退出策略: stop_loss=%.0fbps tp_capture=%.0f%% max_hold=%.0fs eval=%.0fs optimal_stopping=%s",
@@ -452,6 +455,7 @@ def main(dotenv_path: str | None = None) -> None:
     total_live_expected_profit = 0.0
     total_simulated_expected_profit = 0.0
     consecutive_api_errors = 0
+    signal_telemetry = StrategySignalTelemetryCompressor(cooldown_sec=60.0)
 
     while not _SHUTDOWN_EVENT.is_set():
         cycle += 1
@@ -635,6 +639,9 @@ def main(dotenv_path: str | None = None) -> None:
                 daily_pnl=risk_mgr.state.daily_pnl,
                 open_positions=risk_mgr.state.open_positions,
                 focus_keywords=focus_keywords,
+                unrealized_pnl=risk_mgr.state.unrealized_pnl,
+                total_pnl=risk_mgr.state.total_pnl,
+                current_position_value=risk_mgr.state.current_position_value,
                 cycle_status="error",
             )
             if consecutive_api_errors >= 10:
@@ -786,10 +793,13 @@ def main(dotenv_path: str | None = None) -> None:
                 "timestamp": signal_for_record.timestamp,
             })
             if event_recorder.is_enabled:
-                event_recorder.write_event(
-                    "strategy_signals",
-                    _serialize_strategy_signal(signal_for_record, submitted=submitted, research_overlay=overlay_payload),
+                signal_payload = _serialize_strategy_signal(
+                    signal_for_record,
+                    submitted=submitted,
+                    research_overlay=overlay_payload,
                 )
+                for compressed_payload in signal_telemetry.consume(signal_payload):
+                    event_recorder.write_event("strategy_signals", compressed_payload)
 
         cycle_timing["strategy_sec"] += time.perf_counter() - phase_start
 
@@ -935,27 +945,36 @@ def main(dotenv_path: str | None = None) -> None:
         # would ride to settlement.
         try:
             exit_result = t2_exit_manager.evaluate(active_markets=execution_markets)
-            if exit_result.triggered > 0 and event_recorder.is_enabled:
+            if exit_result.attempted > 0 and event_recorder.is_enabled:
+                outcome_kinds = sum(
+                    1 for value in (exit_result.triggered, exit_result.partial, exit_result.failed)
+                    if value > 0
+                )
+                if outcome_kinds > 1:
+                    exit_status = "mixed"
+                elif exit_result.failed:
+                    exit_status = "exit_failed"
+                elif exit_result.partial:
+                    exit_status = "partial_exit"
+                else:
+                    exit_status = "exited"
+                telemetry = t2_exit_telemetry(
+                    exit_result,
+                    open_count=len(t2_exit_manager.open_positions),
+                )
                 event_recorder.write_event(
                     "strategy_executions",
                     {
                         "tier": StrategyTier.STATISTICAL_ARB.name,
                         "signal_type": "t2_exit",
                         "market_id": "",
-                        "status": "exited",
+                        "status": exit_status,
                         "trade_count": exit_result.triggered,
-                        "exit_decisions": [
-                            {
-                                "token_id": d["token_id"][:16],
-                                "market_id": d["market_id"][:12],
-                                "outcome": d["outcome"],
-                                "reason": d["reason"],
-                                "entry_price": round(float(d["entry_price"]), 4),
-                                "exit_price": round(float(d["exit_price"]), 4),
-                                "size": round(float(d["size"]), 4),
-                            }
-                            for d in exit_result.decisions
-                        ],
+                        "attempted_count": exit_result.attempted,
+                        "partial_count": exit_result.partial,
+                        "failed_count": exit_result.failed,
+                        "open_positions": telemetry["open_positions"],
+                        "exit_decisions": telemetry["decisions"],
                     },
                 )
         except Exception as exc:
@@ -1025,7 +1044,9 @@ def main(dotenv_path: str | None = None) -> None:
         ))
         dash_state.append_pnl_point({
             "timestamp": time.time(),
-            "cumulative_pnl": risk_s.daily_pnl,
+            "cumulative_pnl": risk_s.total_pnl,
+            "realized_daily_pnl": risk_s.daily_pnl,
+            "unrealized_pnl": risk_s.unrealized_pnl,
         })
 
         cycle_summary_payload = _emit_cycle_metrics(
@@ -1048,6 +1069,9 @@ def main(dotenv_path: str | None = None) -> None:
             daily_pnl=risk_s.daily_pnl,
             open_positions=risk_s.open_positions,
             focus_keywords=focus_keywords,
+            unrealized_pnl=risk_s.unrealized_pnl,
+            total_pnl=risk_s.total_pnl,
+            current_position_value=risk_s.current_position_value,
             cycle_status="ok",
         )
 

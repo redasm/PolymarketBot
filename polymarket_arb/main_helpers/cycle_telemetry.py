@@ -40,6 +40,9 @@ def build_cycle_summary_payload(
     focus_keywords: list[str],
     book_stats: dict[str, int],
     timing_stats: dict[str, float],
+    unrealized_pnl: float = 0.0,
+    total_pnl: float | None = None,
+    current_position_value: float = 0.0,
     cycle_status: str = "ok",
 ) -> dict[str, Any]:
     """Build the per-cycle telemetry payload.
@@ -74,6 +77,10 @@ def build_cycle_summary_payload(
         "ws_tokens": ws_status.get("subscribed_tokens", 0),
         "research_count": research_count,
         "daily_pnl": daily_pnl,
+        "realized_daily_pnl": daily_pnl,
+        "unrealized_pnl": unrealized_pnl,
+        "total_pnl": daily_pnl + unrealized_pnl if total_pnl is None else total_pnl,
+        "current_position_value": current_position_value,
         "open_positions": open_positions,
         "focus_keywords": focus_keywords,
         "book_stats": {
@@ -117,6 +124,9 @@ def emit_cycle_metrics(
     daily_pnl: float,
     open_positions: int,
     focus_keywords: list[str],
+    unrealized_pnl: float = 0.0,
+    total_pnl: float | None = None,
+    current_position_value: float = 0.0,
     cycle_status: str = "ok",
 ) -> dict[str, Any]:
     """Snapshot orderbook stats, build the payload, and write to the event log.
@@ -145,6 +155,9 @@ def emit_cycle_metrics(
         research_count=research_count,
         daily_pnl=daily_pnl,
         open_positions=open_positions,
+        unrealized_pnl=unrealized_pnl,
+        total_pnl=total_pnl,
+        current_position_value=current_position_value,
         focus_keywords=focus_keywords,
         book_stats=cycle_book_stats,
         timing_stats=timing_stats,

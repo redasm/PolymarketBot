@@ -19,6 +19,7 @@ Why a separate module:
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from polymarket_arb.config import ArbConfig
@@ -94,6 +95,9 @@ def collect_statistical_strategy_signals(
     for market in candidate_markets:
         if len(market.tokens) != 2 or market.closed or not market.active:
             continue
+        horizon_days = _market_horizon_days(market)
+        if horizon_days is not None and horizon_days > 90.0:
+            continue
 
         yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
         no_token = next((t for t in market.tokens if (t.outcome or "").lower() == "no"), market.tokens[-1])
@@ -143,6 +147,16 @@ def collect_statistical_strategy_signals(
             )
         )
     return signals
+
+
+def _market_horizon_days(market: MarketInfo) -> float | None:
+    if not market.end_date:
+        return None
+    try:
+        end_dt = datetime.fromisoformat(str(market.end_date).replace("Z", "+00:00"))
+        return (end_dt - datetime.now(timezone.utc)).total_seconds() / 86400.0
+    except Exception:
+        return None
 
 
 def collect_maker_strategy_signals(

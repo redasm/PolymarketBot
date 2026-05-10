@@ -33,6 +33,9 @@ def _payload_kwargs(**overrides):
         research_count=12,
         daily_pnl=1.23,
         open_positions=4,
+        unrealized_pnl=-0.25,
+        total_pnl=0.98,
+        current_position_value=12.5,
         focus_keywords=["btc", "election"],
         book_stats={
             "requests": 100,
@@ -65,6 +68,11 @@ def test_build_cycle_summary_payload_canonical_shape():
     assert payload["ws_connected"] is True
     assert payload["ws_tokens"] == 7
     assert payload["research_count"] == 12
+    assert payload["daily_pnl"] == pytest.approx(1.23)
+    assert payload["realized_daily_pnl"] == pytest.approx(1.23)
+    assert payload["unrealized_pnl"] == pytest.approx(-0.25)
+    assert payload["total_pnl"] == pytest.approx(0.98)
+    assert payload["current_position_value"] == pytest.approx(12.5)
     assert payload["focus_keywords"] == ["btc", "election"]
 
 

@@ -198,8 +198,6 @@ class OrderBookAnalyzer:
                         token_id[:20],
                         e,
                     )
-                    if self._retry_delay_sec > 0:
-                        time.sleep(self._retry_delay_sec)
                     continue
                 self._record_stat("rest_error")
                 LOG.error(
@@ -351,7 +349,7 @@ class OrderBookAnalyzer:
     def batch_get_snapshots(
         self,
         token_ids: list[str],
-        delay: float = 0.05,
+        delay: float = 0.0,
         *,
         allow_rest_fallback: bool = True,
     ) -> dict[str, OrderBookSnapshot]:

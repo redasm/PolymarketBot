@@ -114,7 +114,11 @@ class ExecutionEngine:
         return list(self._trade_history)
 
     def execute_arbitrage(
-        self, opp: ArbOpportunity, size: float
+        self,
+        opp: ArbOpportunity,
+        size: float,
+        *,
+        order_type_name: str | None = None,
     ) -> list[TradeRecord]:
         """执行套利交易的所有腿.
 
@@ -146,7 +150,8 @@ class ExecutionEngine:
             LOG.info("=== DRY RUN 模式 === 使用盘口深度模拟成交")
             return self._simulate_dry_run_arbitrage(opp, arb_id, actual_size)
 
-        records = self._submit_legs_parallel(opp, arb_id, actual_size)
+        order_type = self._resolve_named_order_type(order_type_name) if order_type_name else None
+        records = self._submit_legs_parallel(opp, arb_id, actual_size, order_type=order_type)
         all_success = len(records) == len(opp.legs) and all(r.status == TradeStatus.FILLED for r in records)
 
         cancellable_order_ids = [
@@ -182,6 +187,7 @@ class ExecutionEngine:
             for record in records:
                 if record.status == TradeStatus.FILLED:
                     record.error = "hedge_incomplete"
+            records.extend(self._auto_flatten_incomplete_fills(opp, arb_id, records))
 
         return records
 
@@ -724,6 +730,8 @@ class ExecutionEngine:
         opp: ArbOpportunity,
         arb_id: str,
         actual_size: float,
+        *,
+        order_type: Any | None = None,
     ) -> list[TradeRecord]:
         records: list[TradeRecord] = []
         leg_prices = [
@@ -753,6 +761,7 @@ class ExecutionEngine:
                     leg.side,
                     record.price,
                     record.size,
+                    order_type=order_type,
                 ): (index, leg, record)
                 # `zip(strict=True)` 仅在较新的 Python 版本可用；这里前面已经做过长度一致性校验，
                 # 因此直接使用普通 zip 以兼容部署环境中的旧版本解释器。
@@ -818,6 +827,76 @@ class ExecutionEngine:
         for record in records:
             self._append_trade_record(record)
         return records
+
+    def _auto_flatten_incomplete_fills(
+        self,
+        opp: ArbOpportunity,
+        arb_id: str,
+        records: list[TradeRecord],
+    ) -> list[TradeRecord]:
+        """Best-effort flatten for filled legs from a failed multi-leg arb."""
+        if self._config.dry_run or len(opp.legs) <= 1:
+            return []
+
+        filled = [
+            record
+            for record in records
+            if record.status in (TradeStatus.FILLED, TradeStatus.PARTIAL)
+            and float(record.fill_size or 0.0) > 0
+        ]
+        if not filled:
+            return []
+
+        flatten_order_type = self._resolve_named_order_type("FAK")
+        flatten_records: list[TradeRecord] = []
+        for record in filled:
+            reverse_side = OrderSide.SELL if record.side == OrderSide.BUY else OrderSide.BUY
+            fill_size = float(record.fill_size or 0.0)
+            flatten_price = 0.01 if reverse_side == OrderSide.SELL else 0.99
+            flatten = TradeRecord(
+                trade_id=str(uuid.uuid4())[:12],
+                arb_id=arb_id,
+                token_id=record.token_id,
+                condition_id=record.condition_id,
+                side=reverse_side,
+                price=flatten_price,
+                size=fill_size,
+                economic_cost=flatten_price,
+                error="auto_flatten_after_hedge_incomplete",
+            )
+            try:
+                submission = self._submit_order(
+                    record.token_id,
+                    reverse_side,
+                    flatten_price,
+                    fill_size,
+                    order_type=flatten_order_type,
+                )
+                flatten.order_id = submission.order_id
+                flatten.status = submission.trade_status
+                flatten.error = submission.error or flatten.error
+                if submission.fill_price is not None:
+                    flatten.fill_price = submission.fill_price
+                if submission.fill_size is not None:
+                    flatten.fill_size = submission.fill_size
+                if flatten.status == TradeStatus.FILLED and flatten.fill_price is None:
+                    flatten.fill_price = flatten_price
+                if flatten.status == TradeStatus.FILLED and flatten.fill_size is None:
+                    flatten.fill_size = fill_size
+            except Exception as exc:  # pragma: no cover - live transport
+                flatten.status = TradeStatus.FAILED
+                flatten.error = f"auto_flatten_failed:{exc}"
+            self._append_trade_record(flatten)
+            flatten_records.append(flatten)
+            LOG.warning(
+                "[cid=%s] hedge_incomplete 自动平仓: token=%s side=%s size=%.4f status=%s",
+                arb_id,
+                record.token_id[:16],
+                reverse_side.value,
+                fill_size,
+                flatten.status.value,
+            )
+        return flatten_records
 
     def _append_trade_record(self, record: TradeRecord, *, simulated: bool = False) -> None:
         target = self._simulated_trade_history if simulated else self._trade_history

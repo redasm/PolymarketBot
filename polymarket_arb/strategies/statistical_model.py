@@ -297,6 +297,8 @@ class StatisticalMispricingDetector:
         active = [value for value in components if value > 0]
         signal_strength = (sum(active) / len(active)) if active else 0.0
         confidence = confidence_from_signal_strength(signal_strength, scale=1.2)
+        if len(active) == 1:
+            confidence = min(confidence, 0.7)
 
         return ProbabilityEstimate(
             market_id=market_id,

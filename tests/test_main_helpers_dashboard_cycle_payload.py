@@ -53,6 +53,9 @@ def _risk_state(**overrides):
         open_positions=2,
         total_exposure=123.45,
         daily_pnl=4.56,
+        unrealized_pnl=-1.25,
+        total_pnl=3.31,
+        current_position_value=77.0,
         consecutive_failures=0,
         last_portfolio_sync_ts=1000.0,
         portfolio_sync_ok=True,
@@ -190,6 +193,11 @@ def test_risk_state_pulls_from_risk_state_dataclass_and_config() -> None:
     assert rs["max_positions"] == 10  # from config
     assert rs["total_exposure"] == 123.45
     assert rs["daily_pnl"] == 4.56
+    assert rs["realized_daily_pnl"] == 4.56
+    assert rs["unrealized_pnl"] == -1.25
+    assert rs["total_pnl"] == pytest.approx(3.31)
+    assert rs["current_position_value"] == 77.0
+    assert rs["portfolio_pnl_stale"] is False
     assert rs["portfolio_sync_enabled"] is True
     assert rs["portfolio_sync_max_consecutive_failures"] == 3
 

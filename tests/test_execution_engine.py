@@ -177,10 +177,12 @@ def test_execute_arbitrage_records_partial_fill_size(monkeypatch):
 
     trades = engine.execute_arbitrage(opp, 5)
 
-    assert len(trades) == 2
-    assert all(trade.status == TradeStatus.PARTIAL for trade in trades)
-    assert all(trade.fill_size == 2.0 for trade in trades)
-    assert all(trade.fill_price == 0.421 for trade in trades)
+    assert len(trades) == 4
+    assert all(trade.status == TradeStatus.PARTIAL for trade in trades[:2])
+    assert all(trade.fill_size == 2.0 for trade in trades[:2])
+    assert all(trade.fill_price == 0.421 for trade in trades[:2])
+    assert all(trade.side == OrderSide.SELL for trade in trades[2:])
+    assert all("auto_flatten" in str(trade.error) for trade in trades[2:])
 
 
 def test_execution_engine_validates_order_type_enum_at_init(monkeypatch):
@@ -216,13 +218,33 @@ def test_execute_arbitrage_records_failed_leg(monkeypatch):
 
     trades = engine.execute_arbitrage(opp, 5)
 
-    assert len(trades) == 2
+    assert len(trades) == 3
     assert trades[0].status == TradeStatus.FILLED
     assert trades[0].error == "hedge_incomplete"
     assert trades[0].rolled_back is False
     assert trades[1].status == TradeStatus.FAILED
-    assert len(engine.trade_history) == 2
+    assert trades[2].side == OrderSide.SELL
+    assert "auto_flatten" in str(trades[2].error)
+    assert len(engine.trade_history) == 3
     assert engine.is_successful_execution(opp, trades) is False
+
+
+def test_execute_arbitrage_accepts_order_type_override(monkeypatch):
+    _install_fake_clob_modules(monkeypatch)
+    seen_order_types: list[str | None] = []
+    engine = ExecutionEngine(make_test_config(dry_run=False), _FakeClient())
+    opp = _make_opp()
+
+    def fake_submit_order(*args, **kwargs):
+        seen_order_types.append(kwargs.get("order_type"))
+        return OrderSubmissionResult(order_id="oid-ok", trade_status=TradeStatus.FILLED)
+
+    monkeypatch.setattr(engine, "_submit_order", fake_submit_order)
+
+    trades = engine.execute_arbitrage(opp, 5, order_type_name="FAK")
+
+    assert len(trades) == 2
+    assert seen_order_types == ["FAK", "FAK"]
 
 
 def test_execute_arbitrage_successful_when_all_legs_fill(monkeypatch):

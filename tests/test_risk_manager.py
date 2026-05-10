@@ -78,6 +78,50 @@ def test_partial_failure_does_not_book_expected_profit():
     assert mgr.state.total_exposure == 0.45 * 5
 
 
+def test_sell_fill_releases_market_exposure() -> None:
+    mgr = RiskManager(make_test_config())
+    opp = _make_opp()
+    mgr.record_execution(
+        opp,
+        [TradeRecord("t1", "a1", "yes", "c1", OrderSide.BUY, 0.45, 5, status=TradeStatus.FILLED, economic_cost=0.45)],
+    )
+
+    mgr.record_execution(
+        opp,
+        [
+            TradeRecord(
+                "t2",
+                "a2",
+                "yes",
+                "c1",
+                OrderSide.SELL,
+                0.44,
+                5,
+                status=TradeStatus.FILLED,
+                economic_cost=0.45,
+                fill_size=5,
+            )
+        ],
+    )
+
+    assert mgr.state.total_exposure == pytest.approx(0.0)
+    assert mgr.state.open_positions == 0
+
+
+def test_release_market_exposure_reduces_open_position_count() -> None:
+    mgr = RiskManager(make_test_config())
+    opp = _make_opp()
+    mgr.record_execution(
+        opp,
+        [TradeRecord("t1", "a1", "yes", "c1", OrderSide.BUY, 0.45, 5, status=TradeStatus.FILLED, economic_cost=0.45)],
+    )
+
+    mgr.release_market_exposure("c1", 0.45 * 5)
+
+    assert mgr.state.total_exposure == pytest.approx(0.0)
+    assert mgr.state.open_positions == 0
+
+
 def test_consecutive_failures_trigger_halt():
     mgr = RiskManager(make_test_config(max_consecutive_failures=2))
     opp = _make_opp()
@@ -247,6 +291,9 @@ def test_sync_portfolio_snapshot_overwrites_real_positions_and_realized_daily_pn
     mgr.sync_portfolio_snapshot(positions, realized_daily_pnl=2.25, synced_at=1234.0)
 
     assert mgr.state.daily_pnl == 2.25
+    assert mgr.state.unrealized_pnl == pytest.approx(0.2)
+    assert mgr.state.total_pnl == pytest.approx(2.45)
+    assert mgr.state.current_position_value == pytest.approx(2.6)
     assert mgr.state.open_positions == 2
     assert mgr.state.total_exposure == (3 * 0.4) + (2 * 0.6)
     assert mgr.state.last_portfolio_sync_ts == 1234.0

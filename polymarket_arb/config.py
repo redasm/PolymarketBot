@@ -419,7 +419,7 @@ class ArbConfig:
             load_dotenv(override=True)
 
         private_key = _env("PRIVATE_KEY") or _env("POLYMARKET_PRIVATE_KEY")
-        funder = _env("POLYMARKET_FUNDER")
+        funder = _env("POLYMARKET_FUNDER") or _env("POLYMARKET_DEPOSIT_WALLET")
         if require_wallet:
             if not private_key:
                 raise ValueError("必须设置 PRIVATE_KEY 或 POLYMARKET_PRIVATE_KEY")

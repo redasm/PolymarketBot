@@ -236,25 +236,36 @@ class RiskManager:
                 self._state.halt_reason = f"连续失败 {self._state.consecutive_failures} 次"
                 LOG.error("风控熔断: %s", self._state.halt_reason)
 
+        buy_exposure_trades = [t for t in actual_exposure_trades if _trade_side_value(t) == "BUY"]
+        sell_exposure_trades = [t for t in actual_exposure_trades if _trade_side_value(t) == "SELL"]
+
         actual_cost = sum(
             (t.economic_cost if t.economic_cost is not None else t.price)
             * _resolved_exposure_size(t)
-            for t in actual_exposure_trades
+            for t in buy_exposure_trades
         )
         pending_cost = sum(
             (t.economic_cost if t.economic_cost is not None else t.price) * t.size
             for t in pending_trades
+            if _trade_side_value(t) == "BUY"
         )
         self._state.total_exposure += actual_cost + pending_cost
 
-        for t in actual_exposure_trades:
+        for t in buy_exposure_trades:
             cid = t.condition_id
             leg_cost = t.economic_cost if t.economic_cost is not None else t.price
             exposure_size = _resolved_exposure_size(t)
             exposure = leg_cost * exposure_size
             self._market_exposure[cid] = self._market_exposure.get(cid, 0.0) + exposure
 
+        for t in sell_exposure_trades:
+            leg_cost = t.economic_cost if t.economic_cost is not None else t.price
+            exposure = leg_cost * _resolved_exposure_size(t)
+            self.release_market_exposure(t.condition_id, exposure)
+
         for t in pending_trades:
+            if _trade_side_value(t) != "BUY":
+                continue
             cid = t.condition_id
             leg_cost = t.economic_cost if t.economic_cost is not None else t.price
             exposure = leg_cost * t.size
@@ -274,6 +285,7 @@ class RiskManager:
 
         if realized_pnl is not None:
             self._state.daily_pnl += float(realized_pnl)
+            self._state.total_pnl = self._state.daily_pnl + self._state.unrealized_pnl
 
         LOG.info(
             "风控状态: 持仓=%d, 总敞口=$%.2f, 日盈亏=$%.2f, 连续失败=%d",
@@ -287,6 +299,7 @@ class RiskManager:
         """记录市场结算后的盈亏."""
         with self._lock:
             self._state.daily_pnl += pnl
+            self._state.total_pnl = self._state.daily_pnl + self._state.unrealized_pnl
             exposure = self._market_exposure.pop(condition_id, 0.0)
             self._state.total_exposure = max(0, self._state.total_exposure - exposure)
             self._pending_reservations = {
@@ -294,6 +307,22 @@ class RiskManager:
                 for key, reservation in self._pending_reservations.items()
                 if reservation.condition_id != condition_id
             }
+            self._state.open_positions = self._compute_open_positions()
+
+    def release_market_exposure(self, condition_id: str, exposure: float) -> None:
+        """Release booked exposure immediately after a confirmed SELL fill."""
+        amount = max(0.0, float(exposure))
+        if not condition_id or amount <= 0:
+            return
+        with self._lock:
+            current = self._market_exposure.get(condition_id, 0.0)
+            released = min(current, amount)
+            remaining = max(0.0, current - amount)
+            if remaining > 1e-9:
+                self._market_exposure[condition_id] = remaining
+            else:
+                self._market_exposure.pop(condition_id, None)
+            self._state.total_exposure = max(0.0, self._state.total_exposure - released)
             self._state.open_positions = self._compute_open_positions()
 
     def reconcile_pending_order_statuses(self, trades: list[TradeRecord]) -> None:
@@ -378,30 +407,40 @@ class RiskManager:
 
             actual_market_exposure: dict[str, float] = {}
             normalized_positions: list[PositionSnapshot] = []
+            current_position_value = 0.0
+            unrealized_pnl = 0.0
             for position in positions:
                 size = max(0.0, float(position.size))
                 if size <= 0:
                     continue
                 avg_price = max(0.0, float(position.avg_price))
+                position_value = max(0.0, float(position.current_value))
+                position_unrealized = float(position.unrealized_pnl)
                 normalized = PositionSnapshot(
                     token_id=position.token_id,
                     condition_id=position.condition_id,
                     outcome=position.outcome,
                     size=size,
                     avg_price=avg_price,
-                    current_value=max(0.0, float(position.current_value)),
-                    unrealized_pnl=float(position.unrealized_pnl),
+                    current_value=position_value,
+                    unrealized_pnl=position_unrealized,
                 )
                 normalized_positions.append(normalized)
+                current_position_value += position_value
+                unrealized_pnl += position_unrealized
                 actual_market_exposure[normalized.condition_id] = (
                     actual_market_exposure.get(normalized.condition_id, 0.0) + (normalized.avg_price * normalized.size)
                 )
 
             self._state.positions = normalized_positions
             self._state.daily_pnl = float(realized_daily_pnl)
+            self._state.current_position_value = current_position_value
+            self._state.unrealized_pnl = unrealized_pnl
+            self._state.total_pnl = self._state.daily_pnl + self._state.unrealized_pnl
             self._state.last_portfolio_sync_ts = float(synced_at)
             self._state.portfolio_sync_ok = True
             self._state.portfolio_sync_error = ""
+            self._state.portfolio_pnl_stale = False
             if self._state.portfolio_sync_consecutive_failures > 0:
                 LOG.info(
                     "账户同步恢复，重置连续失败计数 %d -> 0",
@@ -423,6 +462,7 @@ class RiskManager:
             self._state.portfolio_sync_ok = False
             self._state.portfolio_sync_error = message
             self._state.portfolio_sync_consecutive_failures += 1
+            self._state.portfolio_pnl_stale = True
             if synced_at is not None:
                 self._state.last_portfolio_sync_ts = float(synced_at)
             cap = self._config.portfolio_sync_max_consecutive_failures
@@ -482,6 +522,7 @@ class RiskManager:
         if today > self._daily_reset_ts:
             LOG.info("日切: 重置日盈亏 $%.2f -> $0.00", self._state.daily_pnl)
             self._state.daily_pnl = 0.0
+            self._state.total_pnl = self._state.unrealized_pnl
             self._daily_reset_ts = today
 
     def _reconcile_pending_reservations(self) -> None:
@@ -531,7 +572,8 @@ class RiskManager:
             "📊 风控状态",
             f"持仓数: {s.open_positions}/{self._config.max_open_positions}",
             f"总敞口: ${s.total_exposure:.2f}/${self._config.max_total_exposure:.2f}",
-            f"日盈亏: ${s.daily_pnl:+.2f} (止损线: -${self._config.max_daily_loss:.2f})",
+            f"已实现日盈亏: ${s.daily_pnl:+.2f} (止损线: -${self._config.max_daily_loss:.2f})",
+            f"未实现盈亏: ${s.unrealized_pnl:+.2f} | 合计: ${s.total_pnl:+.2f}",
             f"连续失败: {s.consecutive_failures}/{self._config.max_consecutive_failures}",
             f"状态: {'🔴 已暂停 - ' + s.halt_reason if s.is_halted else '🟢 正常'}",
         ]
@@ -549,6 +591,9 @@ def _snapshot_risk_state(state: RiskState) -> RiskState:
         total_exposure=state.total_exposure,
         open_positions=state.open_positions,
         daily_pnl=state.daily_pnl,
+        unrealized_pnl=state.unrealized_pnl,
+        total_pnl=state.total_pnl,
+        current_position_value=state.current_position_value,
         consecutive_failures=state.consecutive_failures,
         is_halted=state.is_halted,
         halt_reason=state.halt_reason,
@@ -557,6 +602,7 @@ def _snapshot_risk_state(state: RiskState) -> RiskState:
         portfolio_sync_ok=state.portfolio_sync_ok,
         portfolio_sync_error=state.portfolio_sync_error,
         portfolio_sync_consecutive_failures=state.portfolio_sync_consecutive_failures,
+        portfolio_pnl_stale=state.portfolio_pnl_stale,
     )
 
 
@@ -578,3 +624,7 @@ def _resolved_execution_size(trade: TradeRecord) -> float:
 
 def _resolved_exposure_size(trade: TradeRecord) -> float:
     return _resolved_execution_size(trade)
+
+
+def _trade_side_value(trade: TradeRecord) -> str:
+    return str(getattr(trade.side, "value", trade.side)).upper()

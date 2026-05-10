@@ -209,6 +209,9 @@ class RiskState:
     total_exposure: float = 0.0
     open_positions: int = 0
     daily_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    total_pnl: float = 0.0
+    current_position_value: float = 0.0
     consecutive_failures: int = 0
     is_halted: bool = False
     halt_reason: str = ""
@@ -217,6 +220,7 @@ class RiskState:
     portfolio_sync_ok: bool = False
     portfolio_sync_error: str = ""
     portfolio_sync_consecutive_failures: int = 0
+    portfolio_pnl_stale: bool = False
 
     def check_can_trade(
         self,
@@ -232,8 +236,9 @@ class RiskState:
             return False, f"持仓数 {self.open_positions} 已达上限 {max_positions}"
         if self.total_exposure >= max_total_exposure:
             return False, f"总敞口 ${self.total_exposure:.2f} 已达上限 ${max_total_exposure:.2f}"
-        if self.daily_pnl <= -max_daily_loss:
-            return False, f"日亏损 ${abs(self.daily_pnl):.2f} 已触发止损线 ${max_daily_loss:.2f}"
+        effective_daily_pnl = min(self.daily_pnl, self.total_pnl)
+        if effective_daily_pnl <= -max_daily_loss:
+            return False, f"日亏损 ${abs(effective_daily_pnl):.2f} 已触发止损线 ${max_daily_loss:.2f}"
         if self.consecutive_failures >= max_failures > 0:
             return False, f"连续失败 {self.consecutive_failures} 次，已达上限 {max_failures}"
         return True, ""

@@ -197,8 +197,10 @@ def execute_strategy_signal(
         # and never reach the venue.
         risk_mgr.record_execution(opportunity, trades)
         if t2_exit_manager is not None:
+            t2_payload = dict(signal.payload or {})
+            t2_payload.setdefault("signal_type", signal.signal_type)
             t2_exit_manager.register_fills(
-                signal_payload=dict(signal.payload or {}),
+                signal_payload=t2_payload,
                 market=market,
                 trades=trades,
             )
