@@ -23,6 +23,20 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
 
 
 def _infer_stance(rows: list[dict]) -> str:
+    explicit_counts: dict[str, int] = {}
+    for row in rows:
+        stance = str(row.get("stance", "") or "").strip().lower()
+        if stance in {"bullish", "bearish", "uncertain"}:
+            explicit_counts[stance] = explicit_counts.get(stance, 0) + 1
+    if explicit_counts:
+        bullish = explicit_counts.get("bullish", 0)
+        bearish = explicit_counts.get("bearish", 0)
+        if bullish > bearish:
+            return "bullish"
+        if bearish > bullish:
+            return "bearish"
+        return "uncertain"
+
     text = " ".join((row.get("summary", "") or "").lower() for row in rows)
     bullish_score = sum(term in text for term in _BULLISH_TERMS)
     bearish_score = sum(term in text for term in _BEARISH_TERMS)

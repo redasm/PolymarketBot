@@ -156,6 +156,12 @@ class ArbLeg:
     available_size: float  # 该价位可用深度
     execution_price: Optional[float] = None
     economic_cost: Optional[float] = None
+    # Market tick precision. Most Polymarket markets use 0.01, but some use
+    # 0.005 / 0.001. The execution engine uses this for side-aware price
+    # quantization so SELL limits round DOWN to the matchable bid grid and
+    # BUY limits round UP to the matchable ask grid; the default 0.01
+    # preserves legacy callers that don't yet thread the real value.
+    tick_size: float = 0.01
 
     def __post_init__(self) -> None:
         if self.execution_price is None:

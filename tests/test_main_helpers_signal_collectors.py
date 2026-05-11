@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from polymarket_arb.main_helpers.flow_aggregator import FlowAggregator
 from polymarket_arb.main_helpers.signal_collectors import (
     collect_cross_platform_strategy_signals,
     collect_maker_strategy_signals,
@@ -311,3 +312,46 @@ def test_collect_maker_returns_empty_when_no_fair_value_and_no_detector():
         detector=None,
     )
     assert out == []
+
+
+def test_collect_maker_attaches_flow_bias_when_aggregator_has_data():
+    import time as _time
+
+    snapshots = {"m-yes": _balanced_snapshot("m-yes", mid=0.50)}
+    maker = _StubMaker(quote=_maker_quote())
+    agg = FlowAggregator(window_sec=3600.0, min_trades=1, strong_threshold=0.55)
+    now = _time.time()
+    agg.record_trade(condition_id="m", taker_bought_yes=True, shares=70.0, ts=now - 30)
+    agg.record_trade(condition_id="m", taker_bought_yes=False, shares=30.0, ts=now - 20)
+
+    out = collect_maker_strategy_signals(
+        candidate_markets=[_binary_market("m")],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        maker_strategy=maker,
+        fair_values_by_market={"m": 0.50},
+        flow_aggregator=agg,
+    )
+
+    assert len(out) == 1
+    bias = out[0].payload.get("flow_bias")
+    assert bias is not None
+    assert bias["taker_yes_share"] == pytest.approx(0.70)
+    assert bias["lean"] == "yes"
+    assert bias["is_stable"] is True
+
+
+def test_collect_maker_omits_flow_bias_when_aggregator_has_no_data():
+    snapshots = {"m-yes": _balanced_snapshot("m-yes")}
+    maker = _StubMaker(quote=_maker_quote())
+    agg = FlowAggregator(window_sec=3600.0, min_trades=1)
+
+    out = collect_maker_strategy_signals(
+        candidate_markets=[_binary_market("m")],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        maker_strategy=maker,
+        fair_values_by_market={"m": 0.50},
+        flow_aggregator=agg,
+    )
+
+    assert len(out) == 1
+    assert "flow_bias" not in out[0].payload

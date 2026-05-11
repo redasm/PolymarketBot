@@ -50,9 +50,19 @@ LOG = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from polymarket_arb.notifier import NotificationManager
     from polymarket_arb.risk_manager import RiskManager
+    from polymarket_arb.strategies.recent_exit_cooldown import RecentExitCooldownStore
 
 
 _MAX_EXIT_RETRIES = 3
+# Escalation ladder: after _FLOOR_EXIT_AFTER consecutive failures we stop
+# trying to limit-sell at the moving bid and fire a "give up the spread"
+# FAK at FLOOR_PRICE. After _ABANDON_AFTER total failures we release the
+# exposure so RISK_MAX_OPEN_POSITIONS / RISK_MAX_TOTAL_EXPOSURE stop
+# starving the rest of the strategies — the position remains on-chain
+# (the bot can't dispose of it), but the in-memory book is unblocked.
+_FLOOR_EXIT_AFTER = 10
+_ABANDON_AFTER = 20
+_FLOOR_PRICE = 0.01
 
 
 @dataclass
@@ -76,6 +86,10 @@ class T2OpenPosition:
     # would mark the position closed even though no SELL ever landed.
     exit_failure_count: int = 0
     next_exit_retry_ts: float = 0.0
+    # Set when the in-memory tracking gives up and releases exposure. The
+    # underlying on-chain position may still exist; portfolio_sync owns
+    # the reconciliation from that point on.
+    abandoned: bool = False
 
     def add_fill(
         self,
@@ -132,12 +146,14 @@ class T2ExitManager:
         ob_analyzer: OrderBookAnalyzer,
         risk_manager: "RiskManager | None" = None,
         notifier: "NotificationManager | None" = None,
+        cooldown_store: "RecentExitCooldownStore | None" = None,
     ):
         self._config = config
         self._executor = executor
         self._ob = ob_analyzer
         self._risk_manager = risk_manager
         self._notifier = notifier
+        self._cooldown_store = cooldown_store
         self._positions: dict[str, T2OpenPosition] = {}
         self._policy_cache: dict[float, OptimalStoppingPolicy] = {}
         self._stop_loss_bps = float(config.t2_stop_loss_bps)
@@ -258,7 +274,7 @@ class T2ExitManager:
         with self._lock:
             for token_id in list(self._positions.keys()):
                 pos = self._positions[token_id]
-                if pos.exit_attempted:
+                if pos.exit_attempted or pos.abandoned:
                     self._positions.pop(token_id, None)
                     continue
                 if token_id in self._exiting_tokens:
@@ -275,6 +291,7 @@ class T2ExitManager:
                 if snap is None or snap.best_bid is None or snap.best_bid <= 0:
                     continue
                 current_price = float(snap.best_bid)
+                tick_size = float(getattr(snap, "tick_size", 0.01) or 0.01)
 
                 reason = self._decide_exit(pos, current_price, now)
                 pos.last_decision_reason = reason
@@ -289,19 +306,29 @@ class T2ExitManager:
                     )
                     continue
 
+                # Escalation: after N failures we stop limit-selling at the
+                # bid (which keeps missing on thin or vanished books) and
+                # switch to a floor-price FAK to dump at any price. Past
+                # the abandon threshold the position is released so it
+                # stops starving the rest of the bot.
+                use_floor = pos.exit_failure_count >= _FLOOR_EXIT_AFTER
+                exit_price = _FLOOR_PRICE if use_floor else current_price
+
                 decision = {
                     "token_id": token_id,
                     "market_id": pos.market_id,
                     "outcome": pos.outcome_label,
                     "entry_price": pos.entry_price,
-                    "exit_price": current_price,
+                    "exit_price": exit_price,
                     "size": pos.size_remaining,
-                    "reason": reason,
+                    "reason": "floor_dump" if use_floor else reason,
                     "ts": now,
                 }
                 self._exiting_tokens.add(token_id)
                 try:
-                    issued_status, fill_size = self._issue_exit(pos, market, current_price)
+                    issued_status, fill_size = self._issue_exit(
+                        pos, market, exit_price, tick_size=tick_size
+                    )
                 finally:
                     self._exiting_tokens.discard(token_id)
 
@@ -314,30 +341,92 @@ class T2ExitManager:
                 if issued_status == "exited":
                     pos.exit_attempted = True
                     result.triggered += 1
+                    self._record_cooldown(pos, now)
                 elif issued_status == "partial_exit":
                     pos.exit_failure_count = 0
                     pos.next_exit_retry_ts = 0.0
                     result.partial += 1
                 else:
                     pos.exit_failure_count += 1
-                    pos.next_exit_retry_ts = now + _exit_retry_backoff_sec(
-                        self._eval_interval_sec,
-                        pos.exit_failure_count,
-                    )
+                    if pos.exit_failure_count >= _FLOOR_EXIT_AFTER:
+                        # Once we're in floor-dump mode, retry quickly: at
+                        # $0.01 the only reason FAK fails is no bid at all,
+                        # which we should reconfirm fast, not back off for
+                        # an hour. Caps the abandon path at ~10 minutes
+                        # from the moment we enter floor mode.
+                        pos.next_exit_retry_ts = now + max(60.0, self._eval_interval_sec)
+                    else:
+                        pos.next_exit_retry_ts = now + _exit_retry_backoff_sec(
+                            self._eval_interval_sec,
+                            pos.exit_failure_count,
+                        )
                     result.failed += 1
-                    if pos.exit_failure_count >= _MAX_EXIT_RETRIES:
+                    if pos.exit_failure_count == _MAX_EXIT_RETRIES:
                         LOG.error(
                             "T2 退出失败 %d 次: token=%s — 仓位仍在追踪，可能需要人工干预",
                             pos.exit_failure_count,
                             token_id[:16],
                         )
                         self._notify_fatal_exit_failure(pos)
+                    elif pos.exit_failure_count == _FLOOR_EXIT_AFTER:
+                        LOG.error(
+                            "T2 退出失败 %d 次: token=%s — 下次起切到地板价 %.2f 强平",
+                            pos.exit_failure_count,
+                            token_id[:16],
+                            _FLOOR_PRICE,
+                        )
+                    elif pos.exit_failure_count >= _ABANDON_AFTER:
+                        self._abandon_position(pos)
 
             self._positions = {
                 k: v for k, v in self._positions.items()
-                if not v.exit_attempted and v.size_remaining > 1e-6
+                if not v.exit_attempted and not v.abandoned and v.size_remaining > 1e-6
             }
         return result
+
+    def _abandon_position(self, pos: T2OpenPosition) -> None:
+        """Give up on a position that won't exit after _ABANDON_AFTER tries.
+
+        Releases the booked risk exposure so RISK_MAX_OPEN_POSITIONS /
+        RISK_MAX_TOTAL_EXPOSURE stop blocking new entries. The on-chain
+        position itself is untouched — operator must reconcile manually
+        (or wait for market settlement). portfolio_sync will re-detect
+        the position on its next pass and re-book exposure if the chain
+        still owns it, so this is a *temporary* unblock, not a delete.
+        """
+        if pos.abandoned:
+            return
+        pos.abandoned = True
+        if self._risk_manager is not None:
+            notional = max(0.0, float(pos.entry_price) * float(pos.size_remaining))
+            try:
+                self._risk_manager.release_market_exposure(pos.condition_id, notional)
+            except Exception as exc:  # pragma: no cover - defensive
+                LOG.warning("放弃 T2 仓位时释放 exposure 失败: %s", exc)
+        LOG.error(
+            "T2 仓位 ABANDON: token=%s 失败 %d 次后放弃在 in-memory 追踪并释放 exposure；"
+            "链上仓位仍存在，等待 portfolio_sync 重新发现或人工处理。",
+            pos.token_id[:16],
+            pos.exit_failure_count,
+        )
+        # Lock the market out from immediate re-entry. The bot just gave up
+        # on this position; the entry path should not pick it back up on
+        # the next scan even if the statistical signal still looks good.
+        self._record_cooldown(pos, time.time())
+        if self._notifier is not None:
+            try:
+                self._notifier.notify_fatal_error(
+                    (
+                        "T2 仓位连续失败已放弃 in-memory 追踪，exposure 已释放。\n"
+                        f"市场: {pos.market_question}\n"
+                        f"token: {pos.token_id[:16]}\n"
+                        f"失败次数: {pos.exit_failure_count}\n"
+                        f"剩余 size: {pos.size_remaining:.4f}"
+                    ),
+                    error_key=f"t2_abandon:{pos.token_id}",
+                )
+            except Exception:  # pragma: no cover - notifier transport
+                pass
 
     def remove_position(self, token_id: str) -> None:
         with self._lock:
@@ -400,6 +489,8 @@ class T2ExitManager:
         pos: T2OpenPosition,
         market: MarketInfo,
         current_price: float,
+        *,
+        tick_size: float = 0.01,
     ) -> tuple[str, float]:
         """Submit a single-leg SELL via ExecutionEngine.
 
@@ -426,6 +517,7 @@ class T2ExitManager:
                     price=current_price,
                     size=pos.size_remaining,
                     available_size=pos.size_remaining,
+                    tick_size=tick_size,
                 )
             ],
             max_executable_size=pos.size_remaining,
@@ -492,6 +584,14 @@ class T2ExitManager:
         )
         self._notify_exit_failure(pos, f"statuses={statuses}" + (f" errors={errors}" if errors else ""))
         return "exit_failed", 0.0
+
+    def _record_cooldown(self, pos: T2OpenPosition, now: float) -> None:
+        if self._cooldown_store is None:
+            return
+        try:
+            self._cooldown_store.record_exit(pos.condition_id, now_ts=now)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOG.warning("post-exit cooldown 写入失败: %s", exc)
 
     def _release_exit_exposure(self, pos: T2OpenPosition, fill_price: float, fill_size: float) -> None:
         if self._risk_manager is None:

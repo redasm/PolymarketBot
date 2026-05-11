@@ -163,6 +163,42 @@ class ArbConfig:
     t2_max_hold_sec: float
     t2_exit_eval_interval_sec: float
     t2_optimal_stopping_enabled: bool
+    # T2 long-horizon guard: directional bets on markets resolving more than
+    # `t2_long_horizon_days` away (or with no end_date at all) require a
+    # higher net edge to enter. Long-horizon binary contracts are priced
+    # more by risk premium than by short-term mean reversion, so the
+    # default `live_min_net_edge_bps=25` is way too generous for them.
+    t2_long_horizon_days: float
+    t2_long_horizon_min_net_edge_bps: float
+    # T2 extreme-price gate: reject directional entries at the tails of
+    # [0, 1]. Empirical Polymarket data (Becker 2025, 72M trades) shows
+    # BUY YES at price < 0.10 averaged -41% EV (longshot tax); the
+    # symmetric BUY at price > 0.90 zone is "chasing a near-certain
+    # event" with no real edge after fees. We refuse both sides.
+    t2_reject_price_below: float
+    t2_reject_price_above: float
+    # T2 near-efficient category guard: in Finance / Crypto markets the
+    # Becker 2025 maker-taker gap is only 0.17 pp — taker fees swamp any
+    # statistical edge. We demand a much higher net_edge there (default
+    # 300 bps, vs 25 bps for the rest).
+    t2_near_efficient_min_net_edge_bps: float
+    # T2 post-exit cooldown (cross-restart). After a successful exit or
+    # abandoned-position release, the same market is locked out for
+    # this many seconds so the bot does not immediately re-enter the
+    # position the user (or the abandon path) just closed.
+    t2_post_exit_cooldown_sec: float
+    t2_recent_exits_state_file: str
+
+    # T3 flow-bias data foundation (Becker 2025 follow-up). The bot
+    # observes `last_trade_price` WS events, aggregates per-market
+    # taker_yes_share over a sliding window, and surfaces it on T3
+    # signals. Today the bias is telemetry-only; once the dataset is
+    # large enough we wire it into actual quote-side selection.
+    t3_flow_bias_enabled: bool
+    t3_flow_bias_window_sec: float
+    t3_flow_bias_min_trades: int
+    t3_flow_bias_strong_threshold: float
+    t3_flow_state_file: str
 
     # Tick 录制
     tick_record_enabled: bool
@@ -393,6 +429,24 @@ class ArbConfig:
             raise ValueError("T2_MAX_HOLD_SEC 不能为负数")
         if self.t2_exit_eval_interval_sec < 0:
             raise ValueError("T2_EXIT_EVAL_INTERVAL_SEC 不能为负数")
+        if self.t2_long_horizon_days < 0:
+            raise ValueError("T2_LONG_HORIZON_DAYS 不能为负数")
+        if self.t2_long_horizon_min_net_edge_bps < 0:
+            raise ValueError("T2_LONG_HORIZON_MIN_NET_EDGE_BPS 不能为负数")
+        if not (0.0 <= self.t2_reject_price_below <= 0.5):
+            raise ValueError("T2_REJECT_PRICE_BELOW 必须在 [0, 0.5]")
+        if not (0.5 <= self.t2_reject_price_above <= 1.0):
+            raise ValueError("T2_REJECT_PRICE_ABOVE 必须在 [0.5, 1.0]")
+        if self.t2_near_efficient_min_net_edge_bps < 0:
+            raise ValueError("T2_NEAR_EFFICIENT_MIN_NET_EDGE_BPS 不能为负数")
+        if self.t2_post_exit_cooldown_sec < 0:
+            raise ValueError("T2_POST_EXIT_COOLDOWN_SEC 不能为负数")
+        if self.t3_flow_bias_window_sec <= 0:
+            raise ValueError("T3_FLOW_BIAS_WINDOW_SEC 必须大于 0")
+        if self.t3_flow_bias_min_trades < 1:
+            raise ValueError("T3_FLOW_BIAS_MIN_TRADES 必须 >= 1")
+        if not (0.5 <= self.t3_flow_bias_strong_threshold <= 1.0):
+            raise ValueError("T3_FLOW_BIAS_STRONG_THRESHOLD 必须在 [0.5, 1.0]")
         if not self.dry_run:
             if not self.live_trading_ack:
                 raise ValueError("实盘前必须设置 LIVE_TRADING_ACK=true")
@@ -468,7 +522,11 @@ class ArbConfig:
             maker_strategy_enabled=_env_bool("MAKER_STRATEGY_ENABLED", True),
             min_liquidity=_env_float("ARB_MIN_LIQUIDITY", 1000.0),
             min_volume_24h=_env_float("ARB_MIN_VOLUME_24H", 500.0),
-            orderbook_snapshot_ttl_sec=_env_float("ORDERBOOK_SNAPSHOT_TTL_SEC", 0.5),
+            # REST cache TTL. 0.5s was so tight that sub-cycle re-reads
+            # always hit REST again (cycles run ~1.5s wall). 2.5s keeps a
+            # snapshot warm for the full cycle while still refreshing
+            # every scan, dropping rest_fallback share significantly.
+            orderbook_snapshot_ttl_sec=_env_float("ORDERBOOK_SNAPSHOT_TTL_SEC", 2.5),
             orderbook_ws_snapshot_max_age_sec=_env_float("ORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC", 10.0),
             orderbook_retry_count=_env_int("ORDERBOOK_RETRY_COUNT", 2),
             orderbook_retry_delay_sec=_env_float("ORDERBOOK_RETRY_DELAY_SEC", 0.15),
@@ -506,7 +564,7 @@ class ArbConfig:
             notify_on_daily_summary=_env_bool("NOTIFY_ON_DAILY_SUMMARY", True),
             pnl_profit_alert_usdc=_env_float("PNL_PROFIT_ALERT_USDC", 20.0),
             pnl_loss_alert_usdc=_env_float("PNL_LOSS_ALERT_USDC", 10.0),
-            fatal_error_cooldown_sec=_env_float("FATAL_ERROR_COOLDOWN_SEC", 300.0),
+            fatal_error_cooldown_sec=_env_float("FATAL_ERROR_COOLDOWN_SEC", 3600.0),
             daily_summary_time_hhmm=_env("DAILY_SUMMARY_TIME_HHMM", "08:05"),
             daily_summary_timezone=_env("DAILY_SUMMARY_TIMEZONE", "Asia/Shanghai"),
             notification_state_file=_env("NOTIFICATION_STATE_FILE", "data/telemetry/notification_state.json"),
@@ -532,6 +590,28 @@ class ArbConfig:
             t2_max_hold_sec=_env_float("T2_MAX_HOLD_SEC", 6 * 3600.0),
             t2_exit_eval_interval_sec=_env_float("T2_EXIT_EVAL_INTERVAL_SEC", 30.0),
             t2_optimal_stopping_enabled=_env_bool("T2_OPTIMAL_STOPPING_ENABLED", True),
+            t2_long_horizon_days=_env_float("T2_LONG_HORIZON_DAYS", 30.0),
+            t2_long_horizon_min_net_edge_bps=_env_float("T2_LONG_HORIZON_MIN_NET_EDGE_BPS", 200.0),
+            t2_reject_price_below=_env_float("T2_REJECT_PRICE_BELOW", 0.10),
+            t2_reject_price_above=_env_float("T2_REJECT_PRICE_ABOVE", 0.90),
+            t2_near_efficient_min_net_edge_bps=_env_float(
+                "T2_NEAR_EFFICIENT_MIN_NET_EDGE_BPS", 300.0
+            ),
+            t2_post_exit_cooldown_sec=_env_float("T2_POST_EXIT_COOLDOWN_SEC", 24 * 3600.0),
+            t2_recent_exits_state_file=_env(
+                "T2_RECENT_EXITS_STATE_FILE",
+                "data/telemetry/recent_exits.json",
+            ),
+            t3_flow_bias_enabled=_env_bool("T3_FLOW_BIAS_ENABLED", True),
+            t3_flow_bias_window_sec=_env_float("T3_FLOW_BIAS_WINDOW_SEC", 3600.0),
+            t3_flow_bias_min_trades=_env_int("T3_FLOW_BIAS_MIN_TRADES", 20),
+            t3_flow_bias_strong_threshold=_env_float(
+                "T3_FLOW_BIAS_STRONG_THRESHOLD", 0.55
+            ),
+            t3_flow_state_file=_env(
+                "T3_FLOW_STATE_FILE",
+                "data/telemetry/flow_state.json",
+            ),
             tick_record_enabled=_env_bool("TICK_RECORD_ENABLED", False),
             tick_record_dir=_env("TICK_RECORD_DIR", "data/ticks"),
             telemetry_record_enabled=_env_bool("TELEMETRY_RECORD_ENABLED", False),
@@ -551,7 +631,11 @@ class ArbConfig:
             log_level=_env("LOG_LEVEL", "INFO"),
             log_file=_env("LOG_FILE", "arb_bot.log"),
             ws_enabled=_env_bool("WS_ENABLED", True),
-            ws_max_markets=_env_int("WS_MAX_MARKETS", 3),
+            # Default sized to comfortably cover ARB_HOT_MARKET_POOL_SIZE
+            # without forcing every cycle's snapshots through REST. The
+            # canary template still overrides to 10. Going from 3 → 20
+            # closes the gap that pushed live WS hit-ratio below 50%.
+            ws_max_markets=_env_int("WS_MAX_MARKETS", 20),
             ws_refresh_cycles=_env_int("WS_REFRESH_CYCLES", 200),
             ws_vol_feed_interval_sec=_env_float("WS_VOL_FEED_INTERVAL_SEC", 60.0),
             ai_enabled=_env_bool("AI_ENABLED", False),

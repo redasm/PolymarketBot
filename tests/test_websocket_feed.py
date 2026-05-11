@@ -191,6 +191,73 @@ def test_reconnect_jitter_stays_within_expected_range():
     assert 10.0 <= delay <= 13.0
 
 
+def test_last_trade_price_forwards_to_trade_callback():
+    captured: list[dict] = []
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror, trade_callback=captured.append)
+
+    feed._handle_message(json.dumps({
+        "event_type": "last_trade_price",
+        "asset_id": "yes-tok",
+        "side": "BUY",
+        "size": "100",
+        "price": "0.42",
+        "timestamp": "1740000000000",
+    }))
+
+    assert len(captured) == 1
+    assert captured[0]["asset_id"] == "yes-tok"
+    assert captured[0]["side"] == "BUY"
+
+
+def test_last_trade_price_without_callback_is_safe_no_op():
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror)
+
+    feed._handle_message(json.dumps({
+        "type": "last_trade_price",
+        "asset_id": "yes-tok",
+        "side": "BUY",
+        "size": "100",
+        "price": "0.42",
+    }))
+
+
+def test_last_trade_price_swallows_callback_exceptions():
+    """A buggy consumer must not kill the WS pump."""
+
+    def raising(_event):
+        raise RuntimeError("consumer blew up")
+
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror, trade_callback=raising)
+
+    feed._handle_message(json.dumps({
+        "type": "last_trade_price",
+        "asset_id": "yes-tok",
+        "side": "BUY",
+        "size": "100",
+    }))
+
+
+def test_set_trade_callback_replaces_existing_consumer():
+    first_calls: list[dict] = []
+    second_calls: list[dict] = []
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror, trade_callback=first_calls.append)
+
+    feed.set_trade_callback(second_calls.append)
+    feed._handle_message(json.dumps({
+        "type": "last_trade_price",
+        "asset_id": "yes-tok",
+        "side": "SELL",
+        "size": "12",
+    }))
+
+    assert first_calls == []
+    assert len(second_calls) == 1
+
+
 def test_apply_delta_buffers_until_snapshot_arrives():
     """Pre-snapshot deltas must be replayed once the snapshot lands.
 

@@ -96,11 +96,17 @@ class StrategySignal:
 class StrategyOrchestrator:
     """策略编排器."""
 
+    # Weights shifted toward T3 (maker) after Becker 2025 demonstrated that
+    # Polymarket takers average -1.12% EV vs makers' +1.12% across 72M
+    # trades. T0 still gets the biggest slice because structural arb is
+    # priced-locked profit, not a directional bet; T2 (statistical taker)
+    # is halved because it's the role the paper most clearly identifies
+    # as a negative-EV game in efficient categories.
     DEFAULT_ALLOCATIONS = {
-        StrategyTier.STRUCTURAL_ARB: 0.45,
-        StrategyTier.CROSS_PLATFORM: 0.00,
-        StrategyTier.STATISTICAL_ARB: 0.40,
-        StrategyTier.MARKET_MAKING: 0.15,
+        StrategyTier.STRUCTURAL_ARB: 0.30,
+        StrategyTier.CROSS_PLATFORM: 0.05,
+        StrategyTier.STATISTICAL_ARB: 0.15,
+        StrategyTier.MARKET_MAKING: 0.50,
     }
     _MAX_SIGNAL_HISTORY = 2000
     # Per-market-per-hour cap applies only to directional tiers; T0 / T3 are

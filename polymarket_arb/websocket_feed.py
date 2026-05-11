@@ -261,14 +261,20 @@ class WebSocketFeed:
         mirror: OrderBookMirror,
         ws_url: str = POLYMARKET_WS_URL,
         enhanced_store: Optional[EnhancedBookStore] = None,
+        trade_callback: Optional[Callable[[dict], None]] = None,
     ):
         self._mirror = mirror
         self._ws_url = ws_url
         self._enhanced_store = enhanced_store
+        self._trade_callback = trade_callback
         self._subscribed_tokens: set[str] = set()
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._reconnect_delay = 1.0
+
+    def set_trade_callback(self, callback: Optional[Callable[[dict], None]]) -> None:
+        """Replace the ``last_trade_price`` handler used by this feed."""
+        self._trade_callback = callback
 
     def subscribe(self, token_ids: list[str]) -> None:
         self._subscribed_tokens.update(token_ids)
@@ -404,8 +410,25 @@ class WebSocketFeed:
                     self._mirror.apply_delta(token_id, side, price, size)
                     self._sync_snapshot_from_mirror(token_id)
 
+        elif msg_type == "last_trade_price":
+            self._dispatch_trade(msg)
+
         elif msg_type in ("pong", "subscribed", "subscription_ack", "heartbeat"):
             pass
+
+    def _dispatch_trade(self, msg: dict[str, Any]) -> None:
+        """Forward ``last_trade_price`` events to the registered consumer.
+
+        Exceptions in the consumer are swallowed so a buggy flow
+        aggregator cannot kill the WS pump (the consumer is best-
+        effort telemetry, not a hot-path).
+        """
+        if self._trade_callback is None:
+            return
+        try:
+            self._trade_callback(msg)
+        except Exception as exc:
+            LOG.warning("trade_callback raised: %s", exc)
 
     def _sync_to_enhanced_store(self, token_id: str, bids_raw: list, asks_raw: list) -> None:
         """将 WS 推送的订单簿数据同步写入 EnhancedBookStore."""

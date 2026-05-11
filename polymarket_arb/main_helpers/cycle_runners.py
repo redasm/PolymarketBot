@@ -23,6 +23,7 @@ from typing import Any
 from polymarket_arb.arbitrage_detector import ArbitrageDetector
 from polymarket_arb.book_store import EnhancedBookStore
 from polymarket_arb.config import ArbConfig
+from polymarket_arb.main_helpers.flow_aggregator import FlowIngest
 from polymarket_arb.market_scanner import MarketScanner
 from polymarket_arb.models import ArbOpportunity, MarketInfo
 from polymarket_arb.strategies.strategy_orchestrator import StrategyOrchestrator, StrategySignal
@@ -71,6 +72,7 @@ def start_ws_feed(
     targets: list[MarketInfo],
     enhanced_store: EnhancedBookStore,
     tick_recorder: TickRecorder | None = None,
+    flow_ingest: FlowIngest | None = None,
 ) -> tuple[WebSocketFeed, OrderBookMirror]:
     """Spin up the WS mirror, bind the primary market, and start the feed.
 
@@ -79,6 +81,10 @@ def start_ws_feed(
     market's tokens are still subscribed to the mirror so the per-cycle
     scan path can read fresh books from any of them — but `EnhancedBookStore`
     is single-market by design (see `book_store.py`).
+
+    `flow_ingest`, when provided, also rebuilds its token-id lookup
+    for the new target set and is wired in as the WS feed's trade
+    consumer so `last_trade_price` events feed the FlowAggregator.
     """
     mirror = OrderBookMirror()
     if tick_recorder is not None and tick_recorder.is_enabled:
@@ -95,7 +101,16 @@ def start_ws_feed(
         for t in m.tokens:
             all_token_ids.append(t.token_id)
 
-    feed = WebSocketFeed(mirror=mirror, enhanced_store=enhanced_store)
+    trade_callback = None
+    if flow_ingest is not None:
+        flow_ingest.register_markets(targets)
+        trade_callback = flow_ingest.on_trade
+
+    feed = WebSocketFeed(
+        mirror=mirror,
+        enhanced_store=enhanced_store,
+        trade_callback=trade_callback,
+    )
     feed.subscribe(all_token_ids)
     feed.start()
 

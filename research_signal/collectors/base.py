@@ -417,20 +417,22 @@ class LocalKnowledgeBaseCollector:
         for _, doc in sorted(scored, key=lambda item: item[0], reverse=True)[: self._max_matches_per_topic]:
             published_ts = doc.get("published_ts")
             ts = float(doc.get("ts") or published_ts or now)
-            rows.append(
-                {
-                    "topic": topic,
-                    "summary": str(doc.get("summary") or doc.get("topic") or "")[:500],
-                    "source": str(doc.get("source") or "local_knowledge_base"),
-                    "event_id": str(doc.get("event_id") or "").strip(),
-                    "condition_id": str(doc.get("condition_id") or "").strip(),
-                    "ts": ts,
-                    "published_ts": float(published_ts) if published_ts is not None else None,
-                    "link": str(doc.get("link") or "").strip(),
-                    "tags": list(doc.get("tags", []))[:8],
-                    "knowledge_file": doc.get("_knowledge_file", ""),
-                }
-            )
+            stance = str(doc.get("stance") or "").strip().lower()
+            row = {
+                "topic": topic,
+                "summary": str(doc.get("summary") or doc.get("topic") or "")[:500],
+                "source": str(doc.get("source") or "local_knowledge_base"),
+                "event_id": str(doc.get("event_id") or "").strip(),
+                "condition_id": str(doc.get("condition_id") or "").strip(),
+                "ts": ts,
+                "published_ts": float(published_ts) if published_ts is not None else None,
+                "link": str(doc.get("link") or "").strip(),
+                "tags": list(doc.get("tags", []))[:8],
+                "knowledge_file": doc.get("_knowledge_file", ""),
+            }
+            if stance in {"bullish", "bearish", "uncertain"}:
+                row["stance"] = stance
+            rows.append(row)
         return rows
 
 

@@ -61,6 +61,7 @@ from polymarket_arb.strategies.strategy_orchestrator import (
 )
 
 if TYPE_CHECKING:
+    from polymarket_arb.strategies.recent_exit_cooldown import RecentExitCooldownStore
     from polymarket_arb.strategies.t2_exit_manager import T2ExitManager
 
 
@@ -100,6 +101,7 @@ def execute_strategy_signal(
     maker_strategy: MakerStrategy,
     notifier: NotificationManager,
     t2_exit_manager: "T2ExitManager | None" = None,
+    cooldown_store: "RecentExitCooldownStore | None" = None,
 ) -> tuple[bool, str, ExecutionDelta]:
     """Dispatch a `StrategySignal` to the right tier executor.
 
@@ -180,6 +182,7 @@ def execute_strategy_signal(
             signal=signal,
             market=market,
             ob_analyzer=ob_analyzer,
+            cooldown_store=cooldown_store,
         )
         if opportunity is None:
             return False, build_reason, ExecutionDelta()
@@ -210,6 +213,10 @@ def execute_strategy_signal(
             exposure_amount_usdc=sum_trade_exposure(trades, include_simulated=False),
         )
         if event_recorder.is_enabled:
+            # `execution_check.category` was set by directional_opportunity
+            # for T2 entries; surface it at row top-level so post-hoc
+            # analysis doesn't have to dig two layers down.
+            exec_check = dict(signal.payload.get("execution_check") or {})
             event_recorder.write_event("strategy_executions", {
                 "tier": signal.tier.name,
                 "signal_type": signal.signal_type,
@@ -217,7 +224,9 @@ def execute_strategy_signal(
                 "status": "executed" if execution_success else "attempted",
                 "trade_count": len(trades),
                 "arb_type": opportunity.arb_type.value,
-                "execution_check": dict(signal.payload.get("execution_check") or {}),
+                "execution_check": exec_check,
+                "our_role": "taker",
+                "category": exec_check.get("category", ""),
             })
         for trade in trades:
             dash_state.append_trade({
@@ -341,6 +350,15 @@ def execute_strategy_signal(
         target_price = float(chosen["price"])
         target_size = float(chosen["size"])
         side_edge = float(chosen["edge"])
+        # The maker quote came from a fresh orderbook snapshot upstream; query
+        # one more time so the limit price quantizes to the real market tick.
+        target_snap = None
+        if ob_analyzer is not None and hasattr(ob_analyzer, "get_snapshot"):
+            try:
+                target_snap = ob_analyzer.get_snapshot(target_token.token_id)
+            except Exception:
+                target_snap = None
+        target_tick_size = float(getattr(target_snap, "tick_size", 0.01) or 0.01)
         maker_opp = ArbOpportunity(
             arb_type=ArbType.MARKET_MAKING,
             event_id=market.event_id or market.condition_id,
@@ -362,6 +380,7 @@ def execute_strategy_signal(
                     available_size=target_size,
                     execution_price=target_price,
                     economic_cost=target_price,
+                    tick_size=target_tick_size,
                 )
             ],
             max_executable_size=target_size,
@@ -385,6 +404,7 @@ def execute_strategy_signal(
             size=adj_size,
             post_only=True,
             order_type_name="GTC",
+            tick_size=target_tick_size,
         )
         submission_success = trade.status in {TradeStatus.PENDING, TradeStatus.PARTIAL, TradeStatus.FILLED}
         if target_order_side == OrderSide.BUY:
@@ -428,6 +448,16 @@ def execute_strategy_signal(
                 "side": target_order_side.value,
                 "expected_edge_per_share": side_edge,
                 "post_only": True,
+                # Becker 2025 follow-up: tag every fill with our role
+                # (maker/taker) and the article's category so we can
+                # later estimate per-category taker-yes-share and
+                # validate maker-only is actually profitable for us.
+                "our_role": "maker",
+                "category": (signal.payload.get("category") if isinstance(signal.payload, dict) else None) or "",
+                "category_maker_taker_gap_pp": (
+                    signal.payload.get("category_maker_taker_gap_pp")
+                    if isinstance(signal.payload, dict) else None
+                ),
             })
         simulated_maker = bool(getattr(trade, "simulated", False))
         expected_edge_usdc = side_edge

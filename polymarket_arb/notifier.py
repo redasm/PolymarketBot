@@ -180,18 +180,36 @@ class NotificationManager:
         error_key: str,
         now_ts: float | None = None,
     ) -> bool:
+        """Send a deduplicated fatal alert.
+
+        Per-key cooldown is exponential so a long-running incident doesn't
+        spam Feishu hourly: send N=1 immediately, then wait base × 2^(N-1)
+        capped at 24h. ``fatal_error_count`` only increments on actual
+        sends — past behaviour conflated dedup hits with new incidents.
+        """
         now_ts = now_ts or time.time()
         self._ensure_daily_state(now_ts)
         stats = self._state["current_daily_stats"]
         last_sent = float(self._state.get("fatal_error_last_sent", {}).get(error_key, 0.0))
-        should_send = (now_ts - last_sent) >= self._config.fatal_error_cooldown_sec
-
-        if should_send:
-            stats["fatal_error_count"] = int(stats.get("fatal_error_count", 0)) + 1
-            self._state.setdefault("fatal_error_last_sent", {})[error_key] = now_ts
-            self._persist_state()
+        send_counts = self._state.setdefault("fatal_error_send_counts", {})
+        prior_sends = int(send_counts.get(error_key, 0))
+        base_cooldown = max(0.0, float(self._config.fatal_error_cooldown_sec))
+        if prior_sends <= 0:
+            required_cooldown = 0.0
         else:
+            required_cooldown = min(
+                86400.0,
+                base_cooldown * (2 ** (prior_sends - 1)),
+            )
+        should_send = (now_ts - last_sent) >= required_cooldown
+
+        if not should_send:
             return False
+
+        stats["fatal_error_count"] = int(stats.get("fatal_error_count", 0)) + 1
+        self._state.setdefault("fatal_error_last_sent", {})[error_key] = now_ts
+        send_counts[error_key] = prior_sends + 1
+        self._persist_state()
 
         if not self._config.notify_on_fatal_error:
             return False

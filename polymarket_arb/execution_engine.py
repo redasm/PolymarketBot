@@ -20,7 +20,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from math import gcd
 from typing import Any
 
@@ -35,6 +35,12 @@ from polymarket_arb.models import (
 LOG = logging.getLogger(__name__)
 _PRICE_QUANT = Decimal("0.01")
 _SIZE_QUANT = Decimal("0.00001")
+# Polymarket allows tick sizes finer than 0.01 (e.g. 0.005, 0.001) on selected
+# markets. Quantizing to a coarser grid than the market's real tick is what
+# made the T2 exit FAK orders unfillable: e.g. snap.best_bid=0.505 → SELL
+# limit rounded UP to 0.51 → no bid ≥ 0.51 → "no orders found to match".
+_DEFAULT_TICK_SIZE = _PRICE_QUANT
+_SIZE_DENOMINATOR = 100000  # 5-decimal size precision (10^5)
 _PENDING_REMOTE_STATUSES = {
     "accepted",
     "live",
@@ -246,9 +252,10 @@ class ExecutionEngine:
         *,
         order_type: Any | None = None,
         post_only: bool = False,
+        tick_size: float | None = None,
     ) -> OrderSubmissionResult:
         """提交单笔订单到 CLOB."""
-        price, size = _quantize_clob_order_args(price, size)
+        price, size = _quantize_clob_order_args(price, size, side=side, tick_size=tick_size)
         if price <= 0 or size <= 0:
             return OrderSubmissionResult(
                 order_id="",
@@ -263,6 +270,7 @@ class ExecutionEngine:
                 size,
                 order_type=order_type,
                 post_only=post_only,
+                tick_size=tick_size,
             )
 
         return self._submit_order_v1(
@@ -318,6 +326,7 @@ class ExecutionEngine:
         *,
         order_type: Any | None = None,
         post_only: bool = False,
+        tick_size: float | None = None,
     ) -> OrderSubmissionResult:
         from py_clob_client_v2 import OrderArgs, PartialCreateOrderOptions, Side
 
@@ -331,7 +340,7 @@ class ExecutionEngine:
         execution_type = order_type if order_type is not None else self._execution_order_type
         resp = self._client.create_and_post_order(
             order_args=order_args,
-            options=PartialCreateOrderOptions(tick_size="0.01"),
+            options=PartialCreateOrderOptions(tick_size=_format_tick_size_for_clob(tick_size)),
             order_type=execution_type,
             post_only=post_only,
         )
@@ -448,10 +457,13 @@ class ExecutionEngine:
         arb_id: str | None = None,
         post_only: bool = False,
         order_type_name: str = "GTC",
+        tick_size: float | None = None,
     ) -> TradeRecord:
         """提交单笔限价单，供做市/单腿策略复用."""
         arb_ref = arb_id or str(uuid.uuid4())[:12]
-        normalized_price, normalized_size = _quantize_clob_order_args(price, size)
+        normalized_price, normalized_size = _quantize_clob_order_args(
+            price, size, side=side, tick_size=tick_size
+        )
         trade = TradeRecord(
             trade_id=str(uuid.uuid4())[:12],
             arb_id=arb_ref,
@@ -488,6 +500,7 @@ class ExecutionEngine:
                 normalized_size,
                 order_type=self._resolve_named_order_type(order_type_name),
                 post_only=post_only,
+                tick_size=tick_size,
             )
             trade.order_id = submission.order_id
             trade.status = submission.trade_status
@@ -735,10 +748,23 @@ class ExecutionEngine:
     ) -> list[TradeRecord]:
         records: list[TradeRecord] = []
         leg_prices = [
-            _quantize_clob_price(leg.execution_price if leg.execution_price is not None else leg.price)
+            _quantize_clob_price(
+                leg.execution_price if leg.execution_price is not None else leg.price,
+                side=leg.side,
+                tick_size=getattr(leg, "tick_size", None),
+            )
             for leg in opp.legs
         ]
-        quantized_size = _quantize_common_clob_order_size(leg_prices, actual_size)
+        # Multi-leg arbs may have different ticks per leg; use the finest so the
+        # shared size remains legal for every leg simultaneously.
+        leg_ticks = [
+            _coerce_tick(getattr(leg, "tick_size", None))
+            for leg in opp.legs
+        ]
+        common_tick = min(leg_ticks) if leg_ticks else _DEFAULT_TICK_SIZE
+        quantized_size = _quantize_common_clob_order_size(
+            leg_prices, actual_size, tick_size=common_tick
+        )
         for leg, quantized_price in zip(opp.legs, leg_prices):
             records.append(TradeRecord(
                 trade_id=str(uuid.uuid4())[:12],
@@ -762,6 +788,7 @@ class ExecutionEngine:
                     record.price,
                     record.size,
                     order_type=order_type,
+                    tick_size=getattr(leg, "tick_size", None),
                 ): (index, leg, record)
                 # `zip(strict=True)` 仅在较新的 Python 版本可用；这里前面已经做过长度一致性校验，
                 # 因此直接使用普通 zip 以兼容部署环境中的旧版本解释器。
@@ -849,10 +876,14 @@ class ExecutionEngine:
 
         flatten_order_type = self._resolve_named_order_type("FAK")
         flatten_records: list[TradeRecord] = []
+        leg_tick_by_token = {
+            leg.token_id: getattr(leg, "tick_size", None) for leg in opp.legs
+        }
         for record in filled:
             reverse_side = OrderSide.SELL if record.side == OrderSide.BUY else OrderSide.BUY
             fill_size = float(record.fill_size or 0.0)
             flatten_price = 0.01 if reverse_side == OrderSide.SELL else 0.99
+            leg_tick = leg_tick_by_token.get(record.token_id)
             flatten = TradeRecord(
                 trade_id=str(uuid.uuid4())[:12],
                 arb_id=arb_id,
@@ -871,6 +902,7 @@ class ExecutionEngine:
                     flatten_price,
                     fill_size,
                     order_type=flatten_order_type,
+                    tick_size=leg_tick,
                 )
                 flatten.order_id = submission.order_id
                 flatten.status = submission.trade_status
@@ -1004,51 +1036,160 @@ def _coerce_rollback_outcome(outcome: Any) -> tuple[set[str], set[str]]:
     return set(outcome), set()
 
 
-def _quantize_clob_order_args(price: float, size: float) -> tuple[float, float]:
+def _format_tick_size_for_clob(tick_size: float | Decimal | None) -> str:
+    """Render tick_size as the string CLOB v2 ``PartialCreateOrderOptions`` expects.
+
+    The CLOB accepts the canonical Polymarket ticks: "0.01", "0.005", "0.001",
+    "0.0001". We pin the output to one of these to avoid the "0.01" → 0.01000…
+    float-string drift; unknown values fall back to "0.01" (legacy default).
+    """
+    tick = _coerce_tick(tick_size)
+    canonical = {
+        Decimal("0.01"): "0.01",
+        Decimal("0.005"): "0.005",
+        Decimal("0.001"): "0.001",
+        Decimal("0.0001"): "0.0001",
+    }
+    return canonical.get(tick, "0.01")
+
+
+def _coerce_tick(tick_size: float | Decimal | None) -> Decimal:
+    if tick_size is None:
+        return _DEFAULT_TICK_SIZE
+    if isinstance(tick_size, Decimal):
+        tick = tick_size
+    else:
+        try:
+            tick = Decimal(str(tick_size))
+        except Exception:
+            return _DEFAULT_TICK_SIZE
+    return tick if tick > 0 else _DEFAULT_TICK_SIZE
+
+
+def _quantize_clob_order_args(
+    price: float,
+    size: float,
+    *,
+    side: OrderSide | None = None,
+    tick_size: float | Decimal | None = None,
+) -> tuple[float, float]:
     """Normalize order args to CLOB decimal precision.
 
     CLOB rejects market buy orders when maker amount has >2 decimals or taker
     amount has >5 decimals. For OrderArgs that means both share size and the
     derived USDC notional (`price * size`) must be representable exactly at
     their allowed precision.
+
+    ``side`` makes the price rounding matchable: BUY rounds UP toward the ask
+    (limit ≥ ask → can fill), SELL rounds DOWN toward the bid (limit ≤ bid →
+    can fill). Without a side we fall back to ROUND_HALF_UP for compatibility.
     """
-    quantized_price = _quantize_clob_price(price)
+    tick = _coerce_tick(tick_size)
+    quantized_price = _quantize_clob_price(price, side=side, tick_size=tick)
     quantized_size = _quantize_clob_size(size)
     if quantized_price <= 0 or quantized_size <= 0:
         return 0.0, 0.0
 
-    legal_size = _quantize_common_clob_order_size([quantized_price], quantized_size)
+    legal_size = _quantize_common_clob_order_size(
+        [quantized_price], quantized_size, tick_size=tick
+    )
     if legal_size <= 0:
         return 0.0, 0.0
     return quantized_price, legal_size
 
 
-def _quantize_clob_price(price: float) -> float:
-    return _quantize_decimal(price, _PRICE_QUANT, rounding=ROUND_HALF_UP)
+def _quantize_clob_price(
+    price: float,
+    *,
+    side: OrderSide | None = None,
+    tick_size: float | Decimal | None = None,
+) -> float:
+    """Snap price to the nearest integer multiple of ``tick_size``.
+
+    ``Decimal.quantize`` aligns to the *exponent* of the quantum, not to the
+    quantum itself: ``Decimal("0.5071").quantize(Decimal("0.005"))`` gives
+    ``0.507`` (3 decimals) rather than ``0.505`` (the nearest multiple of
+    0.005). We therefore divide by tick, round the integer count, and
+    multiply back to land exactly on the tick grid.
+    """
+    tick = _coerce_tick(tick_size)
+    if side == OrderSide.BUY:
+        rounding = ROUND_UP
+    elif side == OrderSide.SELL:
+        rounding = ROUND_DOWN
+    else:
+        rounding = ROUND_HALF_UP
+    try:
+        decimal_price = Decimal(str(price))
+    except Exception:
+        return 0.0
+    if decimal_price <= 0:
+        return 0.0
+    n_ticks = (decimal_price / tick).to_integral_value(rounding=rounding)
+    return float(n_ticks * tick)
 
 
 def _quantize_clob_size(size: float) -> float:
     return _quantize_decimal(size, _SIZE_QUANT, rounding=ROUND_DOWN)
 
 
-def _quantize_common_clob_order_size(prices: list[float], size: float) -> float:
+def _tick_units(price: float, tick: Decimal) -> int:
+    """Express ``price`` as an integer multiple of ``tick``."""
+    try:
+        decimal_price = Decimal(str(price))
+    except Exception:
+        return 0
+    if decimal_price <= 0 or tick <= 0:
+        return 0
+    quotient = (decimal_price / tick).to_integral_value(rounding=ROUND_DOWN)
+    return int(quotient)
+
+
+def _quantize_common_clob_order_size(
+    prices: list[float],
+    size: float,
+    *,
+    tick_size: float | Decimal | None = None,
+) -> float:
+    """Round size down so ``price * size`` lands on the CLOB's USDC grid.
+
+    For tick=0.01 the legality denominator is _SIZE_DENOMINATOR (matches the
+    pre-refactor behaviour). For finer ticks (0.005, 0.001) the denominator
+    scales with the tick so we don't silently corrupt the constraint by
+    rounding sub-cent prices to cents.
+    """
     quantized_size = _quantize_clob_size(size)
-    size_units = int((Decimal(str(quantized_size)) * 100000).to_integral_value(rounding=ROUND_DOWN))
+    size_units = int(
+        (Decimal(str(quantized_size)) * _SIZE_DENOMINATOR).to_integral_value(rounding=ROUND_DOWN)
+    )
     if size_units <= 0:
         return 0.0
 
+    tick = _coerce_tick(tick_size)
+    # legality denominator = size precision × (cents-per-tick).
+    # tick=0.01 → cents_per_tick=1 → denom=100000 (legacy behaviour)
+    # tick=0.001 → cents_per_tick=0.1 → denom=10000 (scaled by 10× tick refinement vs cent)
+    # Compute as Decimal to handle non-power-of-10 ticks (e.g. 0.005).
+    cents_per_tick = tick * Decimal(100)
+    denom_decimal = (Decimal(_SIZE_DENOMINATOR) * cents_per_tick)
+    # Round denom to nearest integer; for the canonical ticks (0.01, 0.005,
+    # 0.001) the value is exact.
+    denom = int(denom_decimal.to_integral_value(rounding=ROUND_HALF_UP))
+    if denom <= 0:
+        denom = _SIZE_DENOMINATOR
+
     size_unit_step = 1
     for price in prices:
-        price_cents = int((Decimal(str(price)) * 100).to_integral_value())
-        if price_cents <= 0:
+        price_units = _tick_units(price, tick)
+        if price_units <= 0:
             return 0.0
-        step = 100000 // gcd(price_cents, 100000)
+        step = denom // gcd(price_units, denom)
         size_unit_step = _lcm(size_unit_step, step)
 
     legal_size_units = (size_units // size_unit_step) * size_unit_step
     if legal_size_units <= 0:
         return 0.0
-    return float(Decimal(legal_size_units) / Decimal(100000))
+    return float(Decimal(legal_size_units) / Decimal(_SIZE_DENOMINATOR))
 
 
 def _lcm(left: int, right: int) -> int:

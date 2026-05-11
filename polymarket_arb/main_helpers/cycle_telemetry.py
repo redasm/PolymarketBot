@@ -44,6 +44,8 @@ def build_cycle_summary_payload(
     total_pnl: float | None = None,
     current_position_value: float = 0.0,
     cycle_status: str = "ok",
+    theoretical_opportunities_today: int = 0,
+    live_successes_today: int = 0,
 ) -> dict[str, Any]:
     """Build the per-cycle telemetry payload.
 
@@ -68,6 +70,8 @@ def build_cycle_summary_payload(
         "selected_event_count": selected_event_count,
         "arbs_found_total": theoretical_opportunities_total,
         "arbs_executed_total": live_successes_total,
+        "arbs_found_today": theoretical_opportunities_today,
+        "arbs_executed_today": live_successes_today,
         "theoretical_opportunities_total": theoretical_opportunities_total,
         "live_successes_total": live_successes_total,
         "simulated_successes_total": simulated_successes_total,
@@ -128,6 +132,8 @@ def emit_cycle_metrics(
     total_pnl: float | None = None,
     current_position_value: float = 0.0,
     cycle_status: str = "ok",
+    theoretical_opportunities_today: int = 0,
+    live_successes_today: int = 0,
 ) -> dict[str, Any]:
     """Snapshot orderbook stats, build the payload, and write to the event log.
 
@@ -162,6 +168,8 @@ def emit_cycle_metrics(
         book_stats=cycle_book_stats,
         timing_stats=timing_stats,
         cycle_status=cycle_status,
+        theoretical_opportunities_today=theoretical_opportunities_today,
+        live_successes_today=live_successes_today,
     )
     if event_recorder.is_enabled:
         event_recorder.write_event("cycle_metrics", payload)

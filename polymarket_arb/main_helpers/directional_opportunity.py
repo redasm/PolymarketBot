@@ -28,7 +28,13 @@ Rejection reasons (stable identifiers — telemetry consumers count them):
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from polymarket_arb.config import ArbConfig
+from polymarket_arb.main_helpers.market_category import (
+    classify_market_category,
+    is_near_efficient,
+)
 from polymarket_arb.main_helpers.signal_helpers import (
     resolve_strategy_signal_action,
     set_signal_execution_check,
@@ -42,7 +48,23 @@ from polymarket_arb.models import (
     OrderSide,
 )
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
+from polymarket_arb.strategies.recent_exit_cooldown import RecentExitCooldownStore
 from polymarket_arb.strategies.strategy_orchestrator import StrategySignal
+
+
+def _market_horizon_days(market: MarketInfo) -> float | None:
+    """Days until market end_date, or None if no end_date is set.
+
+    Mirrors the helper in `signal_collectors` so callers don't need to
+    cross-import; both functions stay in sync because the logic is one-liner.
+    """
+    if not market.end_date:
+        return None
+    try:
+        end_dt = datetime.fromisoformat(str(market.end_date).replace("Z", "+00:00"))
+        return (end_dt - datetime.now(timezone.utc)).total_seconds() / 86400.0
+    except Exception:
+        return None
 
 
 def build_directional_opportunity_from_signal(
@@ -51,6 +73,7 @@ def build_directional_opportunity_from_signal(
     signal: StrategySignal,
     market: MarketInfo,
     ob_analyzer: OrderBookAnalyzer,
+    cooldown_store: RecentExitCooldownStore | None = None,
 ) -> tuple[ArbOpportunity | None, float, str]:
     """Convert a directional T2/T3 signal into an executable `ArbOpportunity`.
 
@@ -65,6 +88,19 @@ def build_directional_opportunity_from_signal(
     if action not in {"BUY_YES", "BUY_NO"}:
         set_signal_execution_check(signal, reason="unsupported_direction", action=action)
         return None, 0.0, "unsupported_direction"
+
+    # Post-exit cooldown gate. Runs early so we don't waste depth-verify /
+    # fee math on a market the operator (or the abandon path) just closed.
+    if cooldown_store is not None:
+        blocked, remaining_sec = cooldown_store.in_cooldown(market.condition_id)
+        if blocked:
+            set_signal_execution_check(
+                signal,
+                reason="recent_exit_cooldown",
+                action=action,
+                cooldown_remaining_sec=float(remaining_sec),
+            )
+            return None, 0.0, "recent_exit_cooldown"
 
     if not config.dry_run and hasattr(ob_analyzer, "feed_health"):
         health = ob_analyzer.feed_health(
@@ -98,6 +134,33 @@ def build_directional_opportunity_from_signal(
             token_id=target_token.token_id[:20],
         )
         return None, 0.0, "missing_best_ask"
+
+    # Extreme-price gate (Becker 2025 longshot/favorite tax). Buying YES
+    # below `t2_reject_price_below` averaged -41% EV on Polymarket;
+    # buying NO at the symmetric high-price tail (= buying YES at low
+    # complement price) is the same trade in reverse. Cut both before
+    # depth + fee math — they are net-negative regardless of edge size.
+    best_ask_price = float(snap.best_ask)
+    reject_below = float(getattr(config, "t2_reject_price_below", 0.0) or 0.0)
+    reject_above = float(getattr(config, "t2_reject_price_above", 1.0) or 1.0)
+    if reject_below > 0.0 and best_ask_price < reject_below:
+        set_signal_execution_check(
+            signal,
+            reason="price_extreme_longshot",
+            action=action,
+            best_ask=best_ask_price,
+            reject_below=reject_below,
+        )
+        return None, 0.0, "price_extreme_longshot"
+    if reject_above < 1.0 and best_ask_price > reject_above:
+        set_signal_execution_check(
+            signal,
+            reason="price_extreme_favorite",
+            action=action,
+            best_ask=best_ask_price,
+            reject_above=reject_above,
+        )
+        return None, 0.0, "price_extreme_favorite"
 
     target_notional = max(0.0, float(signal.recommended_size_usdc))
     if target_notional <= 0:
@@ -155,10 +218,44 @@ def build_directional_opportunity_from_signal(
         set_signal_execution_check(signal, reason="edge_below_fee", **check_payload)
         return None, 0.0, "edge_below_fee"
     if not config.dry_run:
-        min_edge_by_bps = float(execution_price) * (config.live_min_net_edge_bps / 10_000.0)
+        horizon_days = _market_horizon_days(market)
+        # Long-horizon binary markets (or markets with no end_date at all)
+        # are dominated by risk-premium pricing rather than mean reversion.
+        # Demand a much higher edge there so a 99 bps "edge" on a 6-month
+        # question can no longer slip through the live gate.
+        is_long_horizon = (
+            horizon_days is None
+            or horizon_days > float(config.t2_long_horizon_days)
+        )
+        # Near-efficient categories (Finance / Crypto): Becker 2025 shows
+        # the maker-taker gap is only 0.17 pp here. A 25 bps live edge
+        # buffer is meaningless once 5% taker fees compound — bump to
+        # the configured T2 near-efficient bar (default 300 bps).
+        category = classify_market_category(market)
+        near_efficient = is_near_efficient(category)
+        # The active threshold is the strictest of the three:
+        #   default `live_min_net_edge_bps`
+        #   long-horizon override `t2_long_horizon_min_net_edge_bps`
+        #   category override   `t2_near_efficient_min_net_edge_bps`
+        effective_min_edge_bps = float(config.live_min_net_edge_bps)
+        if is_long_horizon:
+            effective_min_edge_bps = max(
+                effective_min_edge_bps,
+                float(config.t2_long_horizon_min_net_edge_bps),
+            )
+        if near_efficient:
+            effective_min_edge_bps = max(
+                effective_min_edge_bps,
+                float(getattr(config, "t2_near_efficient_min_net_edge_bps", 0.0) or 0.0),
+            )
+        min_edge_by_bps = float(execution_price) * (effective_min_edge_bps / 10_000.0)
         min_live_edge = max(config.live_min_net_edge_usd, min_edge_by_bps)
         check_payload["live_min_net_edge"] = min_live_edge
-        check_payload["live_min_net_edge_bps"] = config.live_min_net_edge_bps
+        check_payload["live_min_net_edge_bps"] = effective_min_edge_bps
+        check_payload["horizon_days"] = horizon_days
+        check_payload["long_horizon"] = is_long_horizon
+        check_payload["category"] = category
+        check_payload["near_efficient"] = near_efficient
         if net_edge < min_live_edge:
             set_signal_execution_check(signal, reason="live_edge_below_buffer", **check_payload)
             return None, 0.0, "live_edge_below_buffer"
@@ -185,6 +282,7 @@ def build_directional_opportunity_from_signal(
                 available_size=float(fillable_size),
                 execution_price=float(execution_price),
                 economic_cost=float(execution_price),
+                tick_size=float(getattr(snap, "tick_size", 0.01) or 0.01),
             )
         ],
         max_executable_size=float(fillable_size),

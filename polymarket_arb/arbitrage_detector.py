@@ -119,6 +119,7 @@ class ArbitrageDetector:
                 available_size=snap_yes.best_ask_size,
                 execution_price=ask_yes,
                 economic_cost=ask_yes,
+                tick_size=float(getattr(snap_yes, "tick_size", 0.01) or 0.01),
             ),
             ArbLeg(
                 token_id=token_no.token_id,
@@ -130,6 +131,7 @@ class ArbitrageDetector:
                 available_size=snap_no.best_ask_size,
                 execution_price=ask_no,
                 economic_cost=ask_no,
+                tick_size=float(getattr(snap_no, "tick_size", 0.01) or 0.01),
             ),
         ]
 
@@ -269,6 +271,7 @@ class ArbitrageDetector:
             available_size=snap.best_ask_size,
             execution_price=snap.best_ask,
             economic_cost=snap.best_ask,
+            tick_size=float(getattr(snap, "tick_size", 0.01) or 0.01),
         )
 
     def _get_neg_risk_leg(self, market: MarketInfo) -> Optional[ArbLeg]:
@@ -304,6 +307,7 @@ class ArbitrageDetector:
                 available_size=snap_yes.best_ask_size if snap_yes else 0,
                 execution_price=effective_ask_via_yes,
                 economic_cost=effective_ask_via_yes,
+                tick_size=float(getattr(snap_yes, "tick_size", 0.01) or 0.01) if snap_yes else 0.01,
             )
 
         if effective_ask_via_no is None or no_bid is None:
@@ -326,6 +330,7 @@ class ArbitrageDetector:
             available_size=snap_no.best_bid_size if snap_no else 0,
             execution_price=no_bid,
             economic_cost=effective_ask_via_no,
+            tick_size=float(getattr(snap_no, "tick_size", 0.01) or 0.01) if snap_no else 0.01,
         )
 
     def verify_opportunity_with_depth(
@@ -361,6 +366,7 @@ class ArbitrageDetector:
                     available_size=filled,
                     execution_price=vwap,
                     economic_cost=economic_cost,
+                    tick_size=getattr(leg, "tick_size", 0.01),
                 )
             )
 

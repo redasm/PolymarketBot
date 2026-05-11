@@ -157,6 +157,7 @@ class _FakeMirror:
 class _FakeFeed:
     subscribed: list = field(default_factory=list)
     started: bool = False
+    init_kwargs: dict = field(default_factory=dict)
 
     def subscribe(self, token_ids) -> None:
         self.subscribed = list(token_ids)
@@ -246,6 +247,69 @@ def test_start_ws_feed_skips_disabled_tick_recorder(monkeypatch) -> None:
 
     assert recorder.registered == []
     assert mirror.callbacks == []
+
+
+def test_start_ws_feed_registers_flow_ingest_and_passes_trade_callback(monkeypatch) -> None:
+    """The flow-ingest token map should be rebuilt on every (re)start.
+
+    We assert (a) the FlowIngest learns the targets' token map, and
+    (b) the WebSocketFeed gets a ``trade_callback`` wired to
+    ``flow_ingest.on_trade`` so live trades flow into the aggregator.
+    """
+    fake_feed = _FakeFeed()
+    captured_kwargs: dict = {}
+
+    def _factory(**kwargs):
+        captured_kwargs.update(kwargs)
+        return fake_feed
+
+    monkeypatch.setattr(
+        "polymarket_arb.main_helpers.cycle_runners.WebSocketFeed",
+        _factory,
+    )
+    monkeypatch.setattr(
+        "polymarket_arb.main_helpers.cycle_runners.OrderBookMirror",
+        _FakeMirror,
+    )
+
+    @dataclass
+    class _FakeIngest:
+        registered: list = field(default_factory=list)
+
+        def register_markets(self, markets) -> None:
+            self.registered.extend(markets)
+
+        def on_trade(self, event) -> None:
+            pass
+
+    ingest = _FakeIngest()
+
+    start_ws_feed([_market("0xprimary")], _FakeBookStore(), flow_ingest=ingest)
+
+    assert ingest.registered, "FlowIngest must learn the target market token map"
+    assert captured_kwargs.get("trade_callback") == ingest.on_trade
+
+
+def test_start_ws_feed_omits_trade_callback_when_no_flow_ingest(monkeypatch) -> None:
+    fake_feed = _FakeFeed()
+    captured_kwargs: dict = {}
+
+    def _factory(**kwargs):
+        captured_kwargs.update(kwargs)
+        return fake_feed
+
+    monkeypatch.setattr(
+        "polymarket_arb.main_helpers.cycle_runners.WebSocketFeed",
+        _factory,
+    )
+    monkeypatch.setattr(
+        "polymarket_arb.main_helpers.cycle_runners.OrderBookMirror",
+        _FakeMirror,
+    )
+
+    start_ws_feed([_market()], _FakeBookStore())
+
+    assert captured_kwargs.get("trade_callback") is None
 
 
 # ---------- scan_cycle --------------------------------------------------------

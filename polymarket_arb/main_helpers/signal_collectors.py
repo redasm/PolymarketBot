@@ -19,10 +19,17 @@ Why a separate module:
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any
 
 from polymarket_arb.config import ArbConfig
+from polymarket_arb.main_helpers.flow_aggregator import FlowAggregator
+from polymarket_arb.main_helpers.market_category import (
+    CATEGORY_MAKER_TAKER_GAP_PP,
+    classify_market_category,
+    is_high_gap,
+)
 from polymarket_arb.main_helpers.signal_helpers import (
     build_t2_related_market_context,
     evaluate_t2_market_quality,
@@ -34,6 +41,52 @@ from polymarket_arb.strategies.statistical_model import StatisticalMispricingDet
 from polymarket_arb.strategies.strategy_orchestrator import StrategySignal, StrategyTier
 
 LOG = logging.getLogger("main_loop")
+
+# Per-market T2 emission throttle. The orchestrator's rate cap was hitting
+# ~342 skips per scan cycle on a 2-market universe because the collector
+# re-emitted the same statistical signal every cycle on stable orderbooks.
+# We dedupe at the source: same market + same direction + tiny deviation
+# delta within the window → skip. Material moves (direction flip or
+# |Δdeviation| ≥ STATISTICAL_REEMIT_DEVIATION_DELTA) always re-emit.
+_STATISTICAL_LAST_EMIT: dict[str, tuple[float, str, float]] = {}
+STATISTICAL_REEMIT_WINDOW_SEC = 60.0
+STATISTICAL_REEMIT_DEVIATION_DELTA = 0.005
+
+
+def _statistical_should_emit(
+    market_id: str,
+    action: str,
+    deviation: float,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Throttle re-emission of the same (market, action) on tiny moves.
+
+    Exposed so tests can drive the cache; module-level state is fine here
+    because the bot has a single collector instance per run.
+    """
+    now = now if now is not None else time.time()
+    cached = _STATISTICAL_LAST_EMIT.get(market_id)
+    if cached is None:
+        _STATISTICAL_LAST_EMIT[market_id] = (now, action, float(deviation))
+        return True
+    cached_ts, cached_action, cached_dev = cached
+    age = now - cached_ts
+    if cached_action != action:
+        _STATISTICAL_LAST_EMIT[market_id] = (now, action, float(deviation))
+        return True
+    if abs(float(deviation) - cached_dev) >= STATISTICAL_REEMIT_DEVIATION_DELTA:
+        _STATISTICAL_LAST_EMIT[market_id] = (now, action, float(deviation))
+        return True
+    if age >= STATISTICAL_REEMIT_WINDOW_SEC:
+        _STATISTICAL_LAST_EMIT[market_id] = (now, action, float(deviation))
+        return True
+    return False
+
+
+def reset_statistical_signal_throttle() -> None:
+    """Clear the per-market emission cache. Tests use this between cases."""
+    _STATISTICAL_LAST_EMIT.clear()
 
 
 def collect_cross_platform_strategy_signals(
@@ -124,6 +177,10 @@ def collect_statistical_strategy_signals(
             continue
 
         action = "buy_yes" if estimate.is_underpriced else "buy_no"
+        if not _statistical_should_emit(
+            market.condition_id, action, float(estimate.deviation)
+        ):
+            continue
         signals.append(
             StrategySignal(
                 tier=StrategyTier.STATISTICAL_ARB,
@@ -166,6 +223,7 @@ def collect_maker_strategy_signals(
     maker_strategy: MakerStrategy,
     fair_values_by_market: dict[str, float],
     detector: StatisticalMispricingDetector | None = None,
+    flow_aggregator: FlowAggregator | None = None,
 ) -> list[StrategySignal]:
     """T3 maker quote signals around model fair value.
 
@@ -173,6 +231,12 @@ def collect_maker_strategy_signals(
     when no pre-computed fair value is supplied for a market — this lets
     the maker tier still post quotes during cycles where the T2 path
     didn't run (e.g. T2 disabled by config).
+
+    When `flow_aggregator` is provided each signal also carries a
+    ``flow_bias`` payload (taker_yes_share over the active window).
+    For the current "最小落地" phase this is telemetry-only — it lets
+    us validate the dataset before letting it drive quote-side
+    selection.
     """
     signals: list[StrategySignal] = []
     for market in candidate_markets:
@@ -224,28 +288,49 @@ def collect_maker_strategy_signals(
         )
         per_fill_edge = (bid_edge + ask_edge) / active_sides if active_sides > 0 else 0.0
 
+        # Boost T3 urgency in categories the article identifies as the
+        # maker's structural sweet spot. Same quote, but ranked higher
+        # in the orchestrator queue against same-tier competition.
+        category = classify_market_category(market)
+        gap_pp = CATEGORY_MAKER_TAKER_GAP_PP.get(category, 1.5)
+        # 0.2 baseline; +0.3 in high-gap categories so a World Events
+        # quote with gap=7.32 pp dominates a Finance quote with gap=0.17.
+        urgency = 0.2 + (0.3 if is_high_gap(category) else 0.0)
+
+        flow_bias_payload: dict | None = None
+        if flow_aggregator is not None:
+            bias = flow_aggregator.get_bias(market.condition_id)
+            if bias is not None:
+                flow_bias_payload = bias.to_dict()
+
+        payload: dict = {
+            "quote": {
+                "bid_price": quote.bid_price,
+                "ask_price": quote.ask_price,
+                "bid_size": quote.bid_size,
+                "ask_size": quote.ask_size,
+                "spread": quote.spread,
+                "fair_value": quote.fair_value,
+                "bid_edge": bid_edge,
+                "ask_edge": ask_edge,
+            },
+            "category": category,
+            "category_maker_taker_gap_pp": gap_pp,
+        }
+        if flow_bias_payload is not None:
+            payload["flow_bias"] = flow_bias_payload
+
         signals.append(
             StrategySignal(
                 tier=StrategyTier.MARKET_MAKING,
                 signal_type="maker_quote",
                 market_id=market.condition_id,
-                description=f"{market.question[:80]} | maker fair={fair_value:.4f} spread={quote.spread:.4f}",
+                description=f"{market.question[:80]} | maker fair={fair_value:.4f} spread={quote.spread:.4f} cat={category}",
                 expected_edge=per_fill_edge * 10_000.0,
                 confidence=0.5,
                 recommended_size_usdc=max(quote.bid_size, quote.ask_size),
-                urgency=0.2,
-                payload={
-                    "quote": {
-                        "bid_price": quote.bid_price,
-                        "ask_price": quote.ask_price,
-                        "bid_size": quote.bid_size,
-                        "ask_size": quote.ask_size,
-                        "spread": quote.spread,
-                        "fair_value": quote.fair_value,
-                        "bid_edge": bid_edge,
-                        "ask_edge": ask_edge,
-                    }
-                },
+                urgency=urgency,
+                payload=payload,
             )
         )
     return signals

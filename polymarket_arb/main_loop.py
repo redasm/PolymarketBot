@@ -45,6 +45,7 @@ from polymarket_arb.main_helpers.cycle_runners import (
     scan_cycle as _scan_cycle,
     start_ws_feed as _start_ws_feed,
 )
+from polymarket_arb.main_helpers.flow_aggregator import FlowAggregator, FlowIngest
 from polymarket_arb.main_helpers.order_sync import (
     cancel_stale_maker_orders as _cancel_stale_maker_orders,
     sync_live_order_statuses as _sync_live_order_statuses,
@@ -135,6 +136,7 @@ from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
 from polymarket_arb.portfolio_sync import PortfolioSync
 from polymarket_arb.risk_manager import RiskManager
 from polymarket_arb.strategies.maker_strategy import DynamicSpreadCalculator, MakerStrategy
+from polymarket_arb.strategies.recent_exit_cooldown import make_recent_exit_cooldown_store
 from polymarket_arb.strategies.t2_exit_manager import T2ExitManager, t2_exit_telemetry
 from polymarket_arb.strategies.statistical_model import StatisticalMispricingDetector
 from polymarket_arb.strategies.strategy_orchestrator import (
@@ -370,12 +372,39 @@ def main(dotenv_path: str | None = None) -> None:
         total_bankroll=config.max_total_exposure,
         max_signals_per_market_per_hour=config.t2_max_signals_per_market_per_hour,
     )
+    flow_aggregator: Optional[FlowAggregator] = None
+    flow_ingest: Optional[FlowIngest] = None
+    if config.t3_flow_bias_enabled:
+        flow_aggregator = FlowAggregator(
+            window_sec=config.t3_flow_bias_window_sec,
+            min_trades=config.t3_flow_bias_min_trades,
+            strong_threshold=config.t3_flow_bias_strong_threshold,
+            state_file=config.t3_flow_state_file or None,
+        )
+        flow_ingest = FlowIngest(flow_aggregator)
+        LOG.info(
+            "T3 flow-bias 数据基础已启用: window=%.0fs min_trades=%d strong_threshold=%.2f state=%s",
+            config.t3_flow_bias_window_sec,
+            config.t3_flow_bias_min_trades,
+            config.t3_flow_bias_strong_threshold,
+            config.t3_flow_state_file or "(in-memory)",
+        )
+
+    cooldown_store = make_recent_exit_cooldown_store(config)
+    if cooldown_store.cooldown_sec > 0:
+        LOG.info(
+            "post-exit cooldown 启用: file=%s ttl=%.0fs (已加载 %d 条历史)",
+            config.t2_recent_exits_state_file,
+            cooldown_store.cooldown_sec,
+            len(cooldown_store.snapshot()),
+        )
     t2_exit_manager = T2ExitManager(
         config=config,
         executor=executor,
         ob_analyzer=ob_analyzer,
         risk_manager=risk_mgr,
         notifier=notifier,
+        cooldown_store=cooldown_store,
     )
     LOG.info(
         "T2 退出策略: stop_loss=%.0fbps tp_capture=%.0f%% max_hold=%.0fs eval=%.0fs optimal_stopping=%s",
@@ -420,6 +449,12 @@ def main(dotenv_path: str | None = None) -> None:
     cached_universe_markets: list[MarketInfo] = []
     cached_universe_events: list[Any] = []
     last_universe_refresh_ts = 0.0
+    # Reuse the candidate selection between universe refreshes — selecting
+    # ~5 events from 369 markets took ~0.18s × 8000 cycles/day = 24min CPU
+    # spent re-doing identical work. Recompute only when the universe
+    # itself changed.
+    cached_scanned_markets: list[MarketInfo] = []
+    cached_event_candidates: list[Any] = []
     last_telemetry_heartbeat_ts = 0.0
     last_portfolio_sync_ts = 0.0
 
@@ -455,12 +490,24 @@ def main(dotenv_path: str | None = None) -> None:
     total_live_expected_profit = 0.0
     total_simulated_expected_profit = 0.0
     consecutive_api_errors = 0
+    # Daily counters that roll over at UTC midnight. Lifetime totals above
+    # are useful for run-level summaries but operators reading hourly
+    # telemetry want to know how many opportunities materialised *today*.
+    today_theoretical_opportunities = 0
+    today_live_successes = 0
+    today_utc_date = ""
     signal_telemetry = StrategySignalTelemetryCompressor(cooldown_sec=60.0)
 
     while not _SHUTDOWN_EVENT.is_set():
         cycle += 1
         cycle_start = time.time()
         cycle_perf_start = time.perf_counter()
+        # Roll today's counters at UTC midnight.
+        current_utc_date = time.strftime("%Y-%m-%d", time.gmtime(cycle_start))
+        if current_utc_date != today_utc_date:
+            today_utc_date = current_utc_date
+            today_theoretical_opportunities = 0
+            today_live_successes = 0
         cycle_timing: dict[str, float] = {
             "universe_refresh_sec": 0.0,
             "candidate_select_sec": 0.0,
@@ -516,22 +563,28 @@ def main(dotenv_path: str | None = None) -> None:
             cycle_timing["universe_refresh_sec"] += time.perf_counter() - phase_start
 
             phase_start = time.perf_counter()
-            scanned_markets = _select_scan_candidates(
-                cached_universe_markets,
-                config.hot_market_pool_size,
-                focus_keywords=focus_keywords,
-            )
-            event_candidates = _select_event_candidates(
-                cached_universe_events,
-                config.hot_event_pool_size,
-                focus_keywords=focus_keywords,
-            )
-            scanned_markets = _merge_focus_event_markets(
-                scanned_markets,
-                event_candidates,
-                config.hot_market_pool_size,
-                focus_keywords=focus_keywords,
-            )
+            if universe_refreshed or not cached_scanned_markets:
+                scanned_markets = _select_scan_candidates(
+                    cached_universe_markets,
+                    config.hot_market_pool_size,
+                    focus_keywords=focus_keywords,
+                )
+                event_candidates = _select_event_candidates(
+                    cached_universe_events,
+                    config.hot_event_pool_size,
+                    focus_keywords=focus_keywords,
+                )
+                scanned_markets = _merge_focus_event_markets(
+                    scanned_markets,
+                    event_candidates,
+                    config.hot_market_pool_size,
+                    focus_keywords=focus_keywords,
+                )
+                cached_scanned_markets = scanned_markets
+                cached_event_candidates = event_candidates
+            else:
+                scanned_markets = cached_scanned_markets
+                event_candidates = cached_event_candidates
             cycle_timing["candidate_select_sec"] += time.perf_counter() - phase_start
 
             if config.ws_enabled and scanned_markets:
@@ -548,7 +601,12 @@ def main(dotenv_path: str | None = None) -> None:
                             if ws_feed is not None:
                                 ws_feed.stop()
                                 LOG.info("旧 WebSocket feed 已停止，切换到新目标市场")
-                            ws_feed, ws_mirror = _start_ws_feed(targets, enhanced_store, tick_recorder)
+                            ws_feed, ws_mirror = _start_ws_feed(
+                                targets,
+                                enhanced_store,
+                                tick_recorder,
+                                flow_ingest=flow_ingest,
+                            )
                             ws_target_ids = new_ids
                     elif cycle == 1 or cycle % 20 == 0:
                         LOG.warning("未选出可订阅的 WS 市场，可能是市场 token 解析为空或筛选结果为空")
@@ -643,6 +701,8 @@ def main(dotenv_path: str | None = None) -> None:
                 total_pnl=risk_mgr.state.total_pnl,
                 current_position_value=risk_mgr.state.current_position_value,
                 cycle_status="error",
+                theoretical_opportunities_today=today_theoretical_opportunities,
+                live_successes_today=today_live_successes,
             )
             if consecutive_api_errors >= 10:
                 LOG.error("连续 %d 次 API 错误，暂停 60 秒", consecutive_api_errors)
@@ -669,6 +729,7 @@ def main(dotenv_path: str | None = None) -> None:
 
         if opportunities:
             total_theoretical_opportunities += len(opportunities)
+            today_theoretical_opportunities += len(opportunities)
             LOG.info(
                 "周期 #%d: 发现 %d 个套利机会",
                 cycle,
@@ -761,6 +822,7 @@ def main(dotenv_path: str | None = None) -> None:
                 maker_strategy=maker_strategy,
                 fair_values_by_market=fair_values_by_market,
                 detector=statistical_detector,
+                flow_aggregator=flow_aggregator,
             )
             if config.maker_strategy_enabled
             else []
@@ -820,6 +882,7 @@ def main(dotenv_path: str | None = None) -> None:
                 event_recorder=event_recorder,
             )
             total_live_successes += t0_delta.live_successes
+            today_live_successes += t0_delta.live_successes
             total_simulated_successes += t0_delta.simulated_successes
             total_live_expected_profit += t0_delta.live_profit_total
             total_simulated_expected_profit += t0_delta.simulated_profit_total
@@ -867,6 +930,7 @@ def main(dotenv_path: str | None = None) -> None:
         insufficient_balance_last_reason: str = ""
         processed_signals = [] if execution_blocked_by_forced_sync else orchestrator.process_signals()
         total_theoretical_opportunities += len(processed_signals)
+        today_theoretical_opportunities += len(processed_signals)
         process_skip_summary = orchestrator.get_last_skip_reasons()
         if process_skip_summary.get("total") and event_recorder.is_enabled:
             event_recorder.write_event("strategy_executions", {
@@ -893,8 +957,10 @@ def main(dotenv_path: str | None = None) -> None:
                 maker_strategy=maker_strategy,
                 notifier=notifier,
                 t2_exit_manager=t2_exit_manager,
+                cooldown_store=cooldown_store,
             )
             total_live_successes += delta.live_successes
+            today_live_successes += delta.live_successes
             total_simulated_successes += delta.simulated_successes
             total_live_submissions += delta.live_submissions
             total_simulated_submissions += delta.simulated_submissions
@@ -1073,6 +1139,8 @@ def main(dotenv_path: str | None = None) -> None:
             total_pnl=risk_s.total_pnl,
             current_position_value=risk_s.current_position_value,
             cycle_status="ok",
+            theoretical_opportunities_today=today_theoretical_opportunities,
+            live_successes_today=today_live_successes,
         )
 
         now_ts = time.time()
@@ -1139,6 +1207,8 @@ def main(dotenv_path: str | None = None) -> None:
         })
     tick_recorder.close()
     event_recorder.close()
+    if flow_aggregator is not None:
+        flow_aggregator.close()
     dash_state.update(is_running=False)
     LOG.info(
         "机器人已停止: run_id=%s。总计: %d 周期, 理论机会=%d, 真实成交=%d, 模拟成交=%d, 挂单提交(真/模)=%d/%d",

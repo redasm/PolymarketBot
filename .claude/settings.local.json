@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from polymarket_arb.execution_engine import _quantize_clob_price\")",
+      "Bash(python -c \"from polymarket_arb.execution_engine import _quantize_clob_price; print\\('ok'\\)\")",
+      "Bash(where python *)",
+      "Bash(py --version)",
+      "Bash(py -c \"from polymarket_arb.execution_engine import _quantize_clob_price; print\\('ok'\\)\")",
+      "Bash(py -c ' *)",
+      "Bash(py -m pytest tests/test_execution_engine.py tests/test_arbitrage_detector.py tests/test_fair_value_model.py -x --tb=short)",
+      "Bash(py -m pytest -x --tb=short -q)",
+      "Bash(py -m pytest -q)",
+      "Bash(grep -E \"def refresh|def sync|get_positions|polymarket\\\\\\\\..*positions|self._client\\\\\\\\.\" polymarket_arb/portfolio_sync.py)",
+      "Bash(py -m pytest -q --tb=short)",
+      "Bash(py -m pytest tests/test_t2_exit_escalation.py -v --tb=short)",
+      "Bash(py -m pytest tests/test_notifier_fatal_backoff.py tests/test_signal_collector_throttle.py -v --tb=short)",
+      "Bash(py -m pytest tests/test_t2_exit_manager.py::test_register_then_stop_loss_triggers_sell --tb=long)",
+      "Bash(py -m pytest -q --tb=line)",
+      "Bash(py -m pytest tests/test_recent_exit_cooldown.py tests/test_directional_opportunity_long_horizon_and_cooldown.py -v --tb=short)",
+      "Bash(py -m pytest tests/test_directional_opportunity_long_horizon_and_cooldown.py -v --tb=short)"
+    ]
+  }
+}
