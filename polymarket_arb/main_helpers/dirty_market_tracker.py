@@ -89,11 +89,30 @@ class DirtyMarketTracker:
             self.wake_event.set()
 
     def drain(self) -> set[str]:
-        """Return + clear the dirty-condition set in one lock pass."""
+        """Return + clear the dirty-condition set in one lock pass.
+
+        Race-safety note: ``wake_event.clear()`` MUST happen inside
+        the lock so a concurrent ``mark_dirty`` that runs after the
+        clear is guaranteed to call ``set()`` *after* the clear
+        observed an empty set. The earlier version released the lock
+        before clearing, which created a window where:
+
+            T1: drain()   acquires lock, captures set, empties, releases
+            T2: mark_dirty() acquires lock, adds cond, releases, set()
+            T1: wake_event.clear()  ← wipes T2's signal
+
+        and the main loop slept the full scan_interval despite a
+        dirty cond accumulating. The producer's ``set()`` still
+        happens *outside* its lock — that's fine because after the
+        fix the worst case is a spurious wake (event set with empty
+        dirty set after a drain), which is benign: the loop wakes,
+        drains an empty set, and goes back to sleep on the next
+        cycle.
+        """
         with self._lock:
             drained = self._dirty_conditions
             self._dirty_conditions = set()
-        self.wake_event.clear()
+            self.wake_event.clear()
         return drained
 
     def peek_size(self) -> int:
@@ -106,4 +125,4 @@ class DirtyMarketTracker:
             self._dirty_conditions.clear()
             if token_map is not None:
                 self._token_to_condition = dict(token_map)
-        self.wake_event.clear()
+            self.wake_event.clear()
