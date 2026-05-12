@@ -70,6 +70,11 @@ class ArbConfig:
     max_order_size_usdc: float
     default_order_size_usdc: float
     scan_interval_sec: float
+    # P0-dirty: minimum number of markets that must become "dirty"
+    # (WS best bid/ask changed) before the main loop's inter-cycle
+    # sleep is broken early. 1 = wake on any change (lowest latency,
+    # higher CPU); higher values batch wakes for less-busy operators.
+    dirty_market_wake_threshold: int
     market_fetch_limit: int
     market_universe_refresh_sec: float
     hot_market_pool_size: int
@@ -125,6 +130,11 @@ class ArbConfig:
     feishu_api_base: str
     notification_cooldown_sec: float
     notify_on_arb_found: bool
+    # In dry-run/shadow mode every detected opportunity would push a chat
+    # notification but never produce a real trade — that drowns operators
+    # in noise. This flag (default False) keeps `notify_on_arb_found`
+    # itself usable while silencing only the shadow stream.
+    notify_arb_found_in_shadow: bool
     notify_on_trade_success: bool
     notify_on_trade_failure: bool
     notify_on_fatal_error: bool
@@ -198,13 +208,37 @@ class ArbConfig:
     t3_flow_bias_window_sec: float
     t3_flow_bias_min_trades: int
     t3_flow_bias_strong_threshold: float
+    # How much weight the aggregated taker_yes_share gets when steering
+    # maker quotes, as a fraction of `max_inventory`. 0.0 = telemetry
+    # only (legacy); 0.5 = a fully one-sided market shifts quotes the
+    # same as a half-loaded inventory book; 1.0 = same as a fully loaded
+    # book. 0.5 is the safe initial value — strong enough to validate
+    # the signal in shadow mode, weak enough that a bad flow window
+    # can't completely cripple one side of the quote.
+    t3_flow_bias_inventory_weight: float
     t3_flow_state_file: str
+
+    # Shadow Mode (roadmap §三-阶段 1). Live trading is disabled while
+    # `dry_run=True`; the engine instead simulates fills against the
+    # cached orderbook and writes `virtual_fills.ndjson` so operators
+    # can validate expected PnL / maker ratio / slippage before any
+    # real capital is risked. `shadow_maker_fill_latency_sec` is the
+    # minimum age a simulated maker quote must reach before it is
+    # eligible to be marked FILLED by the cross-price sweep — keeps
+    # the dataset honest about the queue position penalty.
+    shadow_maker_fill_latency_sec: float
 
     # Tick 录制
     tick_record_enabled: bool
     tick_record_dir: str
     telemetry_record_enabled: bool
     telemetry_record_dir: str
+    # P2-telemetry: when true, EventRecorder writes via a background
+    # daemon thread so main-loop emit calls only pay JSON-encode +
+    # queue-put cost (~µs) instead of write+fsync (~ms). Backpressure
+    # policy: drop oldest events on queue overflow.
+    telemetry_async_write: bool
+    telemetry_async_queue_size: int
 
     # Data 清理
     data_cleanup_enabled: bool
@@ -324,6 +358,8 @@ class ArbConfig:
             raise ValueError("ARB_HOT_MARKET_POOL_SIZE 必须大于 0")
         if self.hot_event_pool_size <= 0:
             raise ValueError("ARB_HOT_EVENT_POOL_SIZE 必须大于 0")
+        if self.dirty_market_wake_threshold < 1:
+            raise ValueError("dirty_market_wake_threshold 必须 >= 1")
         if self.scan_interval_sec <= 0:
             raise ValueError("ARB_SCAN_INTERVAL_SEC 必须大于 0")
         if self.orderbook_retry_count < 0:
@@ -447,6 +483,10 @@ class ArbConfig:
             raise ValueError("T3_FLOW_BIAS_MIN_TRADES 必须 >= 1")
         if not (0.5 <= self.t3_flow_bias_strong_threshold <= 1.0):
             raise ValueError("T3_FLOW_BIAS_STRONG_THRESHOLD 必须在 [0.5, 1.0]")
+        if self.t3_flow_bias_inventory_weight < 0:
+            raise ValueError("T3_FLOW_BIAS_INVENTORY_WEIGHT 不能为负数")
+        if self.shadow_maker_fill_latency_sec < 0:
+            raise ValueError("SHADOW_MAKER_FILL_LATENCY_SEC 不能为负数")
         if not self.dry_run:
             if not self.live_trading_ack:
                 raise ValueError("实盘前必须设置 LIVE_TRADING_ACK=true")
@@ -504,6 +544,7 @@ class ArbConfig:
             max_order_size_usdc=_env_float("ARB_MAX_ORDER_SIZE_USDC", 50.0),
             default_order_size_usdc=_env_float("ARB_DEFAULT_ORDER_SIZE_USDC", 10.0),
             scan_interval_sec=_env_float("ARB_SCAN_INTERVAL_SEC", 5.0),
+            dirty_market_wake_threshold=_env_int("DIRTY_MARKET_WAKE_THRESHOLD", 1),
             market_fetch_limit=_env_int("ARB_MARKET_FETCH_LIMIT", 100),
             market_universe_refresh_sec=_env_float("ARB_MARKET_UNIVERSE_REFRESH_SEC", 600.0),
             hot_market_pool_size=_env_int("ARB_HOT_MARKET_POOL_SIZE", 80),
@@ -517,7 +558,16 @@ class ArbConfig:
             live_max_total_exposure_usdc=_env_float("LIVE_MAX_TOTAL_EXPOSURE_USDC", 100.0),
             live_min_net_edge_bps=_env_float("LIVE_MIN_NET_EDGE_BPS", 25.0),
             live_min_net_edge_usd=_env_float("LIVE_MIN_NET_EDGE_USD", 0.0025),
-            live_max_orderbook_snapshot_age_sec=_env_float("LIVE_MAX_ORDERBOOK_SNAPSHOT_AGE_SEC", 1.0),
+            # Raised from 1.0 → 5.0 to match the WS snapshot acceptance
+            # window (`ORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC` default 10s)
+            # more reasonably. Polymarket only pushes on price changes,
+            # so a quiet token can legitimately sit untouched for several
+            # seconds without being "stale". 1s was both contradictory
+            # (single-point reads accepted up to 10s) and aggressive
+            # enough to block T2 entirely whenever one mirror token went
+            # quiet. Operators who want stricter live freshness can
+            # still lower this via env.
+            live_max_orderbook_snapshot_age_sec=_env_float("LIVE_MAX_ORDERBOOK_SNAPSHOT_AGE_SEC", 5.0),
             live_min_ws_hit_ratio=_env_float("LIVE_MIN_WS_HIT_RATIO", 0.25),
             maker_strategy_enabled=_env_bool("MAKER_STRATEGY_ENABLED", True),
             min_liquidity=_env_float("ARB_MIN_LIQUIDITY", 1000.0),
@@ -557,6 +607,7 @@ class ArbConfig:
             feishu_api_base=_env("FEISHU_API_BASE", "https://open.feishu.cn/open-apis"),
             notification_cooldown_sec=_env_float("NOTIFICATION_COOLDOWN_SEC", 30.0),
             notify_on_arb_found=_env_bool("NOTIFY_ON_ARB_FOUND", False),
+            notify_arb_found_in_shadow=_env_bool("NOTIFY_ARB_FOUND_IN_SHADOW", False),
             notify_on_trade_success=_env_bool("NOTIFY_ON_TRADE_SUCCESS", True),
             notify_on_trade_failure=_env_bool("NOTIFY_ON_TRADE_FAILURE", True),
             notify_on_fatal_error=_env_bool("NOTIFY_ON_FATAL_ERROR", True),
@@ -608,6 +659,12 @@ class ArbConfig:
             t3_flow_bias_strong_threshold=_env_float(
                 "T3_FLOW_BIAS_STRONG_THRESHOLD", 0.55
             ),
+            t3_flow_bias_inventory_weight=_env_float(
+                "T3_FLOW_BIAS_INVENTORY_WEIGHT", 0.5
+            ),
+            shadow_maker_fill_latency_sec=_env_float(
+                "SHADOW_MAKER_FILL_LATENCY_SEC", 2.0
+            ),
             t3_flow_state_file=_env(
                 "T3_FLOW_STATE_FILE",
                 "data/telemetry/flow_state.json",
@@ -616,6 +673,8 @@ class ArbConfig:
             tick_record_dir=_env("TICK_RECORD_DIR", "data/ticks"),
             telemetry_record_enabled=_env_bool("TELEMETRY_RECORD_ENABLED", False),
             telemetry_record_dir=_env("TELEMETRY_RECORD_DIR", "data/telemetry"),
+            telemetry_async_write=_env_bool("TELEMETRY_ASYNC_WRITE", True),
+            telemetry_async_queue_size=_env_int("TELEMETRY_ASYNC_QUEUE_SIZE", 10000),
             data_cleanup_enabled=_env_bool("DATA_CLEANUP_ENABLED", True),
             data_cleanup_interval_sec=_env_float("DATA_CLEANUP_INTERVAL_SEC", 3600.0),
             data_ticks_retention_days=_env_int("DATA_TICKS_RETENTION_DAYS", 7),

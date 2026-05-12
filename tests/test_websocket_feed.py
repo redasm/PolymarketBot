@@ -285,6 +285,47 @@ def test_apply_delta_buffers_until_snapshot_arrives():
     assert 0.40 in bid_prices
 
 
+def test_apply_delta_skips_snapshot_allocation_on_no_op_remove():
+    """Removing a price that isn't on book is a no-op — no new
+    snapshot should be allocated and no callbacks fired.
+    """
+    mirror = OrderBookMirror()
+    mirror.apply_snapshot(
+        "tk",
+        bids=[{"price": "0.40", "size": "50"}],
+        asks=[{"price": "0.45", "size": "50"}],
+    )
+    snap_before = mirror.get("tk")
+    mirror.apply_delta("tk", "buy", 0.33, 0.0)  # price not on book, size 0 → no-op
+    snap_after = mirror.get("tk")
+    assert snap_after is snap_before
+
+
+def test_apply_delta_inserts_in_sorted_position_without_full_sort():
+    """The post-rewrite path must still keep bids DESC / asks ASC
+    after a single-level insert (no full sort).
+    """
+    mirror = OrderBookMirror()
+    mirror.apply_snapshot(
+        "tk",
+        bids=[
+            {"price": "0.40", "size": "5"},
+            {"price": "0.38", "size": "5"},
+        ],
+        asks=[
+            {"price": "0.45", "size": "5"},
+            {"price": "0.47", "size": "5"},
+        ],
+    )
+
+    mirror.apply_delta("tk", "buy", 0.39, 7.0)  # mid-insert
+    mirror.apply_delta("tk", "sell", 0.46, 9.0)  # mid-insert
+
+    snap = mirror.get("tk")
+    assert [lv.price for lv in snap.bids] == [0.40, 0.39, 0.38]
+    assert [lv.price for lv in snap.asks] == [0.45, 0.46, 0.47]
+
+
 def test_callback_queue_drops_oldest_snapshot_when_backlogged():
     mirror = OrderBookMirror()
     with mirror._callbacks_lock:

@@ -55,3 +55,51 @@ def test_event_recorder_preserves_canonical_ts_when_payload_has_ts(tmp_path: Pat
     assert row["category"] == "risk_events"
     assert row["payload_ts"] == 123.45
     assert row["payload_category"] == "payload"
+
+
+def test_event_recorder_async_write_drains_on_close(tmp_path: Path):
+    """Async mode must flush every queued event by the time close()
+    returns — otherwise end-of-run summaries would silently lose
+    data.
+    """
+    recorder = EventRecorder(
+        output_dir=str(tmp_path),
+        enabled=True,
+        async_write=True,
+        queue_size=1024,
+    )
+    for i in range(50):
+        recorder.write_event("opportunities", {"i": i})
+    recorder.close()
+
+    files = list(tmp_path.glob("*.opportunities.ndjson"))
+    assert len(files) == 1
+    lines = files[0].read_text(encoding="utf-8").strip().split("\n")
+    assert len(lines) == 50
+    assert recorder.event_count == 50
+    assert recorder.dropped_events == 0
+
+
+def test_event_recorder_async_write_drops_oldest_when_queue_full(tmp_path: Path):
+    """Backpressure policy: when the queue can't accept new events,
+    the OLDEST item is dropped so the newest (most actionable for
+    live debugging) survives.
+    """
+    recorder = EventRecorder(
+        output_dir=str(tmp_path),
+        enabled=True,
+        async_write=True,
+        queue_size=100,
+    )
+    # Block the writer thread so the queue fills up. Easiest way is
+    # to flood it faster than disk can absorb in a normal scenario,
+    # but for determinism we artificially throttle by patching the
+    # internal lock so the writer can't make progress.
+    recorder._lock.acquire()
+    try:
+        for i in range(500):
+            recorder.write_event("trades", {"i": i})
+        assert recorder.dropped_events > 0
+    finally:
+        recorder._lock.release()
+    recorder.close()

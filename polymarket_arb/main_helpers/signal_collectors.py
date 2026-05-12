@@ -263,12 +263,29 @@ def collect_maker_strategy_signals(
         if fair_value is None:
             continue
 
+        # Pull the per-market flow snapshot once and reuse it for both
+        # quote steering and payload telemetry. We only feed
+        # `flow_bias_yes_share` into `compute_quote` when the sample is
+        # *stable* — letting an under-sampled window steer the quote
+        # would just amplify noise (and contradict the `is_stable`
+        # gating semantics defined on FlowBias).
+        flow_snapshot = (
+            flow_aggregator.get_bias(market.condition_id)
+            if flow_aggregator is not None
+            else None
+        )
+        flow_share: float | None = (
+            float(flow_snapshot.taker_yes_share)
+            if flow_snapshot is not None and flow_snapshot.is_stable
+            else None
+        )
         quote = maker_strategy.compute_quote(
             token_id=yes_token.token_id,
             condition_id=market.condition_id,
             fair_value=float(fair_value),
             tick_size=max(float(getattr(snap, "tick_size", 0.01) or 0.01), 0.01),
             mid_price=float(snap.mid),
+            flow_bias_yes_share=flow_share,
         )
         if quote is None or (quote.bid_price is None and quote.ask_price is None):
             continue
@@ -297,11 +314,13 @@ def collect_maker_strategy_signals(
         # quote with gap=7.32 pp dominates a Finance quote with gap=0.17.
         urgency = 0.2 + (0.3 if is_high_gap(category) else 0.0)
 
-        flow_bias_payload: dict | None = None
-        if flow_aggregator is not None:
-            bias = flow_aggregator.get_bias(market.condition_id)
-            if bias is not None:
-                flow_bias_payload = bias.to_dict()
+        flow_bias_payload: dict | None = (
+            flow_snapshot.to_dict() if flow_snapshot is not None else None
+        )
+        if flow_bias_payload is not None:
+            # Annotate whether the snapshot actually influenced the
+            # quote this cycle. Useful for shadow-mode A/B reads.
+            flow_bias_payload["applied_to_quote"] = flow_share is not None
 
         payload: dict = {
             "quote": {

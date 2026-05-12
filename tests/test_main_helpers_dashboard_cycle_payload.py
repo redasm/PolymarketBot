@@ -78,6 +78,8 @@ def _enhanced_store():
 def _counters(**overrides):
     base = dict(
         total_theoretical_opportunities=12,
+        total_t0_opportunities=4,
+        total_directional_signals=8,
         total_live_successes=3,
         total_simulated_successes=5,
         total_live_submissions=7,
@@ -148,19 +150,38 @@ def test_top_level_keys_pinned() -> None:
 def test_counters_drive_arbs_and_execution_summary() -> None:
     payload = _build()
     assert payload["cycle_count"] == 42
-    assert payload["arbs_found"] == 12  # total_theoretical_opportunities
-    assert payload["arbs_executed"] == 3  # total_live_successes
-    assert payload["markets_scanned"] == 2  # len(scanned_markets)
+    # `arbs_found` is now T0-only (4), not the mixed theoretical total (12).
+    assert payload["arbs_found"] == 4
+    assert payload["arbs_executed"] == 3
+    assert payload["markets_scanned"] == 2
 
     summary = payload["execution_summary"]
     assert summary["theoretical_opportunities"] == 12
+    assert summary["t0_opportunities"] == 4
+    assert summary["directional_signals"] == 8
     assert summary["live_successes"] == 3
     assert summary["simulated_successes"] == 5
     assert summary["live_submissions"] == 7
     assert summary["simulated_submissions"] == 9
-    # Profit fields rounded to 6 decimal places.
     assert summary["live_profit_total"] == pytest.approx(1.234568)
     assert summary["simulated_profit_total"] == pytest.approx(2.345679)
+
+
+def test_legacy_counters_without_t0_split_fall_back_to_mixed() -> None:
+    """Older callers that don't pass the split keys must still get a payload."""
+    legacy_counters = dict(
+        total_theoretical_opportunities=12,
+        total_live_successes=3,
+        total_simulated_successes=5,
+        total_live_submissions=7,
+        total_simulated_submissions=9,
+        total_live_expected_profit=0.0,
+        total_simulated_expected_profit=0.0,
+    )
+    payload = _build(counters=legacy_counters)
+    assert payload["arbs_found"] == 12
+    assert payload["execution_summary"]["t0_opportunities"] == 12
+    assert payload["execution_summary"]["directional_signals"] == 0
 
 
 # ---------- universe_status --------------------------------------------------

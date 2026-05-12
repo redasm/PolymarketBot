@@ -39,6 +39,13 @@ class DailySummaryPayload:
     closing_open_positions: int
     closing_total_exposure: float
     summary_local_date: str
+    # Wallet USDC at day close (None = balance query unavailable / no creds).
+    # Surfaced so operators don't have to check the chain manually to know
+    # "how much capital is still on the table" after the day's activity.
+    closing_wallet_usdc: float | None = None
+    # "live" or "shadow" — disambiguates "0 trades" between "bot was idle"
+    # and "bot is intentionally simulating (ARB_DRY_RUN=true)".
+    mode: str = "live"
 
 
 class NotificationManager:
@@ -91,24 +98,38 @@ class NotificationManager:
         *,
         run_id: str,
         cycle_count: int,
-        total_arbs_found: int,
         total_arbs_executed: int,
         simulated_successes: int,
+        total_t0_opportunities: int = 0,
+        total_directional_signals: int = 0,
     ) -> bool:
+        # Split T0 (structural arb) from directional (T2/T3) signals so the
+        # operator can tell "0 trades because no T0 was found" from
+        # "0 trades because all the T2 signals were blocked downstream".
         message = (
             "🛑 机器人停止\n"
             f"实例: {run_id}\n"
             f"周期数: {cycle_count}\n"
-            f"发现机会: {total_arbs_found}\n"
+            f"T0 结构机会: {total_t0_opportunities}\n"
+            f"定向信号(T1/T2/T3): {total_directional_signals}\n"
             f"真实执行成功: {total_arbs_executed}\n"
             f"模拟执行成功: {simulated_successes}"
         )
         return self._backend.send(message, category="shutdown", force=True)
 
-    def notify_arb_found(self, message: str) -> bool:
+    def notify_arb_found(self, message: str, *, simulated: bool | None = None) -> bool:
         if not self._config.notify_on_arb_found:
             return False
-        return self._backend.send(message, category="arb_found")
+        # Suppress per-opportunity push in shadow mode unless explicitly
+        # opted in — under ARB_DRY_RUN every detected opportunity would
+        # otherwise flood the chat (no real trade happens to "consume"
+        # the alert). Callers that explicitly pass `simulated=False`
+        # bypass the shadow check.
+        is_shadow = simulated if simulated is not None else self._config.dry_run
+        if is_shadow and not self._config.notify_arb_found_in_shadow:
+            return False
+        prefix = "🌓 [SHADOW] " if is_shadow else ""
+        return self._backend.send(prefix + message, category="arb_found")
 
     def notify_trade_success(
         self,
@@ -133,15 +154,16 @@ class NotificationManager:
             return False
 
         mode = "DRY RUN" if simulated else "LIVE"
-        message = (
-            "✅ 成交成功\n"
-            f"事件: {event_title}\n"
-            f"类型: {arb_type}\n"
-            f"模式: {mode}\n"
-            f"腿数: {filled_legs}/{total_legs}\n"
-            f"预期净利: ${expected_profit:.4f}"
-        )
-        return self._backend.send(message, category="trade_success", force=True)
+        lines = [
+            "✅ 成交成功",
+            f"事件: {event_title}",
+            f"类型: {arb_type}",
+            f"模式: {mode}",
+            f"腿数: {filled_legs}/{total_legs}",
+            f"预期净利: ${expected_profit:.4f}",
+        ]
+        lines.extend(self._format_capital_snapshot_lines())
+        return self._backend.send("\n".join(lines), category="trade_success", force=True)
 
     def notify_trade_failure(
         self,
@@ -171,13 +193,33 @@ class NotificationManager:
         ]
         if details:
             lines.append(f"详情: {details}")
+        lines.extend(self._format_capital_snapshot_lines())
         return self._backend.send("\n".join(lines), category="trade_failure", force=True)
+
+    def _format_capital_snapshot_lines(self) -> list[str]:
+        """Render the latest known capital state for in-trade notifications.
+
+        Pulled from ``current_risk_snapshot`` which ``observe_cycle`` keeps
+        fresh (≤ 1 scan cycle stale). Returns an empty list when no snapshot
+        has been recorded yet (e.g. trade fires before the first cycle).
+        """
+        snapshot = self._state.get("current_risk_snapshot") or {}
+        if not snapshot:
+            return []
+        lines = [
+            f"持仓/敞口: {int(snapshot.get('open_positions', 0))} / ${float(snapshot.get('total_exposure', 0.0)):.2f}",
+        ]
+        wallet = snapshot.get("wallet_usdc")
+        if wallet is not None:
+            lines.append(f"钱包(USDC): ${float(wallet):.2f}")
+        return lines
 
     def notify_fatal_error(
         self,
         message: str,
         *,
         error_key: str,
+        context_lines: list[str] | None = None,
         now_ts: float | None = None,
     ) -> bool:
         """Send a deduplicated fatal alert.
@@ -214,8 +256,15 @@ class NotificationManager:
         if not self._config.notify_on_fatal_error:
             return False
 
+        body_lines = [
+            "🚨 严重错误",
+            f"错误键: {error_key}",
+            message,
+        ]
+        if context_lines:
+            body_lines.extend(context_lines)
         return self._backend.send(
-            f"🚨 严重错误\n错误键: {error_key}\n{message}",
+            "\n".join(body_lines),
             category=f"fatal_error:{error_key}",
             force=True,
         )
@@ -228,9 +277,18 @@ class NotificationManager:
     ) -> bool:
         now_ts = now_ts or time.time()
         self._ensure_daily_state(now_ts)
-        risk_date = str(self._state["current_daily_stats"]["date_key"])
+        stats = self._state["current_daily_stats"]
+        risk_date = str(stats["date_key"])
         pnl_alerts = self._state.setdefault("pnl_alerts", {})
         sent = False
+
+        trade_success = int(stats.get("trade_success_count", 0))
+        trade_failure = int(stats.get("trade_failure_count", 0))
+        snapshot = self._state.get("current_risk_snapshot") or {}
+        wallet = snapshot.get("wallet_usdc")
+        wallet_line = (
+            f"钱包(USDC): ${float(wallet):.2f}\n" if wallet is not None else ""
+        )
 
         if (
             self._config.notify_on_pnl_alert
@@ -243,6 +301,8 @@ class NotificationManager:
                 f"统计日(UTC): {risk_date}\n"
                 f"已记录日盈亏: ${daily_pnl:+.2f}\n"
                 f"盈利阈值: ${self._config.pnl_profit_alert_usdc:.2f}\n"
+                f"当日成交: 成功 {trade_success} | 失败 {trade_failure}\n"
+                f"{wallet_line}"
                 "说明: 当前口径优先使用账户同步后的真实已实现盈亏",
                 category="pnl_profit",
                 force=True,
@@ -262,6 +322,8 @@ class NotificationManager:
                 f"统计日(UTC): {risk_date}\n"
                 f"已记录日盈亏: ${daily_pnl:+.2f}\n"
                 f"亏损阈值: -${self._config.pnl_loss_alert_usdc:.2f}\n"
+                f"当日成交: 成功 {trade_success} | 失败 {trade_failure}\n"
+                f"{wallet_line}"
                 "说明: 当前口径优先使用账户同步后的真实已实现盈亏",
                 category="pnl_loss",
                 force=True,
@@ -282,6 +344,7 @@ class NotificationManager:
         total_exposure: float,
         is_halted: bool,
         halt_reason: str,
+        wallet_usdc: float | None = None,
         now_ts: float | None = None,
     ) -> None:
         now_ts = now_ts or time.time()
@@ -292,6 +355,11 @@ class NotificationManager:
         snapshot["total_exposure"] = float(total_exposure)
         snapshot["is_halted"] = bool(is_halted)
         snapshot["halt_reason"] = halt_reason
+        # Only overwrite wallet_usdc when caller has a real reading.
+        # Passing None means "balance query failed this cycle" — keep
+        # the last known value so the daily summary still has data.
+        if wallet_usdc is not None:
+            snapshot["wallet_usdc"] = float(wallet_usdc)
         self._persist_state()
 
     def maybe_notify_daily_summary(self, *, now_ts: float | None = None) -> bool:
@@ -321,8 +389,11 @@ class NotificationManager:
         return sent
 
     def _select_summary_payload(self, local_date: str) -> DailySummaryPayload | None:
+        mode = "shadow" if self._config.dry_run else "live"
         completed = self._state.get("completed_daily_stats") or {}
         if completed.get("summary_local_date") == local_date:
+            completed = dict(completed)
+            completed.setdefault("mode", mode)
             return _coerce_summary_payload(completed)
 
         current_stats = dict(self._state.get("current_daily_stats") or {})
@@ -333,6 +404,9 @@ class NotificationManager:
         current_stats.setdefault("closing_daily_pnl", float(current_snapshot.get("daily_pnl", 0.0)))
         current_stats.setdefault("closing_open_positions", int(current_snapshot.get("open_positions", 0)))
         current_stats.setdefault("closing_total_exposure", float(current_snapshot.get("total_exposure", 0.0)))
+        if "wallet_usdc" in current_snapshot:
+            current_stats.setdefault("closing_wallet_usdc", float(current_snapshot["wallet_usdc"]))
+        current_stats.setdefault("mode", mode)
         return _coerce_summary_payload(current_stats)
 
     def _ensure_daily_state(self, now_ts: float) -> None:
@@ -346,9 +420,16 @@ class NotificationManager:
         previous_stats["closing_daily_pnl"] = float(previous_snapshot.get("daily_pnl", 0.0))
         previous_stats["closing_open_positions"] = int(previous_snapshot.get("open_positions", 0))
         previous_stats["closing_total_exposure"] = float(previous_snapshot.get("total_exposure", 0.0))
+        if "wallet_usdc" in previous_snapshot:
+            previous_stats["closing_wallet_usdc"] = float(previous_snapshot["wallet_usdc"])
+        previous_stats["mode"] = "shadow" if self._config.dry_run else "live"
         previous_stats["summary_local_date"] = self._local_now(now_ts).date().isoformat()
         self._state["completed_daily_stats"] = previous_stats
         self._state["current_daily_stats"] = _default_daily_stats(risk_date)
+        # Reset risk snapshot but preserve the last wallet reading so the
+        # next cycle's notification has *some* balance to show even
+        # before the executor queries balance again.
+        prior_wallet = previous_snapshot.get("wallet_usdc")
         self._state["current_risk_snapshot"] = {
             "daily_pnl": 0.0,
             "open_positions": 0,
@@ -356,6 +437,8 @@ class NotificationManager:
             "is_halted": False,
             "halt_reason": "",
         }
+        if prior_wallet is not None:
+            self._state["current_risk_snapshot"]["wallet_usdc"] = float(prior_wallet)
         self._persist_state()
 
     def _load_state(self) -> dict:
@@ -426,6 +509,8 @@ def _parse_hhmm(value: str) -> tuple[int, int]:
 
 
 def _coerce_summary_payload(payload: dict) -> DailySummaryPayload:
+    wallet_raw = payload.get("closing_wallet_usdc")
+    wallet_usdc = float(wallet_raw) if wallet_raw is not None else None
     return DailySummaryPayload(
         risk_date=str(payload.get("date_key", "")),
         trade_success_count=int(payload.get("trade_success_count", 0)),
@@ -437,17 +522,31 @@ def _coerce_summary_payload(payload: dict) -> DailySummaryPayload:
         closing_open_positions=int(payload.get("closing_open_positions", 0)),
         closing_total_exposure=float(payload.get("closing_total_exposure", 0.0)),
         summary_local_date=str(payload.get("summary_local_date", "")),
+        closing_wallet_usdc=wallet_usdc,
+        mode=str(payload.get("mode", "live")),
     )
 
 
 def _format_daily_summary_message(summary: DailySummaryPayload, *, timezone_name: str) -> str:
+    mode_tag = "🌓 SHADOW" if summary.mode == "shadow" else "🔴 LIVE"
+    if summary.closing_wallet_usdc is None:
+        wallet_line = "钱包余额(USDC): N/A  [余额查询不可用 — 检查 CLOB 凭证或网络]"
+    else:
+        wallet_line = f"钱包余额(USDC): ${summary.closing_wallet_usdc:.2f}"
+    mode_note = (
+        "  [dry_run / 模拟撮合，所有成交均为 virtual_fills]"
+        if summary.mode == "shadow"
+        else "  [真实下单 — 数字反映链上结算]"
+    )
     return (
         "🧾 每日汇总\n"
+        f"模式: {mode_tag}{mode_note}\n"
         f"日期: {summary.summary_local_date} ({timezone_name}) | 统计日(UTC): {summary.risk_date}\n"
         f"交易概览: 成功 {summary.trade_success_count} | 失败 {summary.trade_failure_count} | 严重错误 {summary.fatal_error_count}\n"
         f"理论累计净利(LIVE): ${summary.live_expected_profit_total:+.4f}  [按 net_edge×size 估算，未扣滑点/手续费]\n"
         f"理论累计净利(DRY):  ${summary.simulated_expected_profit_total:+.4f}  [dry-run 模拟盘口，仅供观测]\n"
         f"真实已实现日盈亏:   ${summary.closing_daily_pnl:+.2f}  [账户同步的 closed-positions realized PnL，未含浮盈浮亏]\n"
         f"资金状态: 持仓 {summary.closing_open_positions} | 敞口 ${summary.closing_total_exposure:.2f}\n"
+        f"{wallet_line}\n"
         "口径: 落袋盈亏以「真实已实现日盈亏」为准；理论累计净利仅反映信号质量，不等同实盘收益"
     )

@@ -76,6 +76,7 @@ class OrderBookAnalyzer:
         retry_count: int = 2,
         retry_delay_sec: float = 0.15,
         missing_orderbook_cooldown_sec: float = 300.0,
+        feed_health_cache_ttl_sec: float = 0.2,
     ):
         self._client = clob_client
         self._live_mirror = live_mirror
@@ -89,6 +90,14 @@ class OrderBookAnalyzer:
         self._missing_orderbook_until: dict[str, float] = {}
         self._stats_lock = threading.Lock()
         self._stats: dict[str, int] = {key: 0 for key in _ORDERBOOK_STAT_KEYS}
+        # P2-feedhealth: TTL on global-path feed_health results.
+        # The orchestrator + signal paths can call feed_health
+        # multiple times per cycle (T1 cross-platform check + T2
+        # statistical + T3 maker) — caching the global verdict for
+        # 200ms eliminates redundant ``get_all`` + dict scans without
+        # hiding genuine staleness (one scan cycle is typically ≥3s).
+        self._feed_health_cache_ttl_sec = max(0.0, float(feed_health_cache_ttl_sec))
+        self._feed_health_cache: tuple[tuple[float, float], float, dict[str, Any]] | None = None
 
     def set_live_mirror(self, live_mirror: Any | None) -> None:
         self._live_mirror = live_mirror
@@ -105,10 +114,42 @@ class OrderBookAnalyzer:
         *,
         max_snapshot_age_sec: float,
         min_ws_hit_ratio: float,
+        token_ids: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Return live-trading orderbook health from recent source stats."""
+        """Return live-trading orderbook health from recent source stats.
+
+        Pass ``token_ids`` to scope the staleness check to the markets a
+        specific signal actually cares about — without that scoping a
+        single idle hot-pool token whose mirror hasn't been pushed in N
+        seconds will fail the *entire* check and block every T2 signal
+        in the system. Token ids that aren't in the live mirror are
+        skipped (they'll fall through to REST / cache via
+        ``get_snapshot``, which is the right behaviour — REST has its
+        own freshness contract).
+
+        When ``token_ids`` is None the check sweeps every mirror entry
+        (legacy behaviour, kept for callers that want a global view).
+        Global-path results are cached for ``_feed_health_cache_ttl_sec``
+        so per-cycle hot loops calling ``feed_health()`` repeatedly
+        don't pay the ``get_all`` lock contention + dict copy cost on
+        every call. The token-scoped path bypasses cache because the
+        scope changes between callers.
+        """
         if self._live_mirror is None:
             return {"healthy": False, "reason": "ws_mirror_unavailable"}
+
+        now = time.time()
+        if (
+            token_ids is None
+            and self._feed_health_cache_ttl_sec > 0
+            and self._feed_health_cache is not None
+        ):
+            cache_key, cache_ts, cache_result = self._feed_health_cache
+            if (
+                cache_key == (max_snapshot_age_sec, min_ws_hit_ratio)
+                and (now - cache_ts) < self._feed_health_cache_ttl_sec
+            ):
+                return cache_result
 
         stats = self.snapshot_stats(reset=False)
         requests = max(0, int(stats.get("requests", 0)))
@@ -117,27 +158,53 @@ class OrderBookAnalyzer:
         missing = max(0, int(stats.get("missing_orderbook", 0)))
         ws_hit_ratio = (ws_hits / requests) if requests > 0 else 0.0
         if requests > 0 and ws_hit_ratio < min_ws_hit_ratio:
-            return {
+            result = {
                 "healthy": False,
                 "reason": "ws_hit_ratio_low",
                 "ws_hit_ratio": ws_hit_ratio,
                 "stats": stats,
             }
+            return self._maybe_cache_feed_health(token_ids, max_snapshot_age_sec, min_ws_hit_ratio, now, result)
         if rest_errors > 0:
-            return {"healthy": False, "reason": "rest_errors_present", "stats": stats}
+            result = {"healthy": False, "reason": "rest_errors_present", "stats": stats}
+            return self._maybe_cache_feed_health(token_ids, max_snapshot_age_sec, min_ws_hit_ratio, now, result)
         if missing > 0:
-            return {"healthy": False, "reason": "missing_orderbooks_present", "stats": stats}
+            result = {"healthy": False, "reason": "missing_orderbooks_present", "stats": stats}
+            return self._maybe_cache_feed_health(token_ids, max_snapshot_age_sec, min_ws_hit_ratio, now, result)
 
-        now = time.time()
-        for snap in _live_mirror_snapshots(self._live_mirror).values():
+        snapshots = _live_mirror_snapshots(self._live_mirror)
+        if token_ids is not None:
+            relevant = (snapshots.get(tid) for tid in token_ids)
+            scoped_iter = [s for s in relevant if s is not None]
+        else:
+            scoped_iter = list(snapshots.values())
+        for snap in scoped_iter:
             snap_ts = float(getattr(snap, "timestamp", 0.0) or 0.0)
             if snap_ts > 0 and (now - snap_ts) > max_snapshot_age_sec:
-                return {
+                result = {
                     "healthy": False,
                     "reason": "stale_ws_snapshot",
                     "snapshot_age_sec": now - snap_ts,
                 }
-        return {"healthy": True, "reason": "", "ws_hit_ratio": ws_hit_ratio, "stats": stats}
+                return self._maybe_cache_feed_health(token_ids, max_snapshot_age_sec, min_ws_hit_ratio, now, result)
+        result = {"healthy": True, "reason": "", "ws_hit_ratio": ws_hit_ratio, "stats": stats}
+        return self._maybe_cache_feed_health(token_ids, max_snapshot_age_sec, min_ws_hit_ratio, now, result)
+
+    def _maybe_cache_feed_health(
+        self,
+        token_ids: list[str] | None,
+        max_snapshot_age_sec: float,
+        min_ws_hit_ratio: float,
+        now: float,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        if token_ids is None and self._feed_health_cache_ttl_sec > 0:
+            self._feed_health_cache = (
+                (max_snapshot_age_sec, min_ws_hit_ratio),
+                now,
+                result,
+            )
+        return result
 
     def get_snapshot(
         self,
@@ -255,7 +322,21 @@ class OrderBookAnalyzer:
         snap_ts = float(getattr(snap, "timestamp", 0.0) or 0.0)
         if self._ws_snapshot_max_age_sec > 0 and snap_ts > 0 and (now - snap_ts) > self._ws_snapshot_max_age_sec:
             return None
-        self._set_cached_snapshot(token_id, snap, source="ws")
+        # Hot-path micro-opt: scan_cycle calls get_snapshot ≥2× per
+        # binary market every cycle. The WS mirror typically returns
+        # the same snapshot reference until the next delta lands, so
+        # re-writing the cache dicts (two writes per call) is pure
+        # overhead. Compare by identity *and* timestamp to also avoid
+        # stamping a re-rebuilt snapshot that happens to share the
+        # epoch — cheaper than a deep eq.
+        cached = self._snapshot_cache.get(token_id)
+        if (
+            cached is None
+            or cached is not snap
+            or float(getattr(cached, "timestamp", 0.0) or 0.0) != snap_ts
+            or self._snapshot_cache_source.get(token_id) != "ws"
+        ):
+            self._set_cached_snapshot(token_id, snap, source="ws")
         self._record_stat("ws_hit")
         return snap
 
@@ -272,6 +353,20 @@ class OrderBookAnalyzer:
             return
         with self._stats_lock:
             self._stats[key] += int(amount)
+
+    def _record_stats_bulk(self, increments: dict[str, int]) -> None:
+        """Batch variant of :meth:`_record_stat` — one lock acquisition
+        for all keys in ``increments``. The scan/orchestrator path can
+        aggregate per-call counters locally and call this once per
+        cycle so the WS callback thread isn't pre-empting on
+        ``_stats_lock`` hundreds of times per scan cycle.
+        """
+        if not increments:
+            return
+        with self._stats_lock:
+            for key, amount in increments.items():
+                if key in _ORDERBOOK_STAT_KEYS and amount:
+                    self._stats[key] += int(amount)
 
     def get_best_ask_with_depth(
         self, token_id: str, min_size: float = 0.0

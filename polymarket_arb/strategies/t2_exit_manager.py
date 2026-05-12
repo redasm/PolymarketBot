@@ -361,6 +361,15 @@ class T2ExitManager:
                             pos.exit_failure_count,
                         )
                     result.failed += 1
+                    # Escalation ladder. The three terminal-ish milestones
+                    # (max retries / floor mode / abandon) keep their
+                    # ERROR-level logs and notifications. The gap between
+                    # them used to be silent — operators only saw events
+                    # at counts 3, 10 and 20, so a position stuck at 5
+                    # looked like a forgotten incident. We now emit a
+                    # single WARNING per attempt once we're past
+                    # `_MAX_EXIT_RETRIES`: the first two failures are
+                    # left quiet because they're normal FAK retries.
                     if pos.exit_failure_count == _MAX_EXIT_RETRIES:
                         LOG.error(
                             "T2 退出失败 %d 次: token=%s — 仓位仍在追踪，可能需要人工干预",
@@ -377,6 +386,14 @@ class T2ExitManager:
                         )
                     elif pos.exit_failure_count >= _ABANDON_AFTER:
                         self._abandon_position(pos)
+                    elif pos.exit_failure_count > _MAX_EXIT_RETRIES:
+                        LOG.warning(
+                            "T2 退出失败 %d 次: token=%s reason=%s 下一次重试 +%.0fs",
+                            pos.exit_failure_count,
+                            token_id[:16],
+                            pos.last_decision_reason,
+                            max(0.0, pos.next_exit_retry_ts - now),
+                        )
 
             self._positions = {
                 k: v for k, v in self._positions.items()

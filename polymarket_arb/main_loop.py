@@ -93,6 +93,9 @@ from polymarket_arb.main_helpers.signal_helpers import (
     sum_trade_exposure as _sum_trade_exposure,
 )
 from polymarket_arb.main_helpers.signal_telemetry import StrategySignalTelemetryCompressor
+from polymarket_arb.main_helpers.virtual_fill_emitter import (
+    VirtualFillEmitter as _VirtualFillEmitter,
+)
 from polymarket_arb.main_helpers.strategy_execution import (
     ExecutionDelta,
     execute_strategy_signal as _execute_strategy_signal,
@@ -103,6 +106,7 @@ from polymarket_arb.main_helpers.t0_execution import (
 from polymarket_arb.main_helpers.dashboard_cycle_payload import (
     build_dashboard_cycle_payload as _build_dashboard_cycle_payload,
 )
+from polymarket_arb.main_helpers.dirty_market_tracker import DirtyMarketTracker
 from polymarket_arb.main_helpers.dashboard_serializers import (
     build_dashboard_trade_rows as _build_dashboard_trade_rows,
     build_ws_status as _build_ws_status,
@@ -318,6 +322,7 @@ def main(dotenv_path: str | None = None) -> None:
         spread_calc=DynamicSpreadCalculator(vol_estimator=vol_estimator),
         default_size=config.default_order_size_usdc,
         max_inventory=max(config.max_exposure_per_market, config.default_order_size_usdc),
+        flow_inventory_weight=config.t3_flow_bias_inventory_weight,
     )
     cross_platform_scanner = _create_cross_platform_scanner(config, ob_analyzer)
     tick_recorder = TickRecorder(
@@ -327,7 +332,18 @@ def main(dotenv_path: str | None = None) -> None:
     event_recorder = EventRecorder(
         output_dir=config.telemetry_record_dir,
         enabled=config.telemetry_record_enabled,
+        async_write=config.telemetry_async_write,
+        queue_size=config.telemetry_async_queue_size,
     )
+    if config.dry_run:
+        virtual_fill_emitter = _VirtualFillEmitter(
+            event_recorder=event_recorder,
+            book_snapshot_provider=lambda token_id: ob_analyzer.get_snapshot(
+                token_id, allow_rest_fallback=False, count_request=False
+            ),
+            taker_fee_rate=config.polymarket_taker_fee_rate,
+        )
+        executor.set_virtual_fill_emitter(virtual_fill_emitter)
     data_janitor = DataJanitor(
         enabled=config.data_cleanup_enabled,
         interval_sec=config.data_cleanup_interval_sec,
@@ -445,6 +461,13 @@ def main(dotenv_path: str | None = None) -> None:
     ws_feed: Optional[WebSocketFeed] = None
     ws_mirror: Optional[OrderBookMirror] = None
     ws_target_ids: list[str] = []
+    # P0-dirty: producer side lives in the WS callback thread,
+    # consumer side is the main loop's scan_cycle priority reorder +
+    # early sleep wake. ``wake_threshold`` from config; default 1
+    # means "wake on any change".
+    dirty_market_tracker = DirtyMarketTracker(
+        wake_threshold=config.dirty_market_wake_threshold,
+    )
     last_vol_feed_ts = 0.0
     cached_universe_markets: list[MarketInfo] = []
     cached_universe_events: list[Any] = []
@@ -489,12 +512,20 @@ def main(dotenv_path: str | None = None) -> None:
     total_simulated_submissions = 0
     total_live_expected_profit = 0.0
     total_simulated_expected_profit = 0.0
+    # P0-5: T0 structural arbs vs T1/T2/T3 directional signals are mixed
+    # into `total_theoretical_opportunities` for backward compat. Track
+    # them separately so cycle_metrics can answer "how many T0 arbs did
+    # the detector find today" without grepping signal NDJSON.
+    total_t0_opportunities = 0
+    total_directional_signals = 0
     consecutive_api_errors = 0
     # Daily counters that roll over at UTC midnight. Lifetime totals above
     # are useful for run-level summaries but operators reading hourly
     # telemetry want to know how many opportunities materialised *today*.
     today_theoretical_opportunities = 0
     today_live_successes = 0
+    today_t0_opportunities = 0
+    today_directional_signals = 0
     today_utc_date = ""
     signal_telemetry = StrategySignalTelemetryCompressor(cooldown_sec=60.0)
 
@@ -508,6 +539,8 @@ def main(dotenv_path: str | None = None) -> None:
             today_utc_date = current_utc_date
             today_theoretical_opportunities = 0
             today_live_successes = 0
+            today_t0_opportunities = 0
+            today_directional_signals = 0
         cycle_timing: dict[str, float] = {
             "universe_refresh_sec": 0.0,
             "candidate_select_sec": 0.0,
@@ -606,6 +639,7 @@ def main(dotenv_path: str | None = None) -> None:
                                 enhanced_store,
                                 tick_recorder,
                                 flow_ingest=flow_ingest,
+                                dirty_tracker=dirty_market_tracker,
                             )
                             ws_target_ids = new_ids
                     elif cycle == 1 or cycle % 20 == 0:
@@ -622,6 +656,7 @@ def main(dotenv_path: str | None = None) -> None:
 
             universe_markets = list(cached_universe_markets)
             phase_start = time.perf_counter()
+            priority_dirty = dirty_market_tracker.drain()
             opportunities = _scan_cycle(
                 detector=detector,
                 config=config,
@@ -629,9 +664,14 @@ def main(dotenv_path: str | None = None) -> None:
                 candidate_events=event_candidates,
                 universe_market_count=len(cached_universe_markets),
                 universe_refreshed=universe_refreshed,
+                priority_condition_ids=priority_dirty,
                 progress_cb=lambda **kwargs: dash_state.update(
                     markets_scanned=kwargs.get("scanned_markets", 0),
-                    arbs_found=total_theoretical_opportunities + kwargs.get("opportunities_found", 0),
+                    # Dashboard "arbs_found" counter should reflect actual
+                    # T0 structural opportunities, not the mixed
+                    # `total_theoretical_opportunities` that includes
+                    # T2/T3 directional signals.
+                    arbs_found=total_t0_opportunities + kwargs.get("opportunities_found", 0),
                     ws_status=_build_ws_status(
                         config=config,
                         enhanced_store=enhanced_store,
@@ -702,6 +742,10 @@ def main(dotenv_path: str | None = None) -> None:
                 current_position_value=risk_mgr.state.current_position_value,
                 cycle_status="error",
                 theoretical_opportunities_today=today_theoretical_opportunities,
+                t0_opportunities_total=total_t0_opportunities,
+                t0_opportunities_today=today_t0_opportunities,
+                directional_signals_total=total_directional_signals,
+                directional_signals_today=today_directional_signals,
                 live_successes_today=today_live_successes,
             )
             if consecutive_api_errors >= 10:
@@ -730,6 +774,8 @@ def main(dotenv_path: str | None = None) -> None:
         if opportunities:
             total_theoretical_opportunities += len(opportunities)
             today_theoretical_opportunities += len(opportunities)
+            total_t0_opportunities += len(opportunities)
+            today_t0_opportunities += len(opportunities)
             LOG.info(
                 "周期 #%d: 发现 %d 个套利机会",
                 cycle,
@@ -931,6 +977,8 @@ def main(dotenv_path: str | None = None) -> None:
         processed_signals = [] if execution_blocked_by_forced_sync else orchestrator.process_signals()
         total_theoretical_opportunities += len(processed_signals)
         today_theoretical_opportunities += len(processed_signals)
+        total_directional_signals += len(processed_signals)
+        today_directional_signals += len(processed_signals)
         process_skip_summary = orchestrator.get_last_skip_reasons()
         if process_skip_summary.get("total") and event_recorder.is_enabled:
             event_recorder.write_event("strategy_executions", {
@@ -1060,6 +1108,21 @@ def main(dotenv_path: str | None = None) -> None:
                 event_recorder=event_recorder,
             )
 
+        if config.dry_run:
+            # Allow REST fallback so we can sweep maker quotes in markets
+            # that aren't on WS (WS_MAX_MARKETS covers only the hot pool).
+            # `count_request=False` keeps the cycle stats clean — the
+            # quotes that need REST will be served from the analyzer's
+            # cache layer the vast majority of the time, since the same
+            # token usually had a snapshot fetched earlier in the cycle
+            # by scan/signal collection.
+            executor.sweep_simulated_maker_fills(
+                lambda token_id: ob_analyzer.get_snapshot(
+                    token_id, allow_rest_fallback=True, count_request=False
+                ),
+                fill_latency_sec=config.shadow_maker_fill_latency_sec,
+            )
+
         if (
             portfolio_sync is not None
             and (time.time() - last_portfolio_sync_ts) >= config.portfolio_sync_interval_sec
@@ -1100,6 +1163,8 @@ def main(dotenv_path: str | None = None) -> None:
             research_signal_enabled=research_signal_enabled,
             counters={
                 "total_theoretical_opportunities": total_theoretical_opportunities,
+                "total_t0_opportunities": total_t0_opportunities,
+                "total_directional_signals": total_directional_signals,
                 "total_live_successes": total_live_successes,
                 "total_simulated_successes": total_simulated_successes,
                 "total_live_submissions": total_live_submissions,
@@ -1141,6 +1206,10 @@ def main(dotenv_path: str | None = None) -> None:
             cycle_status="ok",
             theoretical_opportunities_today=today_theoretical_opportunities,
             live_successes_today=today_live_successes,
+            t0_opportunities_total=total_t0_opportunities,
+            t0_opportunities_today=today_t0_opportunities,
+            directional_signals_total=total_directional_signals,
+            directional_signals_today=today_directional_signals,
         )
 
         now_ts = time.time()
@@ -1148,18 +1217,34 @@ def main(dotenv_path: str | None = None) -> None:
             event_recorder.write_event("risk_events", cycle_summary_payload)
             last_telemetry_heartbeat_ts = now_ts
 
+        wallet_usdc = executor.get_available_collateral_balance(use_cache=True)
         notifier.observe_cycle(
             daily_pnl=risk_s.daily_pnl,
             open_positions=risk_s.open_positions,
             total_exposure=risk_s.total_exposure,
             is_halted=risk_s.is_halted,
             halt_reason=risk_s.halt_reason,
+            wallet_usdc=wallet_usdc,
             now_ts=now_ts,
         )
         if risk_s.is_halted and risk_s.halt_reason:
+            halt_context: list[str] = [
+                f"连续失败: {risk_s.consecutive_failures}/{config.max_consecutive_failures}",
+            ]
+            halt_started = risk_mgr.halt_time
+            recover_window = float(config.risk_halt_auto_recover_sec)
+            if halt_started is not None and recover_window > 0:
+                elapsed = max(0.0, now_ts - halt_started)
+                remaining = max(0.0, recover_window - elapsed)
+                halt_context.append(
+                    f"自动恢复: 剩余 {remaining:.0f}s / {recover_window:.0f}s（无新失败即解除）"
+                )
+            elif recover_window <= 0:
+                halt_context.append("自动恢复: 已禁用 — 需手动 reset_circuit_breaker")
             notifier.notify_fatal_error(
                 f"风控已熔断\n原因: {risk_s.halt_reason}",
                 error_key=f"risk_halt:{risk_s.halt_reason}",
+                context_lines=halt_context,
                 now_ts=now_ts,
             )
         notifier.maybe_notify_pnl_alert(
@@ -1171,9 +1256,10 @@ def main(dotenv_path: str | None = None) -> None:
         elapsed = time.time() - cycle_start
         if cycle % 100 == 0:
             LOG.info(
-                "状态: 已扫描 %d 周期, 理论机会 %d, 真实成交 %d, 模拟成交 %d, 挂单提交(真/模)=%d/%d, WS=%s, 本周期 %.1fs",
+                "状态: 已扫描 %d 周期, T0机会 %d, 定向信号 %d, 真实成交 %d, 模拟成交 %d, 挂单提交(真/模)=%d/%d, WS=%s, 本周期 %.1fs",
                 cycle,
-                total_theoretical_opportunities,
+                total_t0_opportunities,
+                total_directional_signals,
                 total_live_successes,
                 total_simulated_successes,
                 total_live_submissions,
@@ -1182,9 +1268,25 @@ def main(dotenv_path: str | None = None) -> None:
                 elapsed,
             )
 
-        sleep_time = max(0, config.scan_interval_sec - elapsed)
+        sleep_time = max(0.0, config.scan_interval_sec - elapsed)
         if sleep_time > 0 and not _SHUTDOWN_EVENT.is_set():
-            time.sleep(sleep_time)
+            # P0-dirty: replace the unconditional sleep with a wait
+            # that breaks early on (a) shutdown or (b) the WS callback
+            # marking ≥ `dirty_market_wake_threshold` markets dirty.
+            # The 0.5s cap on each inner wait keeps shutdown latency
+            # bounded even if the wake event is never set this window.
+            sleep_until = time.time() + sleep_time
+            while True:
+                remaining = sleep_until - time.time()
+                if remaining <= 0:
+                    break
+                if _SHUTDOWN_EVENT.is_set():
+                    break
+                if dirty_market_tracker.wake_event.wait(
+                    timeout=min(0.5, remaining)
+                ):
+                    dirty_market_tracker.wake_event.clear()
+                    break
 
     if ws_feed is not None:
         ws_feed.stop()
@@ -1199,7 +1301,13 @@ def main(dotenv_path: str | None = None) -> None:
             "run_id": run_id,
             "pid": os.getpid(),
             "cycle": cycle,
+            # `arbs_found_total` historically meant "T0 + directional signals"
+            # which was misleading. Keep the legacy field for downstream
+            # compatibility but add explicit splits so operators don't have
+            # to grep signal NDJSON to know if T0 actually found anything.
             "arbs_found_total": total_theoretical_opportunities,
+            "t0_opportunities_total": total_t0_opportunities,
+            "directional_signals_total": total_directional_signals,
             "arbs_executed_total": total_live_successes,
             "simulated_successes_total": total_simulated_successes,
             "live_submissions_total": total_live_submissions,
@@ -1211,10 +1319,11 @@ def main(dotenv_path: str | None = None) -> None:
         flow_aggregator.close()
     dash_state.update(is_running=False)
     LOG.info(
-        "机器人已停止: run_id=%s。总计: %d 周期, 理论机会=%d, 真实成交=%d, 模拟成交=%d, 挂单提交(真/模)=%d/%d",
+        "机器人已停止: run_id=%s。总计: %d 周期, T0机会=%d, 定向信号=%d, 真实成交=%d, 模拟成交=%d, 挂单提交(真/模)=%d/%d",
         run_id,
         cycle,
-        total_theoretical_opportunities,
+        total_t0_opportunities,
+        total_directional_signals,
         total_live_successes,
         total_simulated_successes,
         total_live_submissions,
@@ -1223,7 +1332,8 @@ def main(dotenv_path: str | None = None) -> None:
     notifier.notify_shutdown(
         run_id=run_id,
         cycle_count=cycle,
-        total_arbs_found=total_theoretical_opportunities,
+        total_t0_opportunities=total_t0_opportunities,
+        total_directional_signals=total_directional_signals,
         total_arbs_executed=total_live_successes,
         simulated_successes=total_simulated_successes,
     )

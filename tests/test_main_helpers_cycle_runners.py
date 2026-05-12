@@ -391,6 +391,64 @@ def test_scan_cycle_skips_single_market_events() -> None:
     assert opps == []
 
 
+def test_scan_cycle_prioritizes_dirty_markets_first() -> None:
+    """P0-dirty regression: when the WS callback marks a subset of
+    markets dirty, scan_cycle must scan them BEFORE the cold tail
+    so a delta that lands mid-cycle is acted on with sub-cycle
+    latency.
+    """
+    cold_1 = _market("cold-1")
+    cold_2 = _market("cold-2")
+    dirty_a = _market("dirty-a")
+    dirty_b = _market("dirty-b")
+
+    scan_order: list[str] = []
+
+    def _scan_binary(market):
+        scan_order.append(market.condition_id)
+        return _opp(0.05)
+
+    detector = SimpleNamespace(
+        scan_binary_market=_scan_binary,
+        scan_multi_outcome_event=lambda e: None,
+    )
+
+    scan_cycle(
+        detector=detector,
+        config=SimpleNamespace(),
+        candidate_markets=[cold_1, dirty_a, cold_2, dirty_b],
+        candidate_events=[],
+        universe_market_count=4,
+        universe_refreshed=False,
+        priority_condition_ids={"dirty-a", "dirty-b"},
+    )
+
+    assert scan_order[:2] == ["dirty-a", "dirty-b"]
+    assert set(scan_order[2:]) == {"cold-1", "cold-2"}
+
+
+def test_scan_cycle_unaffected_when_no_priority_set() -> None:
+    """Cold path: no priority set → iteration order matches input."""
+    markets = [_market("m1"), _market("m2"), _market("m3")]
+    scan_order: list[str] = []
+
+    detector = SimpleNamespace(
+        scan_binary_market=lambda m: scan_order.append(m.condition_id) or _opp(0.05),
+        scan_multi_outcome_event=lambda e: None,
+    )
+
+    scan_cycle(
+        detector=detector,
+        config=SimpleNamespace(),
+        candidate_markets=markets,
+        candidate_events=[],
+        universe_market_count=3,
+        universe_refreshed=False,
+    )
+
+    assert scan_order == ["m1", "m2", "m3"]
+
+
 def test_scan_cycle_progress_callback_emits_phase_pulses() -> None:
     pulses: list[dict] = []
     detector = SimpleNamespace(

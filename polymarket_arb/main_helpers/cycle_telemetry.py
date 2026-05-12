@@ -46,6 +46,10 @@ def build_cycle_summary_payload(
     cycle_status: str = "ok",
     theoretical_opportunities_today: int = 0,
     live_successes_today: int = 0,
+    t0_opportunities_total: int = 0,
+    t0_opportunities_today: int = 0,
+    directional_signals_total: int = 0,
+    directional_signals_today: int = 0,
 ) -> dict[str, Any]:
     """Build the per-cycle telemetry payload.
 
@@ -59,6 +63,12 @@ def build_cycle_summary_payload(
     Older dashboards key off the short names; newer event-log consumers
     use the explicit ones. Keep both until the dashboard drops the
     legacy keys.
+
+    `theoretical_opportunities_total` mixes T0 structural arbs and
+    T1/T2/T3 directional signals processed by the orchestrator. The
+    `t0_opportunities_*` and `directional_signals_*` fields split them
+    so operators can answer "how many T0 arbs did the detector actually
+    find today" without grepping signal NDJSON.
     """
     return {
         "event": "cycle_summary",
@@ -77,6 +87,10 @@ def build_cycle_summary_payload(
         "simulated_successes_total": simulated_successes_total,
         "live_submissions_total": live_submissions_total,
         "simulated_submissions_total": simulated_submissions_total,
+        "t0_opportunities_total": t0_opportunities_total,
+        "t0_opportunities_today": t0_opportunities_today,
+        "directional_signals_total": directional_signals_total,
+        "directional_signals_today": directional_signals_today,
         "ws_connected": ws_status.get("connected", False),
         "ws_tokens": ws_status.get("subscribed_tokens", 0),
         "research_count": research_count,
@@ -134,6 +148,10 @@ def emit_cycle_metrics(
     cycle_status: str = "ok",
     theoretical_opportunities_today: int = 0,
     live_successes_today: int = 0,
+    t0_opportunities_total: int = 0,
+    t0_opportunities_today: int = 0,
+    directional_signals_total: int = 0,
+    directional_signals_today: int = 0,
 ) -> dict[str, Any]:
     """Snapshot orderbook stats, build the payload, and write to the event log.
 
@@ -170,6 +188,10 @@ def emit_cycle_metrics(
         cycle_status=cycle_status,
         theoretical_opportunities_today=theoretical_opportunities_today,
         live_successes_today=live_successes_today,
+        t0_opportunities_total=t0_opportunities_total,
+        t0_opportunities_today=t0_opportunities_today,
+        directional_signals_total=directional_signals_total,
+        directional_signals_today=directional_signals_today,
     )
     if event_recorder.is_enabled:
         event_recorder.write_event("cycle_metrics", payload)

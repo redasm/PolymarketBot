@@ -114,6 +114,35 @@ class ExecutionEngine:
         # main loop can force a portfolio sync before approving new trades.
         # Cleared by `consume_force_portfolio_resync()`.
         self._force_portfolio_resync_ts: float | None = None
+        # Shadow-mode telemetry hook. main_loop installs a
+        # `VirtualFillEmitter` after construction so dry_run trades get
+        # written to data/telemetry/<date>.virtual_fills.ndjson with the
+        # 13 fields roadmap §三-阶段 1 requires.
+        self._virtual_fill_emitter: Any | None = None
+
+    def set_virtual_fill_emitter(self, emitter: Any) -> None:
+        self._virtual_fill_emitter = emitter
+
+    def _emit_virtual_fill(
+        self,
+        trade: TradeRecord,
+        *,
+        intended_price: float | None = None,
+        tier: str | None = None,
+        signal_context: dict | None = None,
+    ) -> None:
+        emitter = self._virtual_fill_emitter
+        if emitter is None:
+            return
+        try:
+            emitter.record_fill(
+                trade,
+                intended_price=intended_price,
+                tier=tier,
+                signal_context=signal_context,
+            )
+        except Exception as exc:  # pragma: no cover - telemetry must never break execution
+            LOG.warning("virtual_fill emit failed: %s", exc)
 
     @property
     def trade_history(self) -> list[TradeRecord]:
@@ -490,6 +519,11 @@ class ExecutionEngine:
                 trade.fill_price = normalized_price
                 trade.fill_size = normalized_size
             self._append_trade_record(trade, simulated=True)
+            self._emit_virtual_fill(
+                trade,
+                intended_price=normalized_price,
+                tier="T3_MAKER" if post_only else "T2_DIRECTIONAL",
+            )
             return trade
 
         try:
@@ -663,6 +697,108 @@ class ExecutionEngine:
                 )
 
         return OrderSyncResult(polled=polled, changed=changed)
+
+    def sweep_simulated_maker_fills(
+        self,
+        book_snapshot_provider: Any,
+        *,
+        fill_latency_sec: float = 0.0,
+        now_ts: float | None = None,
+    ) -> list[TradeRecord]:
+        """Shadow-mode maker-fill sweep (roadmap §三-阶段 1).
+
+        For each simulated post_only quote still PENDING, look up the
+        current best bid/ask and flip the trade to FILLED if the
+        opposing side has crossed the limit price.
+
+        - BUY limit @ p (resting on the bid): filled when ``best_ask
+          ≤ p`` — somebody is willing to sell into us.
+        - SELL limit @ p (resting on the ask): filled when
+          ``best_bid ≥ p`` — somebody is willing to buy from us.
+
+        ``fill_latency_sec`` enforces a minimum age before a quote is
+        considered fillable, mirroring the queue-position penalty real
+        maker orders face.
+
+        Side effect: each flipped trade emits a ``virtual_fills`` row
+        via the installed emitter so the dataset records both the
+        PENDING and the FILLED event.
+        """
+        if not self._config.dry_run:
+            return []
+
+        now = now_ts if now_ts is not None else time.time()
+        flipped: list[TradeRecord] = []
+        for trade in self._simulated_trade_history:
+            if trade.status != TradeStatus.PENDING:
+                continue
+            if not trade.post_only:
+                continue
+            if (now - trade.timestamp) < fill_latency_sec:
+                continue
+            try:
+                snap = book_snapshot_provider(trade.token_id)
+            except Exception as exc:  # pragma: no cover - provider failure must not break the sweep
+                LOG.debug("sweep maker fill snapshot lookup failed for %s: %s", trade.token_id[:16], exc)
+                continue
+            if snap is None:
+                continue
+            limit_price = float(trade.price)
+            if trade.side == OrderSide.BUY:
+                if snap.best_ask is None or float(snap.best_ask) > limit_price:
+                    continue
+                cross_price = float(snap.best_ask)
+                opposing_size = float(getattr(snap, "best_ask_size", None) or 0.0)
+            else:
+                if snap.best_bid is None or float(snap.best_bid) < limit_price:
+                    continue
+                cross_price = float(snap.best_bid)
+                opposing_size = float(getattr(snap, "best_bid_size", None) or 0.0)
+
+            # Cap simulated fill at the visible opposing depth. Without
+            # this, sweep is over-optimistic vs. live: a 100-share maker
+            # quote would "fill" even if the crossing order only has 5
+            # shares on the other side. Treat 0/None depth as "unknown"
+            # and fall back to full fill so missing-data doesn't
+            # silently zero out shadow telemetry.
+            requested_size = float(trade.size)
+            if opposing_size > 0:
+                fill_size = min(requested_size, opposing_size)
+            else:
+                fill_size = requested_size
+            partial = fill_size + 1e-9 < requested_size
+
+            trade.status = TradeStatus.PARTIAL if partial else TradeStatus.FILLED
+            trade.fill_price = limit_price
+            trade.fill_size = fill_size
+            # Stamp the *fill* moment, not the original submission time, so
+            # the shadow daily report can reason about queue latency. The
+            # downstream emitter formats `trade.timestamp` as
+            # `fill_timestamp` in the NDJSON row.
+            trade.timestamp = now
+            flipped.append(trade)
+            LOG.info(
+                "[SHADOW] maker quote filled: trade=%s side=%s limit=%.4f cross=%.4f filled=%.2f/%.2f%s",
+                trade.trade_id,
+                trade.side.value,
+                limit_price,
+                cross_price,
+                fill_size,
+                requested_size,
+                " (partial)" if partial else "",
+            )
+            self._emit_virtual_fill(
+                trade,
+                intended_price=limit_price,
+                tier="T3_MAKER",
+                signal_context={
+                    "fill_mode": "maker_crossed",
+                    "cross_price": cross_price,
+                    "opposing_depth": opposing_size,
+                    "partial": partial,
+                },
+            )
+        return flipped
 
     def cancel_stale_maker_orders(self, max_age_sec: float) -> list[TradeRecord]:
         """撤销超过 TTL 仍未成交的 live 挂单 (T3 做市 GTC / post_only 订单)。
@@ -969,6 +1105,19 @@ class ExecutionEngine:
             )
             records.append(record)
             self._append_trade_record(record, simulated=True)
+            self._emit_virtual_fill(
+                record,
+                intended_price=leg.execution_price if leg.execution_price is not None else leg.price,
+                tier="T0_STRUCTURAL",
+                signal_context={
+                    "arb_type": opp.arb_type.value,
+                    "event_id": opp.event_id,
+                    "net_edge": float(opp.net_edge),
+                    "edge_pct": float(opp.edge_pct),
+                    "outcome": leg.outcome,
+                    "leg_available_size": float(leg.available_size or 0.0),
+                },
+            )
             LOG.info(
                 "  [DRY] %s %s @ $%.4f target=%.2f filled=%.2f status=%s (token=%s…)",
                 leg.side.value,

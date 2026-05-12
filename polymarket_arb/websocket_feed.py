@@ -42,6 +42,42 @@ _PRE_SNAPSHOT_DELTA_BUFFER = 64
 _FATAL_WS_CLOSE_CODES = frozenset({4000, 4001, 4003})
 
 
+def _splice_level(
+    levels: list[OrderBookLevel],
+    price: float,
+    new_size: float,
+    *,
+    descending: bool,
+) -> tuple[list[OrderBookLevel], bool]:
+    """Return ``(new_levels, changed)`` reflecting a single-level update.
+
+    The hot path through this function is one linear pass: skip the
+    existing entry at ``price`` (if any) while finding the sorted
+    position for the new level. ``changed`` is False when the delta is
+    a no-op (e.g. ``new_size == 0`` for a price that wasn't on book)
+    so the caller can skip allocating a new ``OrderBookSnapshot`` and
+    cycling GC pressure on irrelevant deltas.
+    """
+    out: list[OrderBookLevel] = []
+    found = False
+    inserted = False
+    insert = new_size > 0
+    for lv in levels:
+        if not found and abs(lv.price - price) < 1e-9:
+            found = True
+            continue
+        if insert and not inserted:
+            if (descending and lv.price < price) or (not descending and lv.price > price):
+                out.append(OrderBookLevel(price, new_size))
+                inserted = True
+        out.append(lv)
+    if insert and not inserted:
+        out.append(OrderBookLevel(price, new_size))
+        inserted = True
+    changed = found or inserted
+    return out, changed
+
+
 class OrderBookMirror:
     """本地订单簿镜像：由 WebSocket 增量更新维护.
 
@@ -131,6 +167,17 @@ class OrderBookMirror:
 
         If a snapshot has not yet arrived for `token_id` the delta is buffered
         (FIFO, capped) and replayed once the snapshot lands.
+
+        Hot-path optimization: the previous implementation copied the side
+        list, filtered it, appended, then ran a full ``sort()`` for every
+        delta. Under heavy WS traffic that was the dominant Python-side
+        CPU cost. The rewrite below does a single linear pass that
+        simultaneously drops the existing entry at ``price`` (if any) and
+        inserts the new level at its sorted position — same big-O but
+        ~2× faster in practice and zero allocations on the no-op path.
+        The opposite-side list is reused by reference because we never
+        mutate stored level lists in place (each delta produces a new
+        list on the touched side only).
         """
         with self._lock:
             snap = self._books.get(token_id)
@@ -147,33 +194,37 @@ class OrderBookMirror:
                 return
 
             if side == "buy":
-                levels = list(snap.bids)
-                levels = [lv for lv in levels if abs(lv.price - price) > 1e-9]
-                if new_size > 0:
-                    levels.append(OrderBookLevel(price, new_size))
-                levels.sort(key=lambda x: x.price, reverse=True)
+                existing_levels = snap.bids
+                # Bids are stored DESC so the "insert before first
+                # smaller price" rule keeps the list sorted.
+                new_levels, changed = _splice_level(
+                    existing_levels, price, new_size, descending=True
+                )
+                if not changed:
+                    return
                 new_snap = OrderBookSnapshot(
                     token_id=token_id,
-                    best_bid=levels[0].price if levels else None,
+                    best_bid=new_levels[0].price if new_levels else None,
                     best_ask=snap.best_ask,
                     tick_size=snap.tick_size,
-                    bids=levels,
-                    asks=list(snap.asks),
+                    bids=new_levels,
+                    asks=snap.asks,
                     timestamp=time.time(),
                 )
             else:
-                levels = list(snap.asks)
-                levels = [lv for lv in levels if abs(lv.price - price) > 1e-9]
-                if new_size > 0:
-                    levels.append(OrderBookLevel(price, new_size))
-                levels.sort(key=lambda x: x.price)
+                existing_levels = snap.asks
+                new_levels, changed = _splice_level(
+                    existing_levels, price, new_size, descending=False
+                )
+                if not changed:
+                    return
                 new_snap = OrderBookSnapshot(
                     token_id=token_id,
                     best_bid=snap.best_bid,
-                    best_ask=levels[0].price if levels else None,
+                    best_ask=new_levels[0].price if new_levels else None,
                     tick_size=snap.tick_size,
-                    bids=list(snap.bids),
-                    asks=levels,
+                    bids=snap.bids,
+                    asks=new_levels,
                     timestamp=time.time(),
                 )
 

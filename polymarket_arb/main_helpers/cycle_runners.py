@@ -23,6 +23,7 @@ from typing import Any
 from polymarket_arb.arbitrage_detector import ArbitrageDetector
 from polymarket_arb.book_store import EnhancedBookStore
 from polymarket_arb.config import ArbConfig
+from polymarket_arb.main_helpers.dirty_market_tracker import DirtyMarketTracker
 from polymarket_arb.main_helpers.flow_aggregator import FlowIngest
 from polymarket_arb.market_scanner import MarketScanner
 from polymarket_arb.models import ArbOpportunity, MarketInfo
@@ -73,6 +74,7 @@ def start_ws_feed(
     enhanced_store: EnhancedBookStore,
     tick_recorder: TickRecorder | None = None,
     flow_ingest: FlowIngest | None = None,
+    dirty_tracker: "DirtyMarketTracker | None" = None,
 ) -> tuple[WebSocketFeed, OrderBookMirror]:
     """Spin up the WS mirror, bind the primary market, and start the feed.
 
@@ -85,11 +87,30 @@ def start_ws_feed(
     `flow_ingest`, when provided, also rebuilds its token-id lookup
     for the new target set and is wired in as the WS feed's trade
     consumer so `last_trade_price` events feed the FlowAggregator.
+
+    ``dirty_tracker`` (P0-dirty) gets fed a callback that marks the
+    owning condition_id dirty on every best-bid/ask change. The
+    main loop drains the set at the top of the next cycle and uses
+    ``dirty_tracker.wake_event`` to cut the inter-cycle sleep short
+    when enough markets accumulate.
     """
     mirror = OrderBookMirror()
     if tick_recorder is not None and tick_recorder.is_enabled:
         tick_recorder.register_markets(targets)
         mirror.register_callback(tick_recorder.on_book_update)
+    if dirty_tracker is not None:
+        # Build the token → condition_id lookup eagerly so callbacks
+        # don't need to walk MarketInfo objects each time.
+        token_to_cond: dict[str, str] = {}
+        for m in targets:
+            for t in m.tokens:
+                token_to_cond[t.token_id] = m.condition_id
+        dirty_tracker.register_token_map(token_to_cond)
+
+        def _on_book_change(token_id: str, _snap) -> None:
+            dirty_tracker.mark_dirty(token_id)
+
+        mirror.register_callback(_on_book_change)
 
     primary = targets[0]
     yes_token = next((t for t in primary.tokens if t.outcome.lower() == "yes"), primary.tokens[0])
@@ -131,6 +152,7 @@ def scan_cycle(
     universe_market_count: int,
     universe_refreshed: bool,
     progress_cb: Any | None = None,
+    priority_condition_ids: set[str] | None = None,
 ) -> list[ArbOpportunity]:
     """Sweep the hot pool for T0 (binary + multi-outcome) arbitrage.
 
@@ -138,6 +160,15 @@ def scan_cycle(
     "phase" segments (`scanning_books`, `scanning_events`) plus a
     throttled per-25-markets pulse so the UI shows progress without
     drowning the main loop in callback overhead.
+
+    ``priority_condition_ids`` (P0-dirty): markets whose books were
+    just touched by a WS delta. When provided we reorder the iteration
+    so these are scanned *first* inside the cycle — same total work,
+    but if the cycle is mid-flight when a delta arrives the dirty
+    market won't sit at the tail of a 150-market loop. The cold tail
+    still runs because periodic full sweeps catch markets whose
+    books happen not to move between cycles (e.g. low-volume events
+    that briefly cross into profit because of fee changes).
 
     Sorted by `net_edge` descending so the orchestrator's downstream
     capital-allocation step always sees the best opportunity first.
@@ -155,15 +186,16 @@ def scan_cycle(
             universe_refreshed=universe_refreshed,
         )
 
-    for idx, market in enumerate(candidate_markets, start=1):
+    ordered_markets = _prioritize_dirty(candidate_markets, priority_condition_ids)
+    for idx, market in enumerate(ordered_markets, start=1):
         if len(market.tokens) == 2:
             opp = detector.scan_binary_market(market)
             if opp is not None and opp.is_profitable:
                 opportunities.append(opp)
-        if progress_cb is not None and (idx == 1 or idx % 25 == 0 or idx == len(candidate_markets)):
+        if progress_cb is not None and (idx == 1 or idx % 25 == 0 or idx == len(ordered_markets)):
             progress_cb(
                 phase="scanning_books",
-                scanned_markets=len(candidate_markets),
+                scanned_markets=len(ordered_markets),
                 scanned_orderbooks=idx,
                 universe_markets=universe_market_count,
                 universe_refreshed=universe_refreshed,
@@ -173,13 +205,14 @@ def scan_cycle(
     if progress_cb is not None:
         progress_cb(
             phase="scanning_events",
-            scanned_markets=len(candidate_markets),
+            scanned_markets=len(ordered_markets),
             scanned_events=len(candidate_events),
             universe_markets=universe_market_count,
             universe_refreshed=universe_refreshed,
             opportunities_found=len(opportunities),
         )
-    for event in candidate_events:
+    ordered_events = _prioritize_dirty_events(candidate_events, priority_condition_ids)
+    for event in ordered_events:
         if len(event.markets) >= 2:
             opp = detector.scan_multi_outcome_event(event)
             if opp is not None and opp.is_profitable:
@@ -187,6 +220,36 @@ def scan_cycle(
 
     opportunities.sort(key=lambda o: o.net_edge, reverse=True)
     return opportunities
+
+
+def _prioritize_dirty(
+    markets: list[MarketInfo],
+    priority: set[str] | None,
+) -> list[MarketInfo]:
+    """Return ``markets`` with priority condition_ids first; stable order otherwise."""
+    if not priority:
+        return markets
+    dirty: list[MarketInfo] = []
+    cold: list[MarketInfo] = []
+    for m in markets:
+        (dirty if m.condition_id in priority else cold).append(m)
+    return dirty + cold
+
+
+def _prioritize_dirty_events(
+    events: list[Any],
+    priority: set[str] | None,
+) -> list[Any]:
+    if not priority:
+        return events
+    dirty: list[Any] = []
+    cold: list[Any] = []
+    for event in events:
+        if any(m.condition_id in priority for m in event.markets):
+            dirty.append(event)
+        else:
+            cold.append(event)
+    return dirty + cold
 
 
 def find_pending_signal(

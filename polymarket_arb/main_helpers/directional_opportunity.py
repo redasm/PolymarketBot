@@ -102,10 +102,24 @@ def build_directional_opportunity_from_signal(
             )
             return None, 0.0, "recent_exit_cooldown"
 
+    if len(market.tokens) < 2:
+        set_signal_execution_check(signal, reason="non_binary_market", action=action)
+        return None, 0.0, "non_binary_market"
+
+    yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
+    no_token = next((t for t in market.tokens if (t.outcome or "").lower() == "no"), market.tokens[-1])
+    target_token = yes_token if action == "BUY_YES" else no_token
+    outcome_label = "Yes" if action == "BUY_YES" else "No"
+
     if not config.dry_run and hasattr(ob_analyzer, "feed_health"):
+        # Scope the staleness check to *this signal's* tokens. Without
+        # scoping, a single idle hot-pool token whose mirror hasn't been
+        # pushed in a few seconds would mark the entire feed unhealthy
+        # and block every T2 signal in the system.
         health = ob_analyzer.feed_health(
             max_snapshot_age_sec=config.live_max_orderbook_snapshot_age_sec,
             min_ws_hit_ratio=config.live_min_ws_hit_ratio,
+            token_ids=[yes_token.token_id, no_token.token_id],
         )
         if not bool(health.get("healthy", False)):
             set_signal_execution_check(
@@ -115,15 +129,6 @@ def build_directional_opportunity_from_signal(
                 feed_health_reason=health.get("reason", ""),
             )
             return None, 0.0, "orderbook_feed_unhealthy"
-
-    if len(market.tokens) < 2:
-        set_signal_execution_check(signal, reason="non_binary_market", action=action)
-        return None, 0.0, "non_binary_market"
-
-    yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
-    no_token = next((t for t in market.tokens if (t.outcome or "").lower() == "no"), market.tokens[-1])
-    target_token = yes_token if action == "BUY_YES" else no_token
-    outcome_label = "Yes" if action == "BUY_YES" else "No"
 
     snap = ob_analyzer.get_snapshot(target_token.token_id)
     if snap is None or snap.best_ask is None or snap.best_ask <= 0:

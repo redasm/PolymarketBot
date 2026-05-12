@@ -45,11 +45,18 @@ def build_dashboard_cycle_payload(
 ) -> dict[str, Any]:
     """Build the `dash_state.update(**payload)` kwargs for one cycle.
 
-    `counters` carries the seven per-cycle running totals:
-    `total_theoretical_opportunities`, `total_live_successes`,
-    `total_simulated_successes`, `total_live_submissions`,
-    `total_simulated_submissions`, `total_live_expected_profit`,
-    `total_simulated_expected_profit`.
+    `counters` carries the per-cycle running totals:
+    `total_theoretical_opportunities` (mixed T0+directional, legacy),
+    `total_t0_opportunities`, `total_directional_signals`,
+    `total_live_successes`, `total_simulated_successes`,
+    `total_live_submissions`, `total_simulated_submissions`,
+    `total_live_expected_profit`, `total_simulated_expected_profit`.
+
+    The dashboard's headline `arbs_found` field reflects T0 structural
+    arbs only (consistent with `progress_cb` and the operator-facing
+    state-line log). The mixed value is still preserved under
+    `execution_summary.theoretical_opportunities` for backward
+    compatibility, alongside the new explicit splits.
 
     `risk_state` is `risk_mgr.state` (a `RiskState` dataclass) — passed
     in by the caller after `risk_mgr.state` is read once so the
@@ -60,9 +67,16 @@ def build_dashboard_cycle_payload(
     # Pick the broader market list for catalog/overlay so the dashboard
     # shows everything the orchestrator can act on, not just the hot pool.
     catalog_markets = universe_markets if universe_markets else scanned_markets
+    # T0-only headline. Fall back to the legacy mixed counter if the
+    # caller hasn't supplied the explicit split yet — keeps older test
+    # fixtures + any out-of-tree caller working without a hard crash.
+    t0_total = counters.get(
+        "total_t0_opportunities", counters["total_theoretical_opportunities"]
+    )
+    directional_total = counters.get("total_directional_signals", 0)
     return {
         "cycle_count": cycle,
-        "arbs_found": counters["total_theoretical_opportunities"],
+        "arbs_found": t0_total,
         "arbs_executed": counters["total_live_successes"],
         "markets_scanned": len(scanned_markets),
         "universe_status": {
@@ -103,6 +117,8 @@ def build_dashboard_cycle_payload(
         "strategy_status": orchestrator.get_status(),
         "execution_summary": {
             "theoretical_opportunities": counters["total_theoretical_opportunities"],
+            "t0_opportunities": t0_total,
+            "directional_signals": directional_total,
             "live_successes": counters["total_live_successes"],
             "simulated_successes": counters["total_simulated_successes"],
             "live_submissions": counters["total_live_submissions"],

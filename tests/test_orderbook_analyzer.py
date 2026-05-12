@@ -359,3 +359,171 @@ def test_batch_get_snapshots_counts_logical_requests_once_per_token():
     stats = analyzer.snapshot_stats()
     assert stats["requests"] == 3
     assert stats["rest_fallback"] == 1
+
+
+def test_feed_health_token_scope_ignores_unrelated_stale_mirror():
+    """P0-2: a stale mirror token outside the scope must not fail health."""
+    now = time.time()
+    fresh = OrderBookSnapshot(
+        token_id="fresh-token",
+        best_bid=0.40,
+        best_ask=0.42,
+        bids=[OrderBookLevel(0.40, 10)],
+        asks=[OrderBookLevel(0.42, 12)],
+        timestamp=now - 0.5,
+    )
+    stale = OrderBookSnapshot(
+        token_id="stale-token",
+        best_bid=0.60,
+        best_ask=0.62,
+        bids=[OrderBookLevel(0.60, 5)],
+        asks=[OrderBookLevel(0.62, 5)],
+        timestamp=now - 60.0,
+    )
+
+    class _Mirror:
+        def __init__(self, snapshots):
+            self._snapshots = snapshots
+
+        def get_all(self):
+            return self._snapshots
+
+    analyzer = OrderBookAnalyzer(
+        _Client(),
+        snapshot_ttl_sec=60.0,
+        live_mirror=_Mirror({"fresh-token": fresh, "stale-token": stale}),
+    )
+
+    scoped = analyzer.feed_health(
+        max_snapshot_age_sec=5.0,
+        min_ws_hit_ratio=0.0,
+        token_ids=["fresh-token"],
+    )
+    assert scoped["healthy"] is True
+
+    global_health = analyzer.feed_health(
+        max_snapshot_age_sec=5.0,
+        min_ws_hit_ratio=0.0,
+    )
+    assert global_health["healthy"] is False
+    assert global_health["reason"] == "stale_ws_snapshot"
+
+
+def test_feed_health_token_scope_catches_target_stale():
+    """The opposite: scoping to a stale token still fails health."""
+    now = time.time()
+    stale = OrderBookSnapshot(
+        token_id="target-token",
+        best_bid=0.60,
+        best_ask=0.62,
+        bids=[OrderBookLevel(0.60, 5)],
+        asks=[OrderBookLevel(0.62, 5)],
+        timestamp=now - 60.0,
+    )
+
+    class _Mirror:
+        def __init__(self, snapshots):
+            self._snapshots = snapshots
+
+        def get_all(self):
+            return self._snapshots
+
+    analyzer = OrderBookAnalyzer(
+        _Client(),
+        snapshot_ttl_sec=60.0,
+        live_mirror=_Mirror({"target-token": stale}),
+    )
+
+    health = analyzer.feed_health(
+        max_snapshot_age_sec=5.0,
+        min_ws_hit_ratio=0.0,
+        token_ids=["target-token"],
+    )
+    assert health["healthy"] is False
+    assert health["reason"] == "stale_ws_snapshot"
+
+
+def test_feed_health_global_caches_within_ttl():
+    """Global-path feed_health() must reuse the cached verdict
+    within ``_feed_health_cache_ttl_sec`` so the WS mirror's
+    ``get_all`` lock isn't hit on every redundant call.
+    """
+    now = time.time()
+    fresh = OrderBookSnapshot(
+        token_id="t",
+        best_bid=0.5,
+        best_ask=0.51,
+        bids=[OrderBookLevel(0.5, 5)],
+        asks=[OrderBookLevel(0.51, 5)],
+        timestamp=now,
+    )
+
+    class _CountingMirror:
+        def __init__(self, snap):
+            self._snap = {"t": snap}
+            self.get_all_calls = 0
+
+        def get_all(self):
+            self.get_all_calls += 1
+            return self._snap
+
+    mirror = _CountingMirror(fresh)
+    analyzer = OrderBookAnalyzer(
+        _Client(),
+        snapshot_ttl_sec=60.0,
+        live_mirror=mirror,
+        feed_health_cache_ttl_sec=0.5,
+    )
+
+    first = analyzer.feed_health(max_snapshot_age_sec=5.0, min_ws_hit_ratio=0.0)
+    second = analyzer.feed_health(max_snapshot_age_sec=5.0, min_ws_hit_ratio=0.0)
+    assert first["healthy"] is True
+    assert second["healthy"] is True
+    assert mirror.get_all_calls == 1  # second call served from cache
+
+    # Token-scoped paths must bypass the cache because the scope
+    # changes between call sites — a healthy global verdict isn't
+    # a guarantee that the token-scoped check is healthy.
+    scoped = analyzer.feed_health(
+        max_snapshot_age_sec=5.0,
+        min_ws_hit_ratio=0.0,
+        token_ids=["t"],
+    )
+    assert scoped["healthy"] is True
+    assert mirror.get_all_calls == 2
+
+
+def test_feed_health_cache_expires_after_ttl():
+    """Past the TTL the cache must be rebuilt — otherwise a stale
+    book that lands after the cached verdict would be invisible.
+    """
+    now = time.time()
+    fresh = OrderBookSnapshot(
+        token_id="t",
+        best_bid=0.5,
+        best_ask=0.51,
+        bids=[OrderBookLevel(0.5, 5)],
+        asks=[OrderBookLevel(0.51, 5)],
+        timestamp=now,
+    )
+
+    class _Mirror:
+        def __init__(self, snap):
+            self._snap = {"t": snap}
+            self.get_all_calls = 0
+
+        def get_all(self):
+            self.get_all_calls += 1
+            return self._snap
+
+    mirror = _Mirror(fresh)
+    analyzer = OrderBookAnalyzer(
+        _Client(),
+        snapshot_ttl_sec=60.0,
+        live_mirror=mirror,
+        feed_health_cache_ttl_sec=0.05,
+    )
+    analyzer.feed_health(max_snapshot_age_sec=5.0, min_ws_hit_ratio=0.0)
+    time.sleep(0.08)
+    analyzer.feed_health(max_snapshot_age_sec=5.0, min_ws_hit_ratio=0.0)
+    assert mirror.get_all_calls == 2

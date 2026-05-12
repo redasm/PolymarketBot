@@ -73,6 +73,16 @@ class RiskManager:
             self._reconcile_pending_reservations()
             return _snapshot_risk_state(self._state)
 
+    @property
+    def halt_time(self) -> float | None:
+        """UTC epoch seconds when the circuit breaker most recently tripped.
+
+        ``None`` when the bot is not halted. Read-only — exposed so callers
+        (e.g. the notifier) can render an auto-recovery countdown without
+        reaching into private state.
+        """
+        return self._halt_time
+
     def pre_trade_check(self, opp: ArbOpportunity, proposed_size: float) -> tuple[bool, str, float]:
         """交易前风控检查.
 

@@ -144,11 +144,17 @@ class MakerStrategy:
         default_size: float = 10.0,
         max_inventory: float = 100.0,
         reward_delta: float = 0.0,
+        flow_inventory_weight: float = 0.5,
     ):
         self._spread_calc = spread_calc or DynamicSpreadCalculator()
         self._default_size = default_size
         self._max_inventory = max_inventory
         self._reward_delta = reward_delta
+        # How much aggregated taker flow counts as "synthetic inventory"
+        # when steering quotes. 0.0 disables flow bias entirely (legacy
+        # behaviour); 1.0 lets a fully one-sided market move the quote
+        # the same amount as having a fully-loaded inventory book.
+        self._flow_inventory_weight = max(0.0, float(flow_inventory_weight))
         self._inventory: dict[str, float] = {}
 
     def compute_quote(
@@ -160,6 +166,7 @@ class MakerStrategy:
         *,
         mid_price: Optional[float] = None,
         reward_delta: Optional[float] = None,
+        flow_bias_yes_share: Optional[float] = None,
     ) -> Optional[QuoteUpdate]:
         """计算做市报价.
 
@@ -170,13 +177,40 @@ class MakerStrategy:
             tick_size: 最小价格变动
             mid_price: 订单簿中间价（用于锚定）
             reward_delta: 激励半宽（挂在此范围内获得奖励）
+            flow_bias_yes_share: share-weighted taker_yes_share over the
+                active flow window (0.0–1.0; 0.5 = neutral). When ``>0.5``
+                takers are mostly buying YES — i.e. they want to be
+                served *out of my YES ask*. That's the side where I
+                expect to keep getting filled, so I want:
+                  • more ask depth (bigger ask_size), and
+                  • a tighter bid so I don't accidentally absorb the
+                    illiquid NO-buy side.
+                Both effects fall out for free if I drive the existing
+                inventory-skew math with a synthetic +LONG signal,
+                because `compute_spread` already widens the bid on a
+                LONG book and the size-skew block already grows the
+                ask on positive inventory. ``None`` disables the
+                signal entirely (legacy behaviour).
         """
         if fair_value <= 0 or fair_value >= 1:
             return None
 
         inv = self._inventory.get(token_id, 0.0)
+        effective_inv = inv
+        if (
+            flow_bias_yes_share is not None
+            and self._flow_inventory_weight > 0
+            and self._max_inventory > 0
+        ):
+            # Map taker_yes_share [0,1] → bias_signed [-1,+1].
+            # YES-lean (>0.5) feeds a positive synthetic inventory,
+            # which steers spread + size exactly like "preparing to
+            # serve the YES-buy side"; NO-lean does the mirror.
+            bias_signed = (float(flow_bias_yes_share) - 0.5) * 2.0
+            flow_synth_inv = bias_signed * self._max_inventory * self._flow_inventory_weight
+            effective_inv = inv + flow_synth_inv
         bid_off, ask_off = self._spread_calc.compute_spread(
-            token_id, tick_size, inventory=inv
+            token_id, tick_size, inventory=effective_inv
         )
 
         raw_bid = fair_value - bid_off
@@ -204,11 +238,17 @@ class MakerStrategy:
 
         bid_sz = self._default_size
         ask_sz = self._default_size
-        if inv > 0:
-            ask_sz = min(self._default_size * 1.5, self._default_size + inv * 0.5)
-        elif inv < 0:
-            bid_sz = min(self._default_size * 1.5, self._default_size + abs(inv) * 0.5)
+        # Size skew also uses `effective_inv` so flow bias contributes
+        # to "post bigger on the side we want filled, smaller on the
+        # side that's being adversely selected".
+        if effective_inv > 0:
+            ask_sz = min(self._default_size * 1.5, self._default_size + effective_inv * 0.5)
+        elif effective_inv < 0:
+            bid_sz = min(self._default_size * 1.5, self._default_size + abs(effective_inv) * 0.5)
 
+        # The hard inventory cap still uses *real* inventory only — we
+        # never want flow alone to force the bot to stop posting on one
+        # side, only real on-book positions earn that.
         if abs(inv) >= self._max_inventory:
             if inv > 0:
                 bid_price = None
