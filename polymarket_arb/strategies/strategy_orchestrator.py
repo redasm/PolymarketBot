@@ -48,6 +48,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+import uuid
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from typing import Any, Optional
@@ -56,6 +57,10 @@ from polymarket_arb.strategies.signal_policies import TailRiskClassifier
 from research_signal.normalizers.topic import topic_overlap_score
 
 LOG = logging.getLogger(__name__)
+
+
+def _new_signal_id() -> str:
+    return f"sig-{uuid.uuid4().hex[:12]}"
 
 
 class StrategyTier(IntEnum):
@@ -91,6 +96,7 @@ class StrategySignal:
     urgency: float = 1.0  # 0-1, 结构性套利=1.0（立即执行）, 做市=0.3
     payload: dict = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
+    signal_id: str = ""
 
 
 class StrategyOrchestrator:
@@ -169,6 +175,8 @@ class StrategyOrchestrator:
             self._record_process_skip(signal, "per_market_rate_cap")
             self._log_rate_cap_skip(signal)
             return False
+        if not signal.signal_id:
+            signal.signal_id = _new_signal_id()
         signal_copy = replace(signal, payload=dict(signal.payload))
         overlay = self._apply_research_overlay(
             signal_copy,

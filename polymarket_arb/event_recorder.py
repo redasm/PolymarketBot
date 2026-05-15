@@ -6,11 +6,16 @@ import json
 import logging
 import queue
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 LOG = logging.getLogger(__name__)
+
+
+DEFAULT_SCHEMA_VERSION = 2
+_OVERFLOW_LOG_INTERVAL_SEC = 10.0
 
 
 # Poison pill: a tuple whose first element is None signals the writer
@@ -63,6 +68,8 @@ class EventRecorder:
         self._bytes_written: dict[str, int] = {}
         self._event_count = 0
         self._dropped_events = 0
+        self._last_overflow_log_ts = 0.0
+        self._last_overflow_log_dropped = 0
 
         self._async_write = bool(async_write and enabled)
         self._queue: queue.Queue[tuple[str | None, bytes | None]] | None = None
@@ -105,9 +112,14 @@ class EventRecorder:
             safe_payload.setdefault("payload_ts", safe_payload.pop("ts"))
         if "category" in safe_payload:
             safe_payload.setdefault("payload_category", safe_payload.pop("category"))
+        try:
+            schema_version = int(safe_payload.pop("schema_version", DEFAULT_SCHEMA_VERSION))
+        except (TypeError, ValueError):
+            schema_version = DEFAULT_SCHEMA_VERSION
         record = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "category": category,
+            "schema_version": schema_version,
             **safe_payload,
         }
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -132,6 +144,7 @@ class EventRecorder:
                 except queue.Full:
                     # Should be impossible but stay safe.
                     self._dropped_events += 1
+                self._log_overflow_if_due(category)
                 return
 
         self._write_sync(category, encoded, flush=True)
@@ -163,6 +176,23 @@ class EventRecorder:
                 LOG.warning("event_recorder writer error: %s", exc)
             finally:
                 self._queue.task_done()
+
+    def _log_overflow_if_due(self, category: str) -> None:
+        now = time.monotonic()
+        if (
+            self._last_overflow_log_ts
+            and now - self._last_overflow_log_ts < _OVERFLOW_LOG_INTERVAL_SEC
+        ):
+            return
+        dropped_since_last = self._dropped_events - self._last_overflow_log_dropped
+        self._last_overflow_log_ts = now
+        self._last_overflow_log_dropped = self._dropped_events
+        LOG.warning(
+            "event_recorder queue overflow: category=%s dropped_events=%d dropped_since_last=%d",
+            category,
+            self._dropped_events,
+            dropped_since_last,
+        )
 
     def _flush_all(self) -> None:
         with self._lock:

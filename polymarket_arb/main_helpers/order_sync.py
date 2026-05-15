@@ -24,7 +24,9 @@ import time
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.event_recorder import EventRecorder
 from polymarket_arb.execution_engine import ExecutionEngine
+from polymarket_arb.main_helpers.maker_fill_notifications import handle_observed_maker_fills
 from polymarket_arb.main_helpers.signal_helpers import apply_maker_fill_to_inventory
+from polymarket_arb.notifier import NotificationManager
 from polymarket_arb.risk_manager import RiskManager
 from polymarket_arb.strategies.maker_strategy import MakerStrategy
 
@@ -37,6 +39,7 @@ def sync_live_order_statuses(
     risk_mgr: RiskManager,
     maker_strategy: MakerStrategy,
     event_recorder: EventRecorder,
+    notifier: NotificationManager | None = None,
 ) -> None:
     """Poll the venue for pending order statuses and apply fills.
 
@@ -61,6 +64,16 @@ def sync_live_order_statuses(
                 trade.trade_id: apply_maker_fill_to_inventory(maker_strategy, trade)
                 for trade in order_sync.changed
             }
+            handle_observed_maker_fills(
+                trades=order_sync.changed,
+                maker_strategy=maker_strategy,
+                notifier=notifier,
+                event_recorder=event_recorder,
+                simulated=False,
+                event_name="live_maker_fill_observed",
+                apply_inventory=False,
+                inventory_deltas=inventory_deltas,
+            )
         if event_recorder.is_enabled and order_sync.changed:
             for trade in order_sync.changed:
                 event_recorder.write_event("risk_events", {

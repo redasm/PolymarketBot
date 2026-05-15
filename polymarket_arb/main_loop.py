@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+from collections import deque
 import json
 import logging
 import os
@@ -49,6 +50,15 @@ from polymarket_arb.main_helpers.flow_aggregator import FlowAggregator, FlowInge
 from polymarket_arb.main_helpers.order_sync import (
     cancel_stale_maker_orders as _cancel_stale_maker_orders,
     sync_live_order_statuses as _sync_live_order_statuses,
+)
+from polymarket_arb.main_helpers.maker_fill_notifications import (
+    handle_observed_maker_fills as _handle_observed_maker_fills,
+)
+from polymarket_arb.main_helpers.strategy_telemetry import (
+    build_run_config_event as _build_run_config_event,
+    ensure_signal_id as _ensure_signal_id,
+    normalize_skip_reason_counts as _normalize_skip_reason_counts,
+    structured_skip_reason as _structured_skip_reason,
 )
 from polymarket_arb.main_helpers.directional_opportunity import (
     build_directional_opportunity_from_signal as _build_directional_opportunity_from_signal,
@@ -95,6 +105,9 @@ from polymarket_arb.main_helpers.signal_helpers import (
 from polymarket_arb.main_helpers.signal_telemetry import StrategySignalTelemetryCompressor
 from polymarket_arb.main_helpers.virtual_fill_emitter import (
     VirtualFillEmitter as _VirtualFillEmitter,
+)
+from polymarket_arb.main_helpers.shadow_position_lifecycle import (
+    ShadowPositionLifecycle as _ShadowPositionLifecycle,
 )
 from polymarket_arb.main_helpers.strategy_execution import (
     ExecutionDelta,
@@ -159,11 +172,31 @@ LOG = logging.getLogger("main_loop")
 
 _SHUTDOWN_EVENT = threading.Event()
 _TELEMETRY_HEARTBEAT_SEC = 60.0
+_LIFETIME_DEDUPE_MAX_KEYS = 100_000
 
 
 def _signal_handler(sig: int, frame: Any) -> None:
     LOG.info("收到信号 %d，准备优雅退出…", sig)
     _SHUTDOWN_EVENT.set()
+
+
+class _BoundedDedupeSet:
+    """Small FIFO-capped membership set for run-level opportunity counters."""
+
+    def __init__(self, max_keys: int) -> None:
+        self._max_keys = max(1, int(max_keys))
+        self._keys: set[tuple[Any, ...]] = set()
+        self._order: deque[tuple[Any, ...]] = deque()
+
+    def add_new(self, key: tuple[Any, ...]) -> bool:
+        if key in self._keys:
+            return False
+        self._keys.add(key)
+        self._order.append(key)
+        while len(self._keys) > self._max_keys:
+            oldest = self._order.popleft()
+            self._keys.discard(oldest)
+        return True
 
 
 def _refresh_portfolio_snapshot(
@@ -242,6 +275,37 @@ def _handle_forced_portfolio_resync(
         event_recorder=event_recorder,
         last_portfolio_sync_ts=last_portfolio_sync_ts,
         forced=True,
+    )
+
+
+def _opportunity_dedupe_key(opp: Any) -> tuple[Any, ...]:
+    markets = tuple(sorted(str(getattr(m, "condition_id", "") or "") for m in getattr(opp, "markets", []) or []))
+    legs = tuple(
+        sorted(
+            (
+                str(getattr(leg, "condition_id", "") or ""),
+                str(getattr(leg, "outcome", "") or ""),
+                str(getattr(getattr(leg, "side", ""), "value", getattr(leg, "side", "")) or ""),
+            )
+            for leg in getattr(opp, "legs", []) or []
+        )
+    )
+    return (
+        str(getattr(opp, "arb_type", "") and getattr(opp.arb_type, "value", opp.arb_type)),
+        str(getattr(opp, "event_id", "") or ""),
+        markets,
+        legs,
+    )
+
+
+def _signal_dedupe_key(signal: StrategySignal) -> tuple[Any, ...]:
+    payload = signal.payload if isinstance(signal.payload, dict) else {}
+    return (
+        signal.tier.name,
+        signal.signal_type,
+        signal.market_id,
+        str(payload.get("category", "") or ""),
+        str(payload.get("direction", "") or ""),
     )
 
 
@@ -336,14 +400,23 @@ def main(dotenv_path: str | None = None) -> None:
         queue_size=config.telemetry_async_queue_size,
     )
     if config.dry_run:
+        shadow_lifecycle = _ShadowPositionLifecycle(
+            event_recorder=event_recorder,
+            book_snapshot_provider=lambda token_id: ob_analyzer.get_snapshot(
+                token_id, allow_rest_fallback=False, count_request=False
+            ),
+        )
         virtual_fill_emitter = _VirtualFillEmitter(
             event_recorder=event_recorder,
             book_snapshot_provider=lambda token_id: ob_analyzer.get_snapshot(
                 token_id, allow_rest_fallback=False, count_request=False
             ),
             taker_fee_rate=config.polymarket_taker_fee_rate,
+            lifecycle=shadow_lifecycle,
         )
         executor.set_virtual_fill_emitter(virtual_fill_emitter)
+    else:
+        shadow_lifecycle = None
     data_janitor = DataJanitor(
         enabled=config.data_cleanup_enabled,
         interval_sec=config.data_cleanup_interval_sec,
@@ -366,6 +439,7 @@ def main(dotenv_path: str | None = None) -> None:
     focus_keywords = _focus_keywords(config.market_focus_keywords)
     if config.telemetry_record_enabled:
         LOG.info("Telemetry 录制已开启: %s", config.telemetry_record_dir)
+        event_recorder.write_event("risk_events", _build_run_config_event(config, run_id=run_id))
         event_recorder.write_event("risk_events", {
             "event": "startup",
             "run_id": run_id,
@@ -481,12 +555,13 @@ def main(dotenv_path: str | None = None) -> None:
     last_telemetry_heartbeat_ts = 0.0
     last_portfolio_sync_ts = 0.0
 
-    dash_state = DashboardState()
-    dash_state.update(
-        is_dry_run=config.dry_run,
-        scan_interval=config.scan_interval_sec,
-    )
-    if config.dashboard_enabled:
+    dashboard_enabled = bool(config.dashboard_enabled)
+    dash_state = DashboardState(enabled=dashboard_enabled)
+    if dashboard_enabled:
+        dash_state.update(
+            is_dry_run=config.dry_run,
+            scan_interval=config.scan_interval_sec,
+        )
         start_dashboard_server(dash_state, port=config.dashboard_port)
         LOG.info("Dashboard 已启动: http://127.0.0.1:%d", config.dashboard_port)
 
@@ -506,6 +581,7 @@ def main(dotenv_path: str | None = None) -> None:
 
     cycle = 0
     total_theoretical_opportunities = 0
+    seen_theoretical_keys = _BoundedDedupeSet(_LIFETIME_DEDUPE_MAX_KEYS)
     total_live_successes = 0
     total_simulated_successes = 0
     total_live_submissions = 0
@@ -518,6 +594,8 @@ def main(dotenv_path: str | None = None) -> None:
     # the detector find today" without grepping signal NDJSON.
     total_t0_opportunities = 0
     total_directional_signals = 0
+    seen_t0_keys = _BoundedDedupeSet(_LIFETIME_DEDUPE_MAX_KEYS)
+    seen_directional_keys = _BoundedDedupeSet(_LIFETIME_DEDUPE_MAX_KEYS)
     consecutive_api_errors = 0
     # Daily counters that roll over at UTC midnight. Lifetime totals above
     # are useful for run-level summaries but operators reading hourly
@@ -526,6 +604,9 @@ def main(dotenv_path: str | None = None) -> None:
     today_live_successes = 0
     today_t0_opportunities = 0
     today_directional_signals = 0
+    today_seen_theoretical_keys: set[tuple[Any, ...]] = set()
+    today_seen_t0_keys: set[tuple[Any, ...]] = set()
+    today_seen_directional_keys: set[tuple[Any, ...]] = set()
     today_utc_date = ""
     signal_telemetry = StrategySignalTelemetryCompressor(cooldown_sec=60.0)
 
@@ -541,6 +622,9 @@ def main(dotenv_path: str | None = None) -> None:
             today_live_successes = 0
             today_t0_opportunities = 0
             today_directional_signals = 0
+            today_seen_theoretical_keys.clear()
+            today_seen_t0_keys.clear()
+            today_seen_directional_keys.clear()
         cycle_timing: dict[str, float] = {
             "universe_refresh_sec": 0.0,
             "candidate_select_sec": 0.0,
@@ -564,25 +648,26 @@ def main(dotenv_path: str | None = None) -> None:
                         **cleanup_stats.to_dict(),
                     })
 
-        dash_state.update(
-            cycle_count=cycle,
-            markets_scanned=0,
-            universe_status={
-                "universe_market_count": len(cached_universe_markets),
-                "hot_market_pool_size": config.hot_market_pool_size,
-                "hot_event_pool_size": config.hot_event_pool_size,
-                "focus_keywords": focus_keywords,
-                "last_universe_refresh_ts": last_universe_refresh_ts or None,
-            },
-            ws_status=_build_ws_status(
-                config=config,
-                enhanced_store=enhanced_store,
-                ws_target_ids=ws_target_ids,
-                phase_hint="initializing",
-            ),
-            book_summary=enhanced_store.get_summary(),
-            volatility=vol_estimator.snapshot(),
-        )
+        if dashboard_enabled:
+            dash_state.update(
+                cycle_count=cycle,
+                markets_scanned=0,
+                universe_status={
+                    "universe_market_count": len(cached_universe_markets),
+                    "hot_market_pool_size": config.hot_market_pool_size,
+                    "hot_event_pool_size": config.hot_event_pool_size,
+                    "focus_keywords": focus_keywords,
+                    "last_universe_refresh_ts": last_universe_refresh_ts or None,
+                },
+                ws_status=_build_ws_status(
+                    config=config,
+                    enhanced_store=enhanced_store,
+                    ws_target_ids=ws_target_ids,
+                    phase_hint="initializing",
+                ),
+                book_summary=enhanced_store.get_summary(),
+                volatility=vol_estimator.snapshot(),
+            )
 
         try:
             phase_start = time.perf_counter()
@@ -665,34 +750,39 @@ def main(dotenv_path: str | None = None) -> None:
                 universe_market_count=len(cached_universe_markets),
                 universe_refreshed=universe_refreshed,
                 priority_condition_ids=priority_dirty,
-                progress_cb=lambda **kwargs: dash_state.update(
-                    markets_scanned=kwargs.get("scanned_markets", 0),
-                    # Dashboard "arbs_found" counter should reflect actual
-                    # T0 structural opportunities, not the mixed
-                    # `total_theoretical_opportunities` that includes
-                    # T2/T3 directional signals.
-                    arbs_found=total_t0_opportunities + kwargs.get("opportunities_found", 0),
-                    ws_status=_build_ws_status(
-                        config=config,
-                        enhanced_store=enhanced_store,
-                        ws_target_ids=ws_target_ids,
-                        phase_hint=kwargs.get("phase", "initializing"),
-                        scanned_orderbooks=kwargs.get("scanned_orderbooks", 0),
-                        scanned_events=kwargs.get("scanned_events", 0),
-                    ),
+                progress_cb=(
+                    (lambda **kwargs: dash_state.update(
+                        markets_scanned=kwargs.get("scanned_markets", 0),
+                        # Dashboard "arbs_found" counter should reflect actual
+                        # T0 structural opportunities, not the mixed
+                        # `total_theoretical_opportunities` that includes
+                        # T2/T3 directional signals.
+                        arbs_found=total_t0_opportunities + kwargs.get("opportunities_found", 0),
+                        ws_status=_build_ws_status(
+                            config=config,
+                            enhanced_store=enhanced_store,
+                            ws_target_ids=ws_target_ids,
+                            phase_hint=kwargs.get("phase", "initializing"),
+                            scanned_orderbooks=kwargs.get("scanned_orderbooks", 0),
+                            scanned_events=kwargs.get("scanned_events", 0),
+                        ),
+                    ))
+                    if dashboard_enabled
+                    else None
                 ),
             )
             cycle_timing["scan_cycle_sec"] += time.perf_counter() - phase_start
             consecutive_api_errors = 0
-            dash_state.update(
-                markets_scanned=len(scanned_markets),
-                ws_status=_build_ws_status(
-                    config=config,
-                    enhanced_store=enhanced_store,
-                    ws_target_ids=ws_target_ids,
-                    phase_hint="scan_complete",
-                ),
-            )
+            if dashboard_enabled:
+                dash_state.update(
+                    markets_scanned=len(scanned_markets),
+                    ws_status=_build_ws_status(
+                        config=config,
+                        enhanced_store=enhanced_store,
+                        ws_target_ids=ws_target_ids,
+                        phase_hint="scan_complete",
+                    ),
+                )
         except Exception as e:
             consecutive_api_errors += 1
             LOG.error("扫描周期 #%d 异常: %s", cycle, e, exc_info=True)
@@ -703,15 +793,16 @@ def main(dotenv_path: str | None = None) -> None:
                 "consecutive_api_errors": consecutive_api_errors,
             })
             dash_state.append_error({"message": str(e), "timestamp": time.time()})
-            dash_state.update(
-                markets_scanned=0,
-                ws_status=_build_ws_status(
-                    config=config,
-                    enhanced_store=enhanced_store,
-                    ws_target_ids=ws_target_ids,
-                    phase_hint="scan_error",
-                ),
-            )
+            if dashboard_enabled:
+                dash_state.update(
+                    markets_scanned=0,
+                    ws_status=_build_ws_status(
+                        config=config,
+                        enhanced_store=enhanced_store,
+                        ws_target_ids=ws_target_ids,
+                        phase_hint="scan_error",
+                    ),
+                )
             _emit_cycle_metrics(
                 event_recorder=event_recorder,
                 ob_analyzer=ob_analyzer,
@@ -772,10 +863,18 @@ def main(dotenv_path: str | None = None) -> None:
                 last_vol_feed_ts = now
 
         if opportunities:
-            total_theoretical_opportunities += len(opportunities)
-            today_theoretical_opportunities += len(opportunities)
-            total_t0_opportunities += len(opportunities)
-            today_t0_opportunities += len(opportunities)
+            for opp in opportunities:
+                opp_key = ("t0",) + _opportunity_dedupe_key(opp)
+                if seen_t0_keys.add_new(opp_key):
+                    total_t0_opportunities += 1
+                if opp_key not in today_seen_t0_keys:
+                    today_seen_t0_keys.add(opp_key)
+                    today_t0_opportunities += 1
+                if seen_theoretical_keys.add_new(opp_key):
+                    total_theoretical_opportunities += 1
+                if opp_key not in today_seen_theoretical_keys:
+                    today_seen_theoretical_keys.add(opp_key)
+                    today_theoretical_opportunities += 1
             LOG.info(
                 "周期 #%d: 发现 %d 个套利机会",
                 cycle,
@@ -877,6 +976,7 @@ def main(dotenv_path: str | None = None) -> None:
 
         active_markets_for_overlay = universe_markets if universe_markets else scanned_markets
         for strategy_signal in strategy_signals:
+            _ensure_signal_id(strategy_signal)
             submitted = orchestrator.submit_signal(
                 strategy_signal,
                 active_markets=active_markets_for_overlay,
@@ -910,6 +1010,32 @@ def main(dotenv_path: str | None = None) -> None:
                     event_recorder.write_event("strategy_signals", compressed_payload)
 
         cycle_timing["strategy_sec"] += time.perf_counter() - phase_start
+        t2_collector_skips = dict(getattr(_collect_statistical_strategy_signals, "last_skip_summary", {}) or {})
+        t3_collector_skips = dict(getattr(_collect_maker_strategy_signals, "last_skip_summary", {}) or {})
+        skip_reason_counts = _normalize_skip_reason_counts(
+            t2_collector_skips,
+            t3_collector_skips,
+        )
+        if event_recorder.is_enabled and (
+            int(t2_collector_skips.get("total", 0) or 0) > 0
+            or int(t3_collector_skips.get("total", 0) or 0) > 0
+        ):
+            event_recorder.write_event("strategy_executions", {
+                "execution_id": "",
+                "signal_id": "",
+                "tier": "AGGREGATE",
+                "signal_type": "collector_skipped",
+                "market_id": "",
+                "status": "skipped",
+                "reason": "collector_filter",
+                "skip_reasons": {
+                    "T2_STATISTICAL": t2_collector_skips,
+                    "T3_MARKET_MAKING": t3_collector_skips,
+                },
+                "skip_reason_counts": skip_reason_counts,
+                "total": int(t2_collector_skips.get("total", 0) or 0)
+                + int(t3_collector_skips.get("total", 0) or 0),
+            })
 
         phase_start = time.perf_counter()
         execution_blocked_by_forced_sync = False
@@ -975,13 +1101,12 @@ def main(dotenv_path: str | None = None) -> None:
         insufficient_balance_skips: dict[str, int] = {}
         insufficient_balance_last_reason: str = ""
         processed_signals = [] if execution_blocked_by_forced_sync else orchestrator.process_signals()
-        total_theoretical_opportunities += len(processed_signals)
-        today_theoretical_opportunities += len(processed_signals)
-        total_directional_signals += len(processed_signals)
-        today_directional_signals += len(processed_signals)
         process_skip_summary = orchestrator.get_last_skip_reasons()
+        skip_reason_counts = _normalize_skip_reason_counts(process_skip_summary, skip_reason_counts)
         if process_skip_summary.get("total") and event_recorder.is_enabled:
             event_recorder.write_event("strategy_executions", {
+                "execution_id": "",
+                "signal_id": "",
                 "tier": "AGGREGATE",
                 "signal_type": "orchestrator_skipped",
                 "market_id": "",
@@ -989,9 +1114,21 @@ def main(dotenv_path: str | None = None) -> None:
                 "reason": "orchestrator_process_filter",
                 "skip_reasons": process_skip_summary.get("reasons", {}),
                 "count_by_tier": process_skip_summary.get("by_tier", {}),
+                "skip_reason_counts": _normalize_skip_reason_counts(process_skip_summary),
                 "total": process_skip_summary.get("total", 0),
             })
         for processed_signal in processed_signals:
+            sig_key = ("signal",) + _signal_dedupe_key(processed_signal)
+            if seen_directional_keys.add_new(sig_key):
+                total_directional_signals += 1
+            if sig_key not in today_seen_directional_keys:
+                today_seen_directional_keys.add(sig_key)
+                today_directional_signals += 1
+            if seen_theoretical_keys.add_new(sig_key):
+                total_theoretical_opportunities += 1
+            if sig_key not in today_seen_theoretical_keys:
+                today_seen_theoretical_keys.add(sig_key)
+                today_theoretical_opportunities += 1
             executed, reason, delta = _execute_strategy_signal(
                 signal=processed_signal,
                 config=config,
@@ -1034,21 +1171,29 @@ def main(dotenv_path: str | None = None) -> None:
                 continue
             if event_recorder.is_enabled:
                 event_recorder.write_event("strategy_executions", {
+                    "execution_id": "",
+                    "signal_id": getattr(processed_signal, "signal_id", ""),
                     "tier": processed_signal.tier.name,
                     "signal_type": processed_signal.signal_type,
                     "market_id": processed_signal.market_id,
                     "status": "skipped",
                     "reason": reason,
+                    **_structured_skip_reason(reason),
                     "execution_check": dict(processed_signal.payload.get("execution_check") or {}),
                 })
         if insufficient_balance_skips and event_recorder.is_enabled:
             event_recorder.write_event("strategy_executions", {
+                "execution_id": "",
+                "signal_id": "",
                 "tier": "AGGREGATE",
                 "signal_type": "insufficient_balance_skipped",
                 "market_id": "",
                 "status": "skipped",
                 "reason": insufficient_balance_last_reason,
                 "count_by_tier": insufficient_balance_skips,
+                "skip_reason_counts": {
+                    "insufficient_balance": sum(insufficient_balance_skips.values()),
+                },
                 "total": sum(insufficient_balance_skips.values()),
             })
         cycle_timing["strategy_execution_sec"] = time.perf_counter() - phase_start
@@ -1100,6 +1245,7 @@ def main(dotenv_path: str | None = None) -> None:
                 risk_mgr=risk_mgr,
                 maker_strategy=maker_strategy,
                 event_recorder=event_recorder,
+                notifier=notifier,
             )
             _cancel_stale_maker_orders(
                 config=config,
@@ -1116,12 +1262,32 @@ def main(dotenv_path: str | None = None) -> None:
             # cache layer the vast majority of the time, since the same
             # token usually had a snapshot fetched earlier in the cycle
             # by scan/signal collection.
-            executor.sweep_simulated_maker_fills(
+            swept_maker_fills = executor.sweep_simulated_maker_fills(
                 lambda token_id: ob_analyzer.get_snapshot(
                     token_id, allow_rest_fallback=True, count_request=False
                 ),
                 fill_latency_sec=config.shadow_maker_fill_latency_sec,
             )
+            observed_maker_fills = _handle_observed_maker_fills(
+                trades=swept_maker_fills,
+                maker_strategy=maker_strategy,
+                notifier=notifier,
+                event_recorder=event_recorder,
+                simulated=True,
+                event_name="shadow_maker_fill_observed",
+            )
+            total_simulated_successes += observed_maker_fills
+
+        risk_s = risk_mgr.state
+        telemetry_risk_state = risk_s
+        shadow_snapshot: dict[str, Any] = {}
+        if config.dry_run and shadow_lifecycle is not None:
+            shadow_snapshot = shadow_lifecycle.snapshot()
+            telemetry_risk_state.daily_pnl = float(shadow_snapshot.get("realized_pnl", telemetry_risk_state.daily_pnl))
+            telemetry_risk_state.unrealized_pnl = float(shadow_snapshot.get("unrealized_pnl", telemetry_risk_state.unrealized_pnl))
+            telemetry_risk_state.total_pnl = float(shadow_snapshot.get("total_pnl", telemetry_risk_state.total_pnl))
+            telemetry_risk_state.current_position_value = float(shadow_snapshot.get("current_position_value", telemetry_risk_state.current_position_value))
+            telemetry_risk_state.open_positions = int(shadow_snapshot.get("open_lots", telemetry_risk_state.open_positions))
 
         if (
             portfolio_sync is not None
@@ -1134,7 +1300,6 @@ def main(dotenv_path: str | None = None) -> None:
                 last_portfolio_sync_ts=last_portfolio_sync_ts,
             )
 
-        risk_s = risk_mgr.state
         vol_snap = vol_estimator.snapshot()
         ws_status = _build_ws_status(
             config=config,
@@ -1142,43 +1307,44 @@ def main(dotenv_path: str | None = None) -> None:
             ws_target_ids=ws_target_ids,
             phase_hint="scan_complete",
         )
-        dash_state.update(**_build_dashboard_cycle_payload(
-            config=config,
-            cycle=cycle,
-            scanned_markets=scanned_markets,
-            universe_markets=universe_markets,
-            cached_universe_markets=cached_universe_markets,
-            event_candidates=event_candidates,
-            focus_keywords=focus_keywords,
-            last_universe_refresh_ts=last_universe_refresh_ts,
-            universe_refreshed=universe_refreshed,
-            risk_state=risk_s,
-            vol_snapshot=vol_snap,
-            edge_decision=edge_decision,
-            enhanced_store=enhanced_store,
-            ws_status=ws_status,
-            orchestrator=orchestrator,
-            research_report=research_report,
-            research_signals=research_signals,
-            research_signal_enabled=research_signal_enabled,
-            counters={
-                "total_theoretical_opportunities": total_theoretical_opportunities,
-                "total_t0_opportunities": total_t0_opportunities,
-                "total_directional_signals": total_directional_signals,
-                "total_live_successes": total_live_successes,
-                "total_simulated_successes": total_simulated_successes,
-                "total_live_submissions": total_live_submissions,
-                "total_simulated_submissions": total_simulated_submissions,
-                "total_live_expected_profit": total_live_expected_profit,
-                "total_simulated_expected_profit": total_simulated_expected_profit,
-            },
-        ))
-        dash_state.append_pnl_point({
-            "timestamp": time.time(),
-            "cumulative_pnl": risk_s.total_pnl,
-            "realized_daily_pnl": risk_s.daily_pnl,
-            "unrealized_pnl": risk_s.unrealized_pnl,
-        })
+        if dashboard_enabled:
+            dash_state.update(**_build_dashboard_cycle_payload(
+                config=config,
+                cycle=cycle,
+                scanned_markets=scanned_markets,
+                universe_markets=universe_markets,
+                cached_universe_markets=cached_universe_markets,
+                event_candidates=event_candidates,
+                focus_keywords=focus_keywords,
+                last_universe_refresh_ts=last_universe_refresh_ts,
+                universe_refreshed=universe_refreshed,
+                risk_state=telemetry_risk_state,
+                vol_snapshot=vol_snap,
+                edge_decision=edge_decision,
+                enhanced_store=enhanced_store,
+                ws_status=ws_status,
+                orchestrator=orchestrator,
+                research_report=research_report,
+                research_signals=research_signals,
+                research_signal_enabled=research_signal_enabled,
+                counters={
+                    "total_theoretical_opportunities": total_theoretical_opportunities,
+                    "total_t0_opportunities": total_t0_opportunities,
+                    "total_directional_signals": total_directional_signals,
+                    "total_live_successes": total_live_successes,
+                    "total_simulated_successes": total_simulated_successes,
+                    "total_live_submissions": total_live_submissions,
+                    "total_simulated_submissions": total_simulated_submissions,
+                    "total_live_expected_profit": total_live_expected_profit,
+                    "total_simulated_expected_profit": total_simulated_expected_profit,
+                },
+            ))
+            dash_state.append_pnl_point({
+                "timestamp": time.time(),
+                "cumulative_pnl": telemetry_risk_state.total_pnl,
+                "realized_daily_pnl": telemetry_risk_state.daily_pnl,
+                "unrealized_pnl": telemetry_risk_state.unrealized_pnl,
+            })
 
         cycle_summary_payload = _emit_cycle_metrics(
             event_recorder=event_recorder,
@@ -1197,12 +1363,12 @@ def main(dotenv_path: str | None = None) -> None:
             simulated_submissions_total=total_simulated_submissions,
             ws_status=ws_status,
             research_count=len(research_signals),
-            daily_pnl=risk_s.daily_pnl,
-            open_positions=risk_s.open_positions,
+            daily_pnl=telemetry_risk_state.daily_pnl,
+            open_positions=telemetry_risk_state.open_positions,
             focus_keywords=focus_keywords,
-            unrealized_pnl=risk_s.unrealized_pnl,
-            total_pnl=risk_s.total_pnl,
-            current_position_value=risk_s.current_position_value,
+            unrealized_pnl=telemetry_risk_state.unrealized_pnl,
+            total_pnl=telemetry_risk_state.total_pnl,
+            current_position_value=telemetry_risk_state.current_position_value,
             cycle_status="ok",
             theoretical_opportunities_today=today_theoretical_opportunities,
             live_successes_today=today_live_successes,
@@ -1210,6 +1376,7 @@ def main(dotenv_path: str | None = None) -> None:
             t0_opportunities_today=today_t0_opportunities,
             directional_signals_total=total_directional_signals,
             directional_signals_today=today_directional_signals,
+            skip_reason_counts=skip_reason_counts,
         )
 
         now_ts = time.time()
@@ -1219,17 +1386,17 @@ def main(dotenv_path: str | None = None) -> None:
 
         wallet_usdc = executor.get_available_collateral_balance(use_cache=True)
         notifier.observe_cycle(
-            daily_pnl=risk_s.daily_pnl,
-            open_positions=risk_s.open_positions,
-            total_exposure=risk_s.total_exposure,
-            is_halted=risk_s.is_halted,
-            halt_reason=risk_s.halt_reason,
+            daily_pnl=telemetry_risk_state.daily_pnl,
+            open_positions=telemetry_risk_state.open_positions,
+            total_exposure=telemetry_risk_state.total_exposure,
+            is_halted=telemetry_risk_state.is_halted,
+            halt_reason=telemetry_risk_state.halt_reason,
             wallet_usdc=wallet_usdc,
             now_ts=now_ts,
         )
-        if risk_s.is_halted and risk_s.halt_reason:
+        if telemetry_risk_state.is_halted and telemetry_risk_state.halt_reason:
             halt_context: list[str] = [
-                f"连续失败: {risk_s.consecutive_failures}/{config.max_consecutive_failures}",
+                f"连续失败: {telemetry_risk_state.consecutive_failures}/{config.max_consecutive_failures}",
             ]
             halt_started = risk_mgr.halt_time
             recover_window = float(config.risk_halt_auto_recover_sec)
@@ -1242,13 +1409,13 @@ def main(dotenv_path: str | None = None) -> None:
             elif recover_window <= 0:
                 halt_context.append("自动恢复: 已禁用 — 需手动 reset_circuit_breaker")
             notifier.notify_fatal_error(
-                f"风控已熔断\n原因: {risk_s.halt_reason}",
-                error_key=f"risk_halt:{risk_s.halt_reason}",
+                f"风控已熔断\n原因: {telemetry_risk_state.halt_reason}",
+                error_key=f"risk_halt:{telemetry_risk_state.halt_reason}",
                 context_lines=halt_context,
                 now_ts=now_ts,
             )
         notifier.maybe_notify_pnl_alert(
-            daily_pnl=risk_s.daily_pnl,
+            daily_pnl=telemetry_risk_state.daily_pnl,
             now_ts=now_ts,
         )
         notifier.maybe_notify_daily_summary(now_ts=now_ts)
@@ -1317,7 +1484,8 @@ def main(dotenv_path: str | None = None) -> None:
     event_recorder.close()
     if flow_aggregator is not None:
         flow_aggregator.close()
-    dash_state.update(is_running=False)
+    if dashboard_enabled:
+        dash_state.update(is_running=False)
     LOG.info(
         "机器人已停止: run_id=%s。总计: %d 周期, T0机会=%d, 定向信号=%d, 真实成交=%d, 模拟成交=%d, 挂单提交(真/模)=%d/%d",
         run_id,

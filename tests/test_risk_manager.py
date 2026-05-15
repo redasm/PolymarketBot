@@ -333,6 +333,25 @@ def test_event_cooldown_uses_configured_duration(monkeypatch):
     assert reason == ""
 
 
+def test_pre_trade_check_exposes_structured_reject_context(monkeypatch):
+    base_time = 1_000.0
+    monkeypatch.setattr(risk_manager_module.time, "time", lambda: base_time)
+    mgr = RiskManager(make_test_config(risk_event_cooldown_sec=60.0))
+    opp = _make_opp()
+    mgr.record_execution(
+        opp,
+        [TradeRecord("t1", "a1", "yes", "c1", OrderSide.BUY, 0.45, 5, status=TradeStatus.PENDING, economic_cost=0.45)],
+    )
+
+    monkeypatch.setattr(risk_manager_module.time, "time", lambda: base_time + 1.0)
+    can_trade, reason, _ = mgr.pre_trade_check(opp, 1)
+
+    assert can_trade is False
+    assert "已执行过套利" in reason
+    assert mgr.last_reject["reason_code"] == "event_cooldown"
+    assert mgr.last_reject["reason_context"]["event_id"] == "e1"
+
+
 def test_pending_reservation_ttl_uses_configured_duration(monkeypatch):
     base_time = 1_000.0
     monkeypatch.setattr(risk_manager_module.time, "time", lambda: base_time)

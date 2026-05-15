@@ -193,6 +193,11 @@ class TradeRecord:
     post_only: bool = False
     order_type_name: Optional[str] = None
     inventory_accounted_size: float = 0.0
+    notification_accounted_size: float = 0.0
+    expected_edge_per_share: float = 0.0
+    event_title: str = ""
+    signal_id: str = ""
+    execution_id: str = ""
 
 
 @dataclass

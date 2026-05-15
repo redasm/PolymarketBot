@@ -28,6 +28,7 @@ Rejection reasons (stable identifiers — telemetry consumers count them):
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 
 from polymarket_arb.config import ArbConfig
@@ -200,6 +201,10 @@ def build_directional_opportunity_from_signal(
         float(execution_price)
     )
     net_edge = gross_edge - fee_estimate
+    snap_mid = getattr(snap, "mid", None)
+    snap_spread = getattr(snap, "spread", None)
+    snap_ts = float(getattr(snap, "timestamp", 0.0) or 0.0)
+    snapshot_age_sec = max(0.0, time.time() - snap_ts) if snap_ts > 0 else None
     check_payload = {
         "action": action,
         "token_id": target_token.token_id[:20],
@@ -207,6 +212,19 @@ def build_directional_opportunity_from_signal(
         "target_size": target_size,
         "fillable_size": float(fillable_size),
         "best_ask": float(snap.best_ask),
+        "best_bid": float(snap.best_bid) if snap.best_bid is not None else None,
+        "mid": float(snap_mid) if snap_mid is not None else None,
+        "spread": float(snap_spread) if snap_spread is not None else None,
+        "spread_bps": (
+            (float(snap_spread) / float(snap_mid)) * 10_000.0
+            if snap_spread is not None and snap_mid is not None and float(snap_mid) > 0
+            else None
+        ),
+        "snapshot_age_sec": snapshot_age_sec,
+        "book_depth_top3": {
+            "bids": [[float(level.price), float(level.size)] for level in snap.bids[:3]],
+            "asks": [[float(level.price), float(level.size)] for level in snap.asks[:3]],
+        },
         "execution_price": float(execution_price),
         "gross_edge": gross_edge,
         "fee_estimate": fee_estimate,

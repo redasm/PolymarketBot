@@ -237,8 +237,10 @@ def test_serialize_strategy_signal_round_trip():
         recommended_size_usdc=50.0,
         urgency=0.3,
         payload={"hint": "ok"},
+        signal_id="sig-test",
     )
     payload = serialize_strategy_signal(signal, submitted=True, research_overlay={"r": 1})
+    assert payload["signal_id"] == "sig-test"
     assert payload["tier"] == "STATISTICAL_ARB"
     assert payload["submitted"] is True
     assert payload["research_overlay"] == {"r": 1}

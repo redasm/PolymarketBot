@@ -556,15 +556,15 @@ tmux kill-session -t arb
 tmux new -s arb
 ```
 
-### 远程访问 Dashboard（SSH 端口转发）
+### 远程访问 Dashboard（可选）
 
-机器人默认只在服务器本机监听 dashboard：
+Dashboard 现在默认关闭；如果你显式开启它，它也只会在服务器本机监听：
 
 ```bash
 http://127.0.0.1:8077
 ```
 
-推荐在**本地电脑**执行 SSH 端口转发，而不是把 dashboard 暴露到公网：
+如果你要看它，推荐在**本地电脑**执行 SSH 端口转发，而不是把 dashboard 暴露到公网：
 
 ```bash
 ssh -N -L 18077:127.0.0.1:8077 -i /path/to/your_key.pem root@your_server_ip

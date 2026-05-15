@@ -9,7 +9,16 @@ import types
 import pytest
 
 from polymarket_arb.execution_engine import ExecutionEngine, OrderSubmissionResult
-from polymarket_arb.models import ArbLeg, ArbOpportunity, ArbType, OrderSide, TradeRecord, TradeStatus
+from polymarket_arb.models import (
+    ArbLeg,
+    ArbOpportunity,
+    ArbType,
+    OrderBookLevel,
+    OrderBookSnapshot,
+    OrderSide,
+    TradeRecord,
+    TradeStatus,
+)
 
 from tests.conftest import make_test_config
 
@@ -379,6 +388,54 @@ def test_submit_limit_order_dry_run_post_only_stays_pending():
 
     assert trade.simulated is True
     assert trade.status == TradeStatus.PENDING
+
+
+def test_dry_run_post_only_fill_keeps_virtual_context():
+    class _Emitter:
+        def __init__(self):
+            self.rows = []
+
+        def record_fill(self, trade, **kwargs):
+            self.rows.append((trade, kwargs))
+
+    engine = ExecutionEngine(make_test_config(dry_run=True), _FakeClient())
+    emitter = _Emitter()
+    engine.set_virtual_fill_emitter(emitter)
+
+    trade = engine.submit_limit_order(
+        token_id="token-1",
+        condition_id="cond-1",
+        outcome="Yes",
+        side=OrderSide.BUY,
+        price=0.41,
+        size=3,
+        post_only=True,
+        virtual_fill_context={
+            "signal_id": "sig-1",
+            "execution_id": "exe-1",
+            "maker_side": "buy_yes",
+            "signal_type": "maker_quote",
+            "event_title": "Test market",
+        },
+    )
+
+    assert trade.status == TradeStatus.PENDING
+    assert emitter.rows == []
+
+    snap = OrderBookSnapshot(
+        token_id="token-1",
+        best_ask=0.40,
+        asks=[OrderBookLevel(price=0.40, size=10.0)],
+    )
+    filled = engine.sweep_simulated_maker_fills(lambda _token_id: snap, now_ts=trade.timestamp + 10.0)
+
+    assert filled == [trade]
+    assert len(emitter.rows) == 1
+    _, kwargs = emitter.rows[0]
+    assert kwargs["tier"] == "T3_MAKER"
+    assert kwargs["signal_context"]["maker_side"] == "buy_yes"
+    assert kwargs["signal_context"]["signal_type"] == "maker_quote"
+    assert kwargs["signal_context"]["event_title"] == "Test market"
 
 
 def test_ensure_sufficient_collateral_uses_balance_allowance(monkeypatch):

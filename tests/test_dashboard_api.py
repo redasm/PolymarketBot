@@ -72,6 +72,25 @@ def test_dashboard_snapshot_preserves_research_signal_freshness():
     assert snap["research_signal_status"]["items"][0]["freshness_sec"] == 42.0
 
 
+def test_dashboard_state_disabled_becomes_noop():
+    state = DashboardState(enabled=False)
+    state.update(cycle_count=99, arbs_found=12)
+    state.append_opportunity({"event_title": "noop"})
+    state.append_trade({"trade_id": "noop"})
+    state.append_error({"message": "noop"})
+    state.append_pnl_point({"timestamp": 1.0})
+    state.append_ai_decision({"action": "BUY_YES"})
+
+    snap = state.snapshot()
+    assert snap["enabled"] is False
+    assert snap["cycle_count"] == 0
+    assert snap["arbs_found"] == 0
+    assert snap["recent_opportunities"] == []
+    assert snap["recent_trades"] == []
+    assert snap["recent_errors"] == []
+    assert snap["pnl_history"] == []
+
+
 def test_api_ai_enriches_decisions_with_market_validation():
     state = DashboardState()
     state.update(

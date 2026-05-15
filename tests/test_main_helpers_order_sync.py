@@ -64,6 +64,15 @@ class _MakerStrategy:
         return 0.0
 
 
+class _Notifier:
+    def __init__(self) -> None:
+        self.successes: list[dict] = []
+
+    def notify_trade_success(self, **kwargs: Any) -> bool:
+        self.successes.append(kwargs)
+        return True
+
+
 def _trade(
     *,
     trade_id: str = "t1",
@@ -78,6 +87,9 @@ def _trade(
     timestamp: float = 0.0,
     post_only: bool = True,  # T3 maker fills are post-only
     inventory_accounted_size: float = 0.0,
+    notification_accounted_size: float = 0.0,
+    expected_edge_per_share: float = 0.0,
+    event_title: str = "",
 ) -> SimpleNamespace:
     return SimpleNamespace(
         trade_id=trade_id,
@@ -92,6 +104,9 @@ def _trade(
         timestamp=timestamp,
         post_only=post_only,
         inventory_accounted_size=inventory_accounted_size,
+        notification_accounted_size=notification_accounted_size,
+        expected_edge_per_share=expected_edge_per_share,
+        event_title=event_title,
     )
 
 
@@ -164,16 +179,45 @@ def test_sync_changes_reconcile_apply_inventory_and_emit_event_per_trade() -> No
     )
     # Reconciler runs once for `polled` (which includes the changes).
     assert risk.reconciled == [changed]
-    # One event per changed trade.
+    # One observed-fill event and one status-sync event per changed trade.
     kinds = [k for k, _ in rec.events]
-    assert kinds == ["risk_events", "risk_events"]
+    assert kinds == ["risk_events", "risk_events", "risk_events", "risk_events"]
     payloads = [p for _, p in rec.events]
-    assert payloads[0]["event"] == "order_status_sync"
-    assert payloads[0]["trade_id"] == "t1"
-    assert payloads[1]["trade_id"] == "t2"
+    sync_payloads = [p for p in payloads if p["event"] == "order_status_sync"]
+    assert sync_payloads[0]["trade_id"] == "t1"
+    assert sync_payloads[1]["trade_id"] == "t2"
     # Inventory deltas applied: BUY t1 +2.0, SELL t2 -1.5.
     assert ("tok1", "BUY", 2.0) in maker.updates
     assert ("tok2", "SELL", 1.5) in maker.updates
+
+
+def test_sync_changes_notify_new_maker_fill_delta() -> None:
+    rec = _Recorder()
+    notifier = _Notifier()
+    changed = [
+        _trade(
+            trade_id="t1",
+            fill_size=3.0,
+            notification_accounted_size=1.0,
+            expected_edge_per_share=0.02,
+            event_title="Will test market fill?",
+        )
+    ]
+    sync_live_order_statuses(
+        executor=_executor(sync_result=SimpleNamespace(polled=changed, changed=changed)),
+        risk_mgr=_RiskMgr(),
+        maker_strategy=_MakerStrategy(),
+        event_recorder=rec,
+        notifier=notifier,
+    )
+
+    observed = [payload for _, payload in rec.events if payload["event"] == "live_maker_fill_observed"]
+    assert observed
+    assert observed[0]["fill_delta"] == pytest.approx(2.0)
+    assert observed[0]["expected_profit"] == pytest.approx(0.04)
+    assert changed[0].notification_accounted_size == pytest.approx(3.0)
+    assert notifier.successes[0]["event_title"] == "Will test market fill?"
+    assert notifier.successes[0]["expected_profit"] == pytest.approx(0.04)
 
 
 def test_sync_disabled_recorder_skips_events_but_still_reconciles() -> None:

@@ -65,6 +65,8 @@ def test_record_fill_emits_full_13_field_schema(tmp_path: Path) -> None:
         post_only=False,
         order_type_name="FOK",
     )
+    trade.signal_id = "sig-1"
+    trade.execution_id = "exe-1"
     emitter.record_fill(trade, intended_price=0.51, tier="T0_STRUCTURAL")
     recorder.close()
 
@@ -87,6 +89,8 @@ def test_record_fill_emits_full_13_field_schema(tmp_path: Path) -> None:
         assert field in row, f"missing required field {field!r}"
 
     assert row["market_id"] == "cid-1"
+    assert row["signal_id"] == "sig-1"
+    assert row["execution_id"] == "exe-1"
     assert row["side"] == "BUY"
     assert row["is_maker"] is False
     assert row["tier"] == "T0_STRUCTURAL"

@@ -67,12 +67,18 @@ def _make_config(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**base)
 
 
-def _snap(best_ask: float | None = 0.5, best_bid: float = 0.49):
+def _snap(
+    best_ask: float | None = 0.5,
+    best_bid: float = 0.49,
+    *,
+    timestamp: float | None = None,
+):
     return SimpleNamespace(
         best_ask=best_ask,
         best_bid=best_bid,
         asks=[SimpleNamespace(price=best_ask or 0.0, size=100.0)],
         bids=[SimpleNamespace(price=best_bid, size=100.0)],
+        timestamp=timestamp,
     )
 
 
@@ -218,6 +224,18 @@ def test_happy_path_builds_opportunity_with_diagnostic_payload() -> None:
     assert check["fee_model"] == "clob_binary_fee_rate_x_price_x_1_minus_price"
     assert opp.legs[0].outcome == "Yes"
     assert opp.legs[0].token_id == "yes-1"
+
+
+def test_snapshot_age_is_none_when_snapshot_timestamp_missing() -> None:
+    signal = _make_signal(deviation=0.05, recommended_size_usdc=1.0)
+    opp, _, reason = build_directional_opportunity_from_signal(
+        config=_make_config(polymarket_taker_fee_rate=0.02),
+        signal=signal,
+        market=_make_market(),
+        ob_analyzer=_ob_analyzer(snapshot=_snap(timestamp=0.0)),
+    )
+    assert opp is not None and reason == ""
+    assert signal.payload["execution_check"]["snapshot_age_sec"] is None
 
 
 def test_happy_path_buy_no_picks_no_token() -> None:

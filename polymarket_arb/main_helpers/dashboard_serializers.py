@@ -209,6 +209,7 @@ def serialize_strategy_signal(
     research_overlay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
+        "signal_id": getattr(signal, "signal_id", ""),
         "tier": signal.tier.name,
         "signal_type": signal.signal_type,
         "market_id": signal.market_id,

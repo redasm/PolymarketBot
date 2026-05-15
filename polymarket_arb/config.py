@@ -685,7 +685,7 @@ class ArbConfig:
             data_research_cache_max_gb=_env_float("DATA_RESEARCH_CACHE_MAX_GB", 1.0),
             data_backtest_retention_days=_env_int("DATA_BACKTEST_RETENTION_DAYS", 30),
             data_backtest_max_gb=_env_float("DATA_BACKTEST_MAX_GB", 2.0),
-            dashboard_enabled=_env_bool("DASHBOARD_ENABLED", True),
+            dashboard_enabled=_env_bool("DASHBOARD_ENABLED", False),
             dashboard_port=_env_int("DASHBOARD_PORT", 8077),
             log_level=_env("LOG_LEVEL", "INFO"),
             log_file=_env("LOG_FILE", "arb_bot.log"),

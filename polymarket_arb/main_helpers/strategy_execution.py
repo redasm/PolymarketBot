@@ -35,6 +35,11 @@ from polymarket_arb.execution_engine import ExecutionEngine
 from polymarket_arb.main_helpers.directional_opportunity import (
     build_directional_opportunity_from_signal,
 )
+from polymarket_arb.main_helpers.strategy_telemetry import (
+    compact_book_snapshot,
+    ensure_signal_id,
+    new_execution_id,
+)
 from polymarket_arb.main_helpers.signal_helpers import (
     apply_maker_fill_to_inventory,
     find_market_for_signal,
@@ -127,6 +132,8 @@ def execute_strategy_signal(
       skips risk because we already own the asset.
     - Any other tier returns `"unsupported_strategy_tier"`.
     """
+    signal_id = ensure_signal_id(signal)
+    execution_id = new_execution_id()
     market = find_market_for_signal(signal.market_id, active_markets)
     if signal.tier == StrategyTier.CROSS_PLATFORM:
         if not config.dry_run:
@@ -165,6 +172,8 @@ def execute_strategy_signal(
         ]
         if event_recorder.is_enabled:
             event_recorder.write_event("strategy_executions", {
+                "execution_id": execution_id,
+                "signal_id": signal_id,
                 "tier": signal.tier.name,
                 "signal_type": signal.signal_type,
                 "market_id": signal.market_id,
@@ -192,7 +201,24 @@ def execute_strategy_signal(
         balance_ok, balance_reason, _ = executor.ensure_sufficient_collateral(opportunity.total_cost * adj_size)
         if not balance_ok:
             return False, balance_reason, ExecutionDelta()
-        trades = executor.execute_arbitrage(opportunity, adj_size)
+        virtual_fill_context = {
+            "signal_id": signal_id,
+            "execution_id": execution_id,
+            "tier": signal.tier.name,
+            "signal_type": signal.signal_type,
+            "market_id": signal.market_id,
+            "event_title": opportunity.event_title,
+        }
+        trades = executor.execute_arbitrage(
+            opportunity,
+            adj_size,
+            virtual_fill_context=virtual_fill_context,
+        )
+        for trade in trades:
+            trade.signal_id = signal_id
+            trade.execution_id = execution_id
+            trade.expected_edge_per_share = opportunity.net_edge
+            trade.event_title = opportunity.event_title
         execution_success = executor.is_successful_execution(opportunity, trades)
         simulated_exec = bool(trades) and all(getattr(t, "simulated", False) for t in trades)
         # Always feed RiskManager so position / exposure / cooldown
@@ -218,6 +244,8 @@ def execute_strategy_signal(
             # analysis doesn't have to dig two layers down.
             exec_check = dict(signal.payload.get("execution_check") or {})
             event_recorder.write_event("strategy_executions", {
+                "execution_id": execution_id,
+                "signal_id": signal_id,
                 "tier": signal.tier.name,
                 "signal_type": signal.signal_type,
                 "market_id": signal.market_id,
@@ -227,6 +255,7 @@ def execute_strategy_signal(
                 "execution_check": exec_check,
                 "our_role": "taker",
                 "category": exec_check.get("category", ""),
+                "trades": [_trade_link_payload(trade) for trade in trades],
             })
         for trade in trades:
             dash_state.append_trade({
@@ -405,7 +434,20 @@ def execute_strategy_signal(
             post_only=True,
             order_type_name="GTC",
             tick_size=target_tick_size,
+            virtual_fill_context={
+                "signal_id": signal_id,
+                "execution_id": execution_id,
+                "tier": signal.tier.name,
+                "signal_type": signal.signal_type,
+                "market_id": signal.market_id,
+                "event_title": market.question,
+                "maker_side": maker_side,
+            },
         )
+        trade.expected_edge_per_share = side_edge
+        trade.event_title = market.question
+        trade.signal_id = signal_id
+        trade.execution_id = execution_id
         submission_success = trade.status in {TradeStatus.PENDING, TradeStatus.PARTIAL, TradeStatus.FILLED}
         if target_order_side == OrderSide.BUY:
             risk_mgr.record_execution(
@@ -438,15 +480,35 @@ def execute_strategy_signal(
         })
         if event_recorder.is_enabled:
             event_recorder.write_event("strategy_executions", {
+                "execution_id": execution_id,
+                "signal_id": signal_id,
+                "trade_id": trade.trade_id,
+                "order_id": trade.order_id,
                 "tier": signal.tier.name,
                 "signal_type": signal.signal_type,
                 "market_id": signal.market_id,
                 "status": "submitted" if submission_success else "failed",
                 "trade_status": trade.status.value,
+                "submitted_price": trade.price,
+                "submitted_size": trade.size,
+                "submitted_notional": trade.price * trade.size,
+                "filled_size": trade.fill_size,
+                "fill_price": trade.fill_price,
                 "maker_side": maker_side,
                 "outcome": target_outcome,
                 "side": target_order_side.value,
                 "expected_edge_per_share": side_edge,
+                "expected_edge_usdc": side_edge * float(adj_size),
+                "fair_value": fair_value,
+                "quote_bid_price": bid_price,
+                "quote_ask_price": ask_price,
+                "quote_bid_size": bid_size,
+                "quote_ask_size": ask_size,
+                "inventory_before": {
+                    "yes": yes_inventory,
+                    "no": no_inventory,
+                },
+                "book_snapshot": compact_book_snapshot(target_snap),
                 "post_only": True,
                 # Becker 2025 follow-up: tag every fill with our role
                 # (maker/taker) and the article's category so we can
@@ -456,6 +518,10 @@ def execute_strategy_signal(
                 "category": (signal.payload.get("category") if isinstance(signal.payload, dict) else None) or "",
                 "category_maker_taker_gap_pp": (
                     signal.payload.get("category_maker_taker_gap_pp")
+                    if isinstance(signal.payload, dict) else None
+                ),
+                "flow_bias": (
+                    signal.payload.get("flow_bias")
                     if isinstance(signal.payload, dict) else None
                 ),
             })
@@ -496,3 +562,20 @@ def execute_strategy_signal(
         return submission_success, "", delta
 
     return False, "unsupported_strategy_tier", ExecutionDelta()
+
+
+def _trade_link_payload(trade: TradeRecord) -> dict[str, Any]:
+    return {
+        "trade_id": trade.trade_id,
+        "order_id": trade.order_id,
+        "token_id": trade.token_id,
+        "condition_id": trade.condition_id,
+        "side": trade.side.value,
+        "price": trade.price,
+        "size": trade.size,
+        "status": trade.status.value,
+        "fill_price": trade.fill_price,
+        "fill_size": trade.fill_size,
+        "post_only": trade.post_only,
+        "simulated": trade.simulated,
+    }

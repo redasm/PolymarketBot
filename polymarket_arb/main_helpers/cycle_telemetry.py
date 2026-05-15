@@ -50,6 +50,7 @@ def build_cycle_summary_payload(
     t0_opportunities_today: int = 0,
     directional_signals_total: int = 0,
     directional_signals_today: int = 0,
+    skip_reason_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Build the per-cycle telemetry payload.
 
@@ -91,6 +92,11 @@ def build_cycle_summary_payload(
         "t0_opportunities_today": t0_opportunities_today,
         "directional_signals_total": directional_signals_total,
         "directional_signals_today": directional_signals_today,
+        "skip_reason_counts": {
+            str(key): int(value)
+            for key, value in sorted((skip_reason_counts or {}).items())
+            if int(value) > 0
+        },
         "ws_connected": ws_status.get("connected", False),
         "ws_tokens": ws_status.get("subscribed_tokens", 0),
         "research_count": research_count,
@@ -152,6 +158,7 @@ def emit_cycle_metrics(
     t0_opportunities_today: int = 0,
     directional_signals_total: int = 0,
     directional_signals_today: int = 0,
+    skip_reason_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """Snapshot orderbook stats, build the payload, and write to the event log.
 
@@ -192,6 +199,7 @@ def emit_cycle_metrics(
         t0_opportunities_today=t0_opportunities_today,
         directional_signals_total=directional_signals_total,
         directional_signals_today=directional_signals_today,
+        skip_reason_counts=skip_reason_counts,
     )
     if event_recorder.is_enabled:
         event_recorder.write_event("cycle_metrics", payload)

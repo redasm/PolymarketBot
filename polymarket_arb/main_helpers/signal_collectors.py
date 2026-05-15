@@ -89,6 +89,12 @@ def reset_statistical_signal_throttle() -> None:
     _STATISTICAL_LAST_EMIT.clear()
 
 
+def reset_signal_collector_skip_summaries() -> None:
+    """Reset collector skip telemetry carried between scan cycles."""
+    collect_statistical_strategy_signals.last_skip_summary = {"total": 0, "reasons": {}, "top_markets": []}
+    collect_maker_strategy_signals.last_skip_summary = {"total": 0, "reasons": {}, "top_markets": []}
+
+
 def collect_cross_platform_strategy_signals(
     *,
     config: ArbConfig,
@@ -144,12 +150,16 @@ def collect_statistical_strategy_signals(
     payloads on signals that *do* survive.
     """
     signals: list[StrategySignal] = []
+    skip_reasons: dict[str, int] = {}
+    skip_by_market: dict[str, dict[str, Any]] = {}
     related_market_context = build_t2_related_market_context(candidate_markets, ob_analyzer)
     for market in candidate_markets:
         if len(market.tokens) != 2 or market.closed or not market.active:
+            _record_skip(skip_reasons, skip_by_market, market.condition_id, "non_binary_or_inactive")
             continue
         horizon_days = _market_horizon_days(market)
         if horizon_days is not None and horizon_days > 90.0:
+            _record_skip(skip_reasons, skip_by_market, market.condition_id, "horizon_gt_90d", horizon_days=horizon_days)
             continue
 
         yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
@@ -157,9 +167,12 @@ def collect_statistical_strategy_signals(
         snap = ob_analyzer.get_snapshot(yes_token.token_id)
         no_snap = ob_analyzer.get_snapshot(no_token.token_id)
         if snap is None or no_snap is None or snap.mid is None or no_snap.mid is None:
+            _record_skip(skip_reasons, skip_by_market, market.condition_id, "missing_t2_snapshot")
             continue
         quality = evaluate_t2_market_quality(config=config, snap=snap, no_snap=no_snap)
         if quality["passes"] is False:
+            for reason in quality.get("reasons", []) or ["quality_gate_failed"]:
+                _record_skip(skip_reasons, skip_by_market, market.condition_id, f"quality_{reason}", quality=quality)
             continue
 
         bids_total_size = sum(level.size for level in snap.bids[:5])
@@ -174,12 +187,14 @@ def collect_statistical_strategy_signals(
             related_market_prices=related_market_context.get(market.condition_id),
         )
         if estimate is None:
+            _record_skip(skip_reasons, skip_by_market, market.condition_id, "model_no_estimate")
             continue
 
         action = "buy_yes" if estimate.is_underpriced else "buy_no"
         if not _statistical_should_emit(
             market.condition_id, action, float(estimate.deviation)
         ):
+            _record_skip(skip_reasons, skip_by_market, market.condition_id, "collector_reemit_throttle")
             continue
         signals.append(
             StrategySignal(
@@ -203,6 +218,15 @@ def collect_statistical_strategy_signals(
                 },
             )
         )
+    collect_statistical_strategy_signals.last_skip_summary = {
+        "total": sum(skip_reasons.values()),
+        "reasons": dict(skip_reasons),
+        "top_markets": sorted(
+            skip_by_market.values(),
+            key=lambda item: int(item.get("count", 0)),
+            reverse=True,
+        )[:10],
+    }
     return signals
 
 
@@ -239,13 +263,17 @@ def collect_maker_strategy_signals(
     selection.
     """
     signals: list[StrategySignal] = []
+    skip_reasons: dict[str, int] = {}
+    skip_by_market: dict[str, dict[str, Any]] = {}
     for market in candidate_markets:
         if len(market.tokens) != 2 or market.closed or not market.active:
+            _record_skip(skip_reasons, skip_by_market, market.condition_id, "non_binary_or_inactive")
             continue
 
         yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
         snap = ob_analyzer.get_snapshot(yes_token.token_id)
         if snap is None or snap.mid is None:
+            _record_skip(skip_reasons, skip_by_market, market.condition_id, "missing_maker_snapshot")
             continue
         fair_value = fair_values_by_market.get(market.condition_id)
         if fair_value is None and detector is not None:
@@ -261,6 +289,7 @@ def collect_maker_strategy_signals(
             )
             fair_value = estimate.model_prob
         if fair_value is None:
+            _record_skip(skip_reasons, skip_by_market, market.condition_id, "missing_fair_value")
             continue
 
         # Pull the per-market flow snapshot once and reuse it for both
@@ -288,6 +317,7 @@ def collect_maker_strategy_signals(
             flow_bias_yes_share=flow_share,
         )
         if quote is None or (quote.bid_price is None and quote.ask_price is None):
+            _record_skip(skip_reasons, skip_by_market, market.condition_id, "maker_no_quote")
             continue
 
         bid_edge = (
@@ -352,4 +382,34 @@ def collect_maker_strategy_signals(
                 payload=payload,
             )
         )
+    collect_maker_strategy_signals.last_skip_summary = {
+        "total": sum(skip_reasons.values()),
+        "reasons": dict(skip_reasons),
+        "top_markets": sorted(
+            skip_by_market.values(),
+            key=lambda item: int(item.get("count", 0)),
+            reverse=True,
+        )[:10],
+    }
     return signals
+
+
+reset_signal_collector_skip_summaries()
+
+
+def _record_skip(
+    reasons: dict[str, int],
+    by_market: dict[str, dict[str, Any]],
+    market_id: str,
+    reason: str,
+    **context: Any,
+) -> None:
+    reasons[reason] = reasons.get(reason, 0) + 1
+    if not market_id:
+        return
+    item = by_market.setdefault(market_id, {"market_id": market_id, "count": 0, "reasons": {}})
+    item["count"] = int(item.get("count", 0)) + 1
+    item_reasons = item.setdefault("reasons", {})
+    item_reasons[reason] = int(item_reasons.get(reason, 0)) + 1
+    if context and "sample_context" not in item:
+        item["sample_context"] = context

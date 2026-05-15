@@ -57,6 +57,17 @@ def test_event_recorder_preserves_canonical_ts_when_payload_has_ts(tmp_path: Pat
     assert row["payload_category"] == "payload"
 
 
+def test_event_recorder_falls_back_on_bad_schema_version(tmp_path: Path):
+    recorder = EventRecorder(output_dir=str(tmp_path), enabled=True)
+
+    recorder.write_event("risk_events", {"event": "bad_schema", "schema_version": "v2"})
+    recorder.close()
+
+    files = list(tmp_path.glob("*.risk_events.ndjson"))
+    row = json.loads(files[0].read_text(encoding="utf-8").strip())
+    assert row["schema_version"] == 2
+
+
 def test_event_recorder_async_write_drains_on_close(tmp_path: Path):
     """Async mode must flush every queued event by the time close()
     returns — otherwise end-of-run summaries would silently lose
@@ -103,3 +114,22 @@ def test_event_recorder_async_write_drops_oldest_when_queue_full(tmp_path: Path)
     finally:
         recorder._lock.release()
     recorder.close()
+
+
+def test_event_recorder_warns_on_async_overflow(tmp_path: Path, caplog):
+    recorder = EventRecorder(
+        output_dir=str(tmp_path),
+        enabled=True,
+        async_write=True,
+        queue_size=100,
+    )
+    recorder._lock.acquire()
+    try:
+        for i in range(150):
+            recorder.write_event("trades", {"i": i})
+        assert recorder.dropped_events > 0
+    finally:
+        recorder._lock.release()
+    recorder.close()
+
+    assert any("event_recorder queue overflow" in record.message for record in caplog.records)

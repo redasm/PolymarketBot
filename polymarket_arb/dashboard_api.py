@@ -27,8 +27,9 @@ _STATE: Optional[DashboardState] = None
 class DashboardState:
     """仪表盘共享状态：由主循环写入，由 API 端点读取."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, enabled: bool = True) -> None:
         self._lock = threading.Lock()
+        self.enabled = enabled
         # Public read-only field grouped from `_lock`. API endpoints can grab
         # it without reaching into the private attribute, while writers in
         # this module keep a single lock identity.
@@ -68,36 +69,48 @@ class DashboardState:
         self.backtest_last_report: dict = {}
 
     def update(self, **kwargs: Any) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             for k, v in kwargs.items():
                 if hasattr(self, k):
                     setattr(self, k, v)
 
     def append_opportunity(self, opp: dict) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             self.recent_opportunities.append(opp)
             if len(self.recent_opportunities) > 100:
                 self.recent_opportunities = self.recent_opportunities[-100:]
 
     def append_trade(self, trade: dict) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             self.recent_trades.append(trade)
             if len(self.recent_trades) > 200:
                 self.recent_trades = self.recent_trades[-200:]
 
     def append_error(self, error: dict) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             self.recent_errors.append(error)
             if len(self.recent_errors) > 50:
                 self.recent_errors = self.recent_errors[-50:]
 
     def append_pnl_point(self, point: dict) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             self.pnl_history.append(point)
             if len(self.pnl_history) > 2880:
                 self.pnl_history = self.pnl_history[-2880:]
 
     def append_ai_decision(self, decision: dict) -> None:
+        if not self.enabled:
+            return
         with self._lock:
             self.ai_decisions.append(decision)
             if len(self.ai_decisions) > 100:
@@ -107,6 +120,7 @@ class DashboardState:
         with self._lock:
             uptime = time.time() - self.bot_start_ts
             return {
+                "enabled": self.enabled,
                 "uptime_sec": uptime,
                 "uptime_human": _format_duration(uptime),
                 "cycle_count": self.cycle_count,

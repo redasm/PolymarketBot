@@ -119,6 +119,7 @@ class ExecutionEngine:
         # written to data/telemetry/<date>.virtual_fills.ndjson with the
         # 13 fields roadmap §三-阶段 1 requires.
         self._virtual_fill_emitter: Any | None = None
+        self._virtual_fill_context_by_trade_id: dict[str, dict[str, Any]] = {}
 
     def set_virtual_fill_emitter(self, emitter: Any) -> None:
         self._virtual_fill_emitter = emitter
@@ -130,10 +131,20 @@ class ExecutionEngine:
         intended_price: float | None = None,
         tier: str | None = None,
         signal_context: dict | None = None,
+        consume_context: bool = True,
     ) -> None:
         emitter = self._virtual_fill_emitter
         if emitter is None:
             return
+        if consume_context:
+            extra_context = self._virtual_fill_context_by_trade_id.pop(trade.trade_id, {})
+        else:
+            extra_context = self._virtual_fill_context_by_trade_id.get(trade.trade_id, {})
+        if extra_context:
+            signal_context = {
+                **extra_context,
+                **(signal_context or {}),
+            }
         try:
             emitter.record_fill(
                 trade,
@@ -143,6 +154,11 @@ class ExecutionEngine:
             )
         except Exception as exc:  # pragma: no cover - telemetry must never break execution
             LOG.warning("virtual_fill emit failed: %s", exc)
+
+    def set_virtual_fill_context(self, trade_id: str, context: dict[str, Any]) -> None:
+        if not trade_id:
+            return
+        self._virtual_fill_context_by_trade_id[trade_id] = dict(context)
 
     @property
     def trade_history(self) -> list[TradeRecord]:
@@ -154,6 +170,7 @@ class ExecutionEngine:
         size: float,
         *,
         order_type_name: str | None = None,
+        virtual_fill_context: dict[str, Any] | None = None,
     ) -> list[TradeRecord]:
         """执行套利交易的所有腿.
 
@@ -183,7 +200,12 @@ class ExecutionEngine:
 
         if self._config.dry_run:
             LOG.info("=== DRY RUN 模式 === 使用盘口深度模拟成交")
-            return self._simulate_dry_run_arbitrage(opp, arb_id, actual_size)
+            return self._simulate_dry_run_arbitrage(
+                opp,
+                arb_id,
+                actual_size,
+                virtual_fill_context=virtual_fill_context,
+            )
 
         order_type = self._resolve_named_order_type(order_type_name) if order_type_name else None
         records = self._submit_legs_parallel(opp, arb_id, actual_size, order_type=order_type)
@@ -487,6 +509,7 @@ class ExecutionEngine:
         post_only: bool = False,
         order_type_name: str = "GTC",
         tick_size: float | None = None,
+        virtual_fill_context: dict[str, Any] | None = None,
     ) -> TradeRecord:
         """提交单笔限价单，供做市/单腿策略复用."""
         arb_ref = arb_id or str(uuid.uuid4())[:12]
@@ -519,11 +542,14 @@ class ExecutionEngine:
                 trade.fill_price = normalized_price
                 trade.fill_size = normalized_size
             self._append_trade_record(trade, simulated=True)
-            self._emit_virtual_fill(
-                trade,
-                intended_price=normalized_price,
-                tier="T3_MAKER" if post_only else "T2_DIRECTIONAL",
-            )
+            if virtual_fill_context:
+                self.set_virtual_fill_context(trade.trade_id, virtual_fill_context)
+            if trade.status == TradeStatus.FILLED:
+                self._emit_virtual_fill(
+                    trade,
+                    intended_price=normalized_price,
+                    tier="T3_MAKER" if post_only else "T2_DIRECTIONAL",
+                )
             return trade
 
         try:
@@ -1077,6 +1103,8 @@ class ExecutionEngine:
         opp: ArbOpportunity,
         arb_id: str,
         actual_size: float,
+        *,
+        virtual_fill_context: dict[str, Any] | None = None,
     ) -> list[TradeRecord]:
         records: list[TradeRecord] = []
         for leg in opp.legs:
@@ -1105,6 +1133,8 @@ class ExecutionEngine:
             )
             records.append(record)
             self._append_trade_record(record, simulated=True)
+            if virtual_fill_context:
+                self.set_virtual_fill_context(record.trade_id, virtual_fill_context)
             self._emit_virtual_fill(
                 record,
                 intended_price=leg.execution_price if leg.execution_price is not None else leg.price,

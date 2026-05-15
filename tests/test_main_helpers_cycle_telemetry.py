@@ -54,7 +54,7 @@ def _payload_kwargs(**overrides):
 
 
 def test_build_cycle_summary_payload_canonical_shape():
-    payload = build_cycle_summary_payload(**_payload_kwargs())
+    payload = build_cycle_summary_payload(**_payload_kwargs(skip_reason_counts={"event_cooldown": 4}))
     assert payload["event"] == "cycle_summary"
     assert payload["cycle_status"] == "ok"
     assert payload["run_id"] == "run-1"
@@ -74,6 +74,7 @@ def test_build_cycle_summary_payload_canonical_shape():
     assert payload["total_pnl"] == pytest.approx(0.98)
     assert payload["current_position_value"] == pytest.approx(12.5)
     assert payload["focus_keywords"] == ["btc", "election"]
+    assert payload["skip_reason_counts"] == {"event_cooldown": 4}
 
 
 def test_build_cycle_summary_payload_book_stats_normalised_to_int():
@@ -120,6 +121,7 @@ def test_build_cycle_summary_payload_ws_status_missing_keys_default_safely():
 def test_build_cycle_summary_payload_propagates_cycle_status():
     payload = build_cycle_summary_payload(**_payload_kwargs(cycle_status="degraded"))
     assert payload["cycle_status"] == "degraded"
+    assert payload["skip_reason_counts"] == {}
 
 
 # --------- emit_cycle_metrics ----------
@@ -174,6 +176,7 @@ def test_emit_cycle_metrics_writes_to_recorder_and_resets_book_stats():
         daily_pnl=0.0,
         open_positions=1,
         focus_keywords=[],
+        skip_reason_counts={"event_cooldown": 1},
     )
     assert analyzer.snapshot_calls == [True]  # reset must be True
     assert len(recorder.events) == 1

@@ -10,6 +10,7 @@ import pytest
 from polymarket_arb.dashboard_api import _enrich_ai_decision
 from polymarket_arb.market_scanner import MarketScanner
 from polymarket_arb.main_loop import (
+    _BoundedDedupeSet,
     _build_cycle_summary_payload,
     _build_dashboard_trade_rows,
     _build_directional_opportunity_from_signal,
@@ -71,6 +72,16 @@ class _StubExecutor:
 def test_is_live_execution_success_returns_false_in_dry_run():
     config = make_test_config(dry_run=True)
     assert _is_live_execution_success(config, _StubExecutor(True), _make_opp(), []) is False
+
+
+def test_bounded_dedupe_set_caps_memory_and_allows_evicted_key_again():
+    seen = _BoundedDedupeSet(max_keys=2)
+
+    assert seen.add_new(("a",)) is True
+    assert seen.add_new(("a",)) is False
+    assert seen.add_new(("b",)) is True
+    assert seen.add_new(("c",)) is True
+    assert seen.add_new(("a",)) is True
 
 
 def test_is_live_execution_success_uses_executor_in_live_mode():

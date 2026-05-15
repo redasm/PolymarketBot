@@ -15,6 +15,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.models import (
@@ -63,6 +64,7 @@ class RiskManager:
         self._effective_max_daily_loss = config.max_daily_loss
         self._pending_reservation_ttl_sec = config.risk_pending_reservation_ttl_sec
         self._halt_time: float | None = None
+        self._last_reject: dict[str, Any] = {}
         # RLock so e.g. `pre_trade_check` can call `_reconcile_pending_reservations`
         # without deadlocking on itself.
         self._lock = threading.RLock()
@@ -83,6 +85,11 @@ class RiskManager:
         """
         return self._halt_time
 
+    @property
+    def last_reject(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._last_reject)
+
     def pre_trade_check(self, opp: ArbOpportunity, proposed_size: float) -> tuple[bool, str, float]:
         """交易前风控检查.
 
@@ -90,7 +97,10 @@ class RiskManager:
             (允许交易, 原因, 调整后的数量)
         """
         with self._lock:
-            return self._pre_trade_check_locked(opp, proposed_size)
+            allowed, reason, size = self._pre_trade_check_locked(opp, proposed_size)
+            if allowed:
+                self._last_reject = {}
+            return allowed, reason, size
 
     def _pre_trade_check_locked(self, opp: ArbOpportunity, proposed_size: float) -> tuple[bool, str, float]:
         self._maybe_reset_daily()
@@ -115,6 +125,10 @@ class RiskManager:
             max_failures=self._config.max_consecutive_failures,
         )
         if not can:
+            structured_code = _reason_code_from_risk_state_reason(reason)
+            self._set_last_reject("risk_state_gate", reason, {})
+            if structured_code != "risk_state_gate":
+                self._last_reject["reason_code"] = structured_code
             return False, reason, 0.0
 
         # Portfolio-sync circuit breaker: when sync has failed N consecutive
@@ -128,27 +142,67 @@ class RiskManager:
             and self._state.portfolio_sync_consecutive_failures
             >= self._config.portfolio_sync_max_consecutive_failures
         ):
+            reason = (
+                f"账户同步连续失败 {self._state.portfolio_sync_consecutive_failures} 次，"
+                f"已暂停开仓直到下一次成功同步"
+            )
+            self._set_last_reject(
+                "portfolio_sync_gate",
+                reason,
+                {
+                    "consecutive_failures": self._state.portfolio_sync_consecutive_failures,
+                    "max_consecutive_failures": self._config.portfolio_sync_max_consecutive_failures,
+                },
+            )
             return (
                 False,
-                f"账户同步连续失败 {self._state.portfolio_sync_consecutive_failures} 次，"
-                f"已暂停开仓直到下一次成功同步",
+                reason,
                 0.0,
             )
 
         event_id = opp.event_id
         if event_id in self._recent_arb_markets:
             last_ts = self._recent_arb_markets[event_id]
-            if time.time() - last_ts < self._config.risk_event_cooldown_sec:
-                return False, f"事件 {event_id} {self._format_cooldown_label()}内已执行过套利", 0.0
+            age_sec = time.time() - last_ts
+            if age_sec < self._config.risk_event_cooldown_sec:
+                reason = f"事件 {event_id} {self._format_cooldown_label()}内已执行过套利"
+                self._set_last_reject(
+                    "event_cooldown",
+                    reason,
+                    {
+                        "event_id": event_id,
+                        "cooldown_sec": self._config.risk_event_cooldown_sec,
+                        "age_sec": age_sec,
+                    },
+                )
+                return False, reason, 0.0
 
         for market in opp.markets:
             cid = market.condition_id
             current_exposure = self._market_exposure.get(cid, 0.0)
             if current_exposure >= self._config.max_exposure_per_market:
-                return False, f"市场 {cid[:12]} 敞口已达上限", 0.0
+                reason = f"市场 {cid[:12]} 敞口已达上限"
+                self._set_last_reject(
+                    "market_exposure_cap",
+                    reason,
+                    {
+                        "market_id": cid,
+                        "current_exposure": current_exposure,
+                        "max_exposure_per_market": self._config.max_exposure_per_market,
+                    },
+                )
+                return False, reason, 0.0
 
         remaining_total = self._effective_max_total_exposure - self._state.total_exposure
         if remaining_total <= 0:
+            self._set_last_reject(
+                "total_exposure_cap",
+                "全局敞口已满",
+                {
+                    "total_exposure": self._state.total_exposure,
+                    "max_total_exposure": self._effective_max_total_exposure,
+                },
+            )
             return False, "全局敞口已满", 0.0
 
         per_market_size_limit = float("inf")
@@ -166,7 +220,17 @@ class RiskManager:
             used = self._market_exposure.get(cid, 0.0)
             remaining = self._config.max_exposure_per_market - used
             if remaining <= 0:
-                return False, f"市场 {cid[:12]} 敞口已达上限", 0.0
+                reason = f"市场 {cid[:12]} 敞口已达上限"
+                self._set_last_reject(
+                    "market_exposure_cap",
+                    reason,
+                    {
+                        "market_id": cid,
+                        "current_exposure": used,
+                        "max_exposure_per_market": self._config.max_exposure_per_market,
+                    },
+                )
+                return False, reason, 0.0
             per_share_market_exposure = exposure_per_share_by_market.get(cid, 0.0)
             if per_share_market_exposure > 0:
                 per_market_size_limit = min(per_market_size_limit, remaining / per_share_market_exposure)
@@ -179,9 +243,26 @@ class RiskManager:
         )
 
         if max_affordable_size <= 0:
+            self._set_last_reject(
+                "zero_size_after_risk",
+                "风控后可执行数量为 0",
+                {
+                    "proposed_size": proposed_size,
+                    "remaining_total": remaining_total,
+                    "max_executable_size": opp.max_executable_size,
+                    "per_market_size_limit": per_market_size_limit,
+                },
+            )
             return False, "风控后可执行数量为 0", 0.0
 
         return True, "", max_affordable_size
+
+    def _set_last_reject(self, reason_code: str, reason: str, context: dict[str, Any]) -> None:
+        self._last_reject = {
+            "reason_code": reason_code,
+            "reason": reason,
+            "reason_context": dict(context),
+        }
 
     def record_execution(
         self,
@@ -638,3 +719,18 @@ def _resolved_exposure_size(trade: TradeRecord) -> float:
 
 def _trade_side_value(trade: TradeRecord) -> str:
     return str(getattr(trade.side, "value", trade.side)).upper()
+
+
+def _reason_code_from_risk_state_reason(reason: str) -> str:
+    text = str(reason or "")
+    if text.startswith("交易已暂停"):
+        return "risk_halted"
+    if text.startswith("持仓数 "):
+        return "open_position_cap"
+    if text.startswith("总敞口 "):
+        return "total_exposure_cap"
+    if text.startswith("日亏损 "):
+        return "daily_loss_stop"
+    if text.startswith("连续失败 "):
+        return "consecutive_failure_halt"
+    return "risk_state_gate"

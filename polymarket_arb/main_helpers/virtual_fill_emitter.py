@@ -56,6 +56,7 @@ class VirtualFillEmitter:
     book_snapshot_provider: Optional[BookSnapshotProvider]
     taker_fee_rate: float
     enabled: bool = True
+    lifecycle: Any | None = None
 
     def record_fill(
         self,
@@ -100,6 +101,8 @@ class VirtualFillEmitter:
             "event": "virtual_fill",
             "trade_id": trade.trade_id,
             "arb_id": trade.arb_id,
+            "signal_id": getattr(trade, "signal_id", ""),
+            "execution_id": getattr(trade, "execution_id", ""),
             "fill_timestamp": datetime.fromtimestamp(trade.timestamp, tz=timezone.utc).isoformat(),
             "market_id": trade.condition_id,
             "token_id": trade.token_id,
@@ -124,3 +127,13 @@ class VirtualFillEmitter:
             payload["tier"] = tier
 
         self.event_recorder.write_event("virtual_fills", payload)
+        if self.lifecycle is not None:
+            try:
+                self.lifecycle.record_fill(
+                    trade,
+                    fee=fee,
+                    tier=tier or "",
+                    decision_context=decision_context,
+                )
+            except Exception as exc:  # pragma: no cover - telemetry must not break trading
+                LOG.warning("shadow position lifecycle emit failed: %s", exc)
