@@ -213,6 +213,7 @@ def execute_strategy_signal(
             opportunity,
             adj_size,
             virtual_fill_context=virtual_fill_context,
+            virtual_fill_tier="T2_STATISTICAL",
         )
         for trade in trades:
             trade.signal_id = signal_id

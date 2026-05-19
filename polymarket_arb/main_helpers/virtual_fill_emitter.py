@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 from polymarket_arb.event_recorder import EventRecorder
-from polymarket_arb.models import OrderBookSnapshot, TradeRecord
+from polymarket_arb.models import FeeStructure, OrderBookSnapshot, TradeRecord
 
 LOG = logging.getLogger(__name__)
 
@@ -88,7 +88,10 @@ class VirtualFillEmitter:
         # never crossed.
         actual_filled = float(trade.fill_size) if trade.fill_size is not None else 0.0
         effective_price = fill_price if fill_price is not None else float(trade.price)
-        fee = fee_rate * effective_price * actual_filled
+        fee = FeeStructure(taker_fee_rate=fee_rate).estimate_price_fee(
+            effective_price,
+            size=actual_filled,
+        )
 
         decision_context: dict[str, Any] = {
             "best_bid_at_decision": best_bid,

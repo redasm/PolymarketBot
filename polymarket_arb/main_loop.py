@@ -1278,17 +1278,6 @@ def main(dotenv_path: str | None = None) -> None:
             )
             total_simulated_successes += observed_maker_fills
 
-        risk_s = risk_mgr.state
-        telemetry_risk_state = risk_s
-        shadow_snapshot: dict[str, Any] = {}
-        if config.dry_run and shadow_lifecycle is not None:
-            shadow_snapshot = shadow_lifecycle.snapshot()
-            telemetry_risk_state.daily_pnl = float(shadow_snapshot.get("realized_pnl", telemetry_risk_state.daily_pnl))
-            telemetry_risk_state.unrealized_pnl = float(shadow_snapshot.get("unrealized_pnl", telemetry_risk_state.unrealized_pnl))
-            telemetry_risk_state.total_pnl = float(shadow_snapshot.get("total_pnl", telemetry_risk_state.total_pnl))
-            telemetry_risk_state.current_position_value = float(shadow_snapshot.get("current_position_value", telemetry_risk_state.current_position_value))
-            telemetry_risk_state.open_positions = int(shadow_snapshot.get("open_lots", telemetry_risk_state.open_positions))
-
         if (
             portfolio_sync is not None
             and (time.time() - last_portfolio_sync_ts) >= config.portfolio_sync_interval_sec
@@ -1299,6 +1288,12 @@ def main(dotenv_path: str | None = None) -> None:
                 event_recorder=event_recorder,
                 last_portfolio_sync_ts=last_portfolio_sync_ts,
             )
+
+        shadow_snapshot: dict[str, Any] = {}
+        if config.dry_run and shadow_lifecycle is not None:
+            shadow_snapshot = shadow_lifecycle.snapshot()
+            risk_mgr.update_shadow_snapshot(shadow_snapshot)
+        telemetry_risk_state = risk_mgr.state
 
         vol_snap = vol_estimator.snapshot()
         ws_status = _build_ws_status(

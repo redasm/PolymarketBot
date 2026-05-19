@@ -66,6 +66,24 @@ def _load_rows(telemetry_dir: Path, dates: list[str]) -> list[dict]:
     return rows
 
 
+def _load_category_rows(telemetry_dir: Path, dates: list[str], category: str) -> list[dict]:
+    rows: list[dict] = []
+    for date in dates:
+        path = telemetry_dir / f"{date}.{category}.ndjson"
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return rows
+
+
 def _percentile(values: list[float], pct: float) -> float | None:
     if not values:
         return None
@@ -219,6 +237,40 @@ def _overall(rows: list[dict]) -> dict:
     }
 
 
+def _summarize_lifecycle(rows: list[dict]) -> dict:
+    opened = [r for r in rows if r.get("event") == "position_opened"]
+    closed = [
+        r for r in rows
+        if r.get("event") in {"position_closed", "position_partially_closed"}
+    ]
+    unmatched = [r for r in rows if r.get("event") == "unmatched_sell"]
+    realized = [float(r.get("realized_pnl") or 0.0) for r in closed]
+    fees = [float(r.get("fees") or 0.0) for r in closed]
+    wins = [pnl for pnl in realized if pnl >= 0]
+    by_tier: dict[str, dict] = defaultdict(lambda: {"closed": 0, "realized_pnl": 0.0, "fees": 0.0})
+    for row, pnl, fee in zip(closed, realized, fees):
+        tier = str(row.get("tier") or "UNKNOWN")
+        by_tier[tier]["closed"] += 1
+        by_tier[tier]["realized_pnl"] += pnl
+        by_tier[tier]["fees"] += fee
+    return {
+        "opened": len(opened),
+        "closed": len(closed),
+        "unmatched_sell": len(unmatched),
+        "realized_pnl": round(sum(realized), 6),
+        "fees": round(sum(fees), 6),
+        "win_rate": (len(wins) / len(closed)) if closed else 0.0,
+        "by_entry_tier": {
+            tier: {
+                "closed": values["closed"],
+                "realized_pnl": round(values["realized_pnl"], 6),
+                "fees": round(values["fees"], 6),
+            }
+            for tier, values in sorted(by_tier.items())
+        },
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Shadow Mode daily fill report")
     parser.add_argument("--telemetry-dir", default="data/telemetry")
@@ -239,12 +291,14 @@ def main() -> int:
         telemetry_dir = PROJECT_ROOT / telemetry_dir
 
     rows = _load_rows(telemetry_dir, dates)
+    lifecycle_rows = _load_category_rows(telemetry_dir, dates, "positions_lifecycle")
     payload = {
         "dates": dates,
         "telemetry_dir": str(telemetry_dir),
         "overall": _overall(rows),
         "by_tier": _summarize_per_tier(rows),
         "top_markets_by_fills": _top_markets(rows, top_n=args.top_n),
+        "lifecycle": _summarize_lifecycle(lifecycle_rows),
     }
 
     if not rows:

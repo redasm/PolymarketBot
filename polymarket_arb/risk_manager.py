@@ -65,6 +65,7 @@ class RiskManager:
         self._pending_reservation_ttl_sec = config.risk_pending_reservation_ttl_sec
         self._halt_time: float | None = None
         self._last_reject: dict[str, Any] = {}
+        self._shadow_snapshot: dict[str, Any] | None = None
         # RLock so e.g. `pre_trade_check` can call `_reconcile_pending_reservations`
         # without deadlocking on itself.
         self._lock = threading.RLock()
@@ -73,6 +74,7 @@ class RiskManager:
     def state(self) -> RiskState:
         with self._lock:
             self._reconcile_pending_reservations()
+            self._apply_shadow_snapshot_locked()
             return _snapshot_risk_state(self._state)
 
     @property
@@ -90,6 +92,20 @@ class RiskManager:
         with self._lock:
             return dict(self._last_reject)
 
+    def update_shadow_snapshot(self, snapshot: dict[str, Any] | None) -> None:
+        """Use the shadow lifecycle ledger as dry-run risk state.
+
+        In dry-run, portfolio sync correctly reports the real wallet as flat,
+        but the strategy needs the simulated ledger to gate new entries. This
+        method keeps live trading untouched while making shadow runs respect
+        max open positions, exposure, and daily loss limits on the next check.
+        """
+        if not self._config.dry_run:
+            return
+        with self._lock:
+            self._shadow_snapshot = dict(snapshot or {})
+            self._apply_shadow_snapshot_locked()
+
     def pre_trade_check(self, opp: ArbOpportunity, proposed_size: float) -> tuple[bool, str, float]:
         """交易前风控检查.
 
@@ -105,6 +121,7 @@ class RiskManager:
     def _pre_trade_check_locked(self, opp: ArbOpportunity, proposed_size: float) -> tuple[bool, str, float]:
         self._maybe_reset_daily()
         self._reconcile_pending_reservations()
+        self._apply_shadow_snapshot_locked()
 
         if (
             self._state.is_halted
@@ -370,6 +387,7 @@ class RiskManager:
             )
 
         self._state.open_positions = self._compute_open_positions()
+        self._apply_shadow_snapshot_locked()
 
         if event_should_cooldown:
             self._recent_arb_markets[opp.event_id] = time.time()
@@ -438,12 +456,15 @@ class RiskManager:
                     continue
 
                 if trade.status in (TradeStatus.PENDING, TradeStatus.PARTIAL):
+                    consumes_slot = reservation.consumes_slot or trade.status == TradeStatus.PARTIAL
                     self._pending_reservations[reservation_key] = PendingReservation(
                         condition_id=reservation.condition_id,
                         exposure=reservation.exposure,
                         created_ts=now,
-                        consumes_slot=reservation.consumes_slot or trade.status == TradeStatus.PARTIAL,
+                        consumes_slot=consumes_slot,
                     )
+                    if consumes_slot != reservation.consumes_slot:
+                        updated = True
                     continue
 
                 self._pending_reservations.pop(reservation_key, None)
@@ -638,7 +659,30 @@ class RiskManager:
                 reservation.exposure,
             )
 
-        self._state.open_positions = self._compute_open_positions()
+            self._state.open_positions = self._compute_open_positions()
+
+    def _apply_shadow_snapshot_locked(self) -> None:
+        if not self._config.dry_run or not self._shadow_snapshot:
+            return
+        snap = self._shadow_snapshot
+        self._state.daily_pnl = _safe_float(snap.get("realized_pnl"), self._state.daily_pnl)
+        self._state.unrealized_pnl = _safe_float(snap.get("unrealized_pnl"), self._state.unrealized_pnl)
+        self._state.total_pnl = _safe_float(
+            snap.get("total_pnl"),
+            self._state.daily_pnl + self._state.unrealized_pnl,
+        )
+        self._state.current_position_value = _safe_float(
+            snap.get("current_position_value"),
+            self._state.current_position_value,
+        )
+        self._state.total_exposure = _safe_float(
+            snap.get("open_cost"),
+            self._state.total_exposure,
+        )
+        try:
+            self._state.open_positions = max(0, int(snap.get("open_lots", self._state.open_positions)))
+        except (TypeError, ValueError):
+            pass
 
     def _compute_open_positions(self) -> int:
         slotless_pending_by_market: dict[str, float] = {}
@@ -703,6 +747,14 @@ def _start_of_day() -> float:
     now = datetime.datetime.now(datetime.timezone.utc)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return start.timestamp()
+
+
+def _safe_float(value: Any, fallback: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+    return parsed
 
 
 def _resolved_execution_size(trade: TradeRecord) -> float:

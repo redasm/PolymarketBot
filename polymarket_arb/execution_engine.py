@@ -171,6 +171,7 @@ class ExecutionEngine:
         *,
         order_type_name: str | None = None,
         virtual_fill_context: dict[str, Any] | None = None,
+        virtual_fill_tier: str = "T0_STRUCTURAL",
     ) -> list[TradeRecord]:
         """执行套利交易的所有腿.
 
@@ -205,6 +206,7 @@ class ExecutionEngine:
                 arb_id,
                 actual_size,
                 virtual_fill_context=virtual_fill_context,
+                virtual_fill_tier=virtual_fill_tier,
             )
 
         order_type = self._resolve_named_order_type(order_type_name) if order_type_name else None
@@ -1105,6 +1107,7 @@ class ExecutionEngine:
         actual_size: float,
         *,
         virtual_fill_context: dict[str, Any] | None = None,
+        virtual_fill_tier: str = "T0_STRUCTURAL",
     ) -> list[TradeRecord]:
         records: list[TradeRecord] = []
         for leg in opp.legs:
@@ -1138,7 +1141,7 @@ class ExecutionEngine:
             self._emit_virtual_fill(
                 record,
                 intended_price=leg.execution_price if leg.execution_price is not None else leg.price,
-                tier="T0_STRUCTURAL",
+                tier=virtual_fill_tier,
                 signal_context={
                     "arb_type": opp.arb_type.value,
                     "event_id": opp.event_id,

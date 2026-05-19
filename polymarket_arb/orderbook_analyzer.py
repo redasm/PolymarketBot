@@ -88,6 +88,7 @@ class OrderBookAnalyzer:
         self._snapshot_cache: dict[str, OrderBookSnapshot] = {}
         self._snapshot_cache_source: dict[str, str] = {}
         self._missing_orderbook_until: dict[str, float] = {}
+        self._missing_orderbook_failures: dict[str, int] = {}
         self._stats_lock = threading.Lock()
         self._stats: dict[str, int] = {key: 0 for key in _ORDERBOOK_STAT_KEYS}
         # P2-feedhealth: TTL on global-path feed_health results.
@@ -247,13 +248,16 @@ class OrderBookAnalyzer:
                 break
             except Exception as e:
                 if _is_missing_orderbook_error(e):
-                    self._missing_orderbook_until[token_id] = time.time() + self._missing_orderbook_cooldown_sec
+                    failures = self._missing_orderbook_failures.get(token_id, 0) + 1
+                    self._missing_orderbook_failures[token_id] = failures
+                    cooldown = self._missing_orderbook_backoff_sec(failures)
+                    self._missing_orderbook_until[token_id] = time.time() + cooldown
                     self._record_stat("missing_orderbook")
                     LOG.warning(
                         "[cid=%s] token=%s… 暂无 orderbook，进入 %.0fs 冷却",
                         correlation_id,
                         token_id[:20],
-                        self._missing_orderbook_cooldown_sec,
+                        cooldown,
                     )
                     return None
                 if attempt < self._retry_count:
@@ -306,6 +310,8 @@ class OrderBookAnalyzer:
             timestamp=now,
         )
         self._set_cached_snapshot(token_id, snapshot, source="rest")
+        self._missing_orderbook_failures.pop(token_id, None)
+        self._missing_orderbook_until.pop(token_id, None)
         self._record_stat("rest_success")
         return snapshot
 
@@ -347,6 +353,13 @@ class OrderBookAnalyzer:
     def _evict_cached_snapshot(self, token_id: str) -> None:
         self._snapshot_cache.pop(token_id, None)
         self._snapshot_cache_source.pop(token_id, None)
+
+    def _missing_orderbook_backoff_sec(self, failures: int) -> float:
+        base = self._missing_orderbook_cooldown_sec
+        if base <= 0:
+            return 0.0
+        exponent = min(max(0, int(failures) - 1), 6)
+        return min(base * (2 ** exponent), 6 * 3600.0)
 
     def _record_stat(self, key: str, amount: int = 1) -> None:
         if key not in _ORDERBOOK_STAT_KEYS:

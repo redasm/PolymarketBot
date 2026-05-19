@@ -94,6 +94,7 @@ class ShadowPositionLifecycle:
     def snapshot(self) -> dict[str, Any]:
         unrealized = 0.0
         current_value = 0.0
+        open_cost = 0.0
         open_lots = 0
         open_size = 0.0
         for token_id, lots in self._lots_by_token.items():
@@ -103,11 +104,12 @@ class ShadowPositionLifecycle:
                     continue
                 open_lots += 1
                 open_size += lot.remaining_size
+                fee_alloc = lot.fees * (lot.remaining_size / lot.open_size) if lot.open_size > 0 else 0.0
+                cost = lot.open_price * lot.remaining_size
+                open_cost += cost + fee_alloc
                 if mark is None:
                     continue
                 value = mark * lot.remaining_size
-                cost = lot.open_price * lot.remaining_size
-                fee_alloc = lot.fees * (lot.remaining_size / lot.open_size) if lot.open_size > 0 else 0.0
                 current_value += value
                 unrealized += value - cost - fee_alloc
         return {
@@ -115,6 +117,7 @@ class ShadowPositionLifecycle:
             "unrealized_pnl": round(unrealized, 6),
             "total_pnl": round(self._realized_pnl + unrealized, 6),
             "current_position_value": round(current_value, 6),
+            "open_cost": round(open_cost, 6),
             "open_lots": open_lots,
             "open_size": round(open_size, 6),
             "fees": round(self._fees, 6),
