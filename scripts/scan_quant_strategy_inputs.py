@@ -206,6 +206,7 @@ def _build_payload(args) -> Any:
             _load_rows(Path(args.candidates)),
             min_violation_bps=args.min_violation_bps,
             max_candidates=args.max_candidates,
+            temperature=config.ai_temperature,
         )
         generated_at = time.time()
         return {

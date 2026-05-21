@@ -65,6 +65,7 @@ def select_logical_constraints_with_llm(
     *,
     min_violation_bps: float = 250.0,
     max_candidates: int = 40,
+    temperature: float,
 ) -> list[dict[str, Any]]:
     """Use an LLM provider to keep only deterministic implication relations.
 
@@ -87,6 +88,7 @@ def select_logical_constraints_with_llm(
             provider,
             candidates[:max_candidates],
             min_violation_bps=min_violation_bps,
+            temperature=temperature,
         )
     )
 
@@ -96,6 +98,7 @@ async def select_logical_constraints_with_llm_async(
     candidates: list[dict[str, Any]],
     *,
     min_violation_bps: float,
+    temperature: float,
 ) -> list[dict[str, Any]]:
     messages = [
         {
@@ -111,7 +114,7 @@ async def select_logical_constraints_with_llm_async(
             "content": json.dumps({"candidates": candidates}, ensure_ascii=False),
         },
     ]
-    resp = await provider.chat(messages, temperature=0.0, json_mode=True)
+    resp = await provider.chat(messages, temperature=temperature, json_mode=True)
     try:
         payload = json.loads(resp.content)
     except json.JSONDecodeError:

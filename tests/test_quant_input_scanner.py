@@ -37,7 +37,11 @@ class _FakeSession:
 
 
 class _FakeLLM:
+    def __init__(self) -> None:
+        self.calls = []
+
     async def chat(self, messages, *, temperature=0.1, json_mode=False, tools=None):
+        self.calls.append({"temperature": temperature, "json_mode": json_mode})
         content = json.dumps(
             {
                 "rules": [
@@ -113,8 +117,9 @@ def test_generate_logical_constraint_candidates_caps_and_ranks_large_events() ->
 
 
 def test_select_logical_constraints_with_llm_returns_parseable_rules() -> None:
+    llm = _FakeLLM()
     rules = select_logical_constraints_with_llm(
-        _FakeLLM(),
+        llm,
         [
             {
                 "subject_market_id": "candidate",
@@ -123,8 +128,10 @@ def test_select_logical_constraints_with_llm_returns_parseable_rules() -> None:
                 "bound_question": "Will Alice party win?",
             }
         ],
+        temperature=0.2,
     )
 
+    assert llm.calls == [{"temperature": 0.2, "json_mode": True}]
     assert rules == [
         {
             "subject_market_id": "candidate",
