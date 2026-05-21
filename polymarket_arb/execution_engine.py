@@ -732,6 +732,7 @@ class ExecutionEngine:
         *,
         fill_latency_sec: float = 0.0,
         now_ts: float | None = None,
+        fill_guard: Any | None = None,
     ) -> list[TradeRecord]:
         """Shadow-mode maker-fill sweep (roadmap §三-阶段 1).
 
@@ -795,6 +796,27 @@ class ExecutionEngine:
             else:
                 fill_size = requested_size
             partial = fill_size + 1e-9 < requested_size
+            if fill_guard is not None:
+                try:
+                    guard_result = fill_guard(trade, fill_size, cross_price)
+                except Exception as exc:  # pragma: no cover - guard failures should be conservative
+                    LOG.warning("shadow maker fill guard failed for %s: %s", trade.trade_id, exc)
+                    continue
+                allowed = bool(guard_result)
+                reason = ""
+                if isinstance(guard_result, tuple):
+                    allowed = bool(guard_result[0])
+                    reason = str(guard_result[1] if len(guard_result) > 1 else "")
+                if not allowed:
+                    LOG.info(
+                        "[SHADOW] maker quote fill skipped by guard: trade=%s side=%s limit=%.4f cross=%.4f reason=%s",
+                        trade.trade_id,
+                        trade.side.value,
+                        limit_price,
+                        cross_price,
+                        reason or "guard_rejected",
+                    )
+                    continue
 
             trade.status = TradeStatus.PARTIAL if partial else TradeStatus.FILLED
             trade.fill_price = limit_price

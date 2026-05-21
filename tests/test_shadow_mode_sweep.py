@@ -187,6 +187,31 @@ def test_sweep_caps_fill_at_opposing_depth_and_marks_partial() -> None:
     assert flipped[0].status == TradeStatus.PARTIAL
 
 
+def test_sweep_respects_fill_guard() -> None:
+    executor = _dry_run_executor()
+    trade = executor.submit_limit_order(
+        token_id="tok-guard",
+        condition_id="cid-guard",
+        outcome="Yes",
+        side=OrderSide.BUY,
+        price=0.50,
+        size=5.0,
+        post_only=True,
+        order_type_name="GTC",
+    )
+    snapshots = {trade.token_id: _snap(trade.token_id, bid=0.46, ask=0.48)}
+
+    flipped = executor.sweep_simulated_maker_fills(
+        lambda tid: snapshots.get(tid),
+        fill_latency_sec=0.0,
+        fill_guard=lambda _trade, _size, _cross: (False, "cap"),
+    )
+
+    assert flipped == []
+    assert trade.status == TradeStatus.PENDING
+    assert trade.fill_size is None
+
+
 def test_sweep_updates_trade_timestamp_to_fill_moment() -> None:
     """P1-2: trade.timestamp should advance to the fill moment."""
     executor = _dry_run_executor()

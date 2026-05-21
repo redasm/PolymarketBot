@@ -144,6 +144,7 @@ from polymarket_arb.market_scanner import MarketScanner
 from polymarket_arb.models import (
     MarketInfo,
     ResearchSignalReport,
+    TradeRecord,
 )
 from polymarket_arb.notifier import NotificationManager
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
@@ -1429,11 +1430,23 @@ def main(dotenv_path: str | None = None) -> None:
             # cache layer the vast majority of the time, since the same
             # token usually had a snapshot fetched earlier in the cycle
             # by scan/signal collection.
+            shadow_fill_slots_used = 0
+
+            def _shadow_maker_fill_guard(trade: TradeRecord, _fill_size: float, _cross_price: float):
+                nonlocal shadow_fill_slots_used
+                if str(getattr(trade.side, "value", trade.side)).upper() != "BUY":
+                    return True, ""
+                if risk_mgr.state.open_positions + shadow_fill_slots_used >= config.max_open_positions:
+                    return False, "shadow_open_position_cap"
+                shadow_fill_slots_used += 1
+                return True, ""
+
             swept_maker_fills = executor.sweep_simulated_maker_fills(
                 lambda token_id: ob_analyzer.get_snapshot(
                     token_id, allow_rest_fallback=True, count_request=False
                 ),
                 fill_latency_sec=config.shadow_maker_fill_latency_sec,
+                fill_guard=_shadow_maker_fill_guard,
             )
             observed_maker_fills = _handle_observed_maker_fills(
                 trades=swept_maker_fills,

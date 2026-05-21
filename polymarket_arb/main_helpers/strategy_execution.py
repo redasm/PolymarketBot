@@ -395,6 +395,14 @@ def execute_strategy_signal(
             except Exception:
                 target_snap = None
         target_tick_size = float(getattr(target_snap, "tick_size", 0.01) or 0.01)
+        if target_order_side == OrderSide.BUY and target_snap is not None:
+            best_ask = getattr(target_snap, "best_ask", None)
+            if best_ask is not None and float(best_ask) <= target_price:
+                return False, "post_only_would_cross_best_ask", ExecutionDelta()
+        if target_order_side == OrderSide.SELL and target_snap is not None:
+            best_bid = getattr(target_snap, "best_bid", None)
+            if best_bid is not None and float(best_bid) >= target_price:
+                return False, "post_only_would_cross_best_bid", ExecutionDelta()
         maker_opp = ArbOpportunity(
             arb_type=ArbType.MARKET_MAKING,
             event_id=market.event_id or market.condition_id,

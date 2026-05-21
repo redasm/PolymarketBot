@@ -442,6 +442,55 @@ def test_maker_inventory_sell_releases_t3_orchestrator_exposure() -> None:
     assert orchestrator.get_status()["T3"]["current_exposure"] == pytest.approx(0.4)
 
 
+def test_maker_buy_post_only_rejects_crossing_snapshot() -> None:
+    class _Executor:
+        def ensure_sufficient_collateral(self, _amount):
+            raise AssertionError("crossing post-only should be rejected before collateral check")
+
+        def submit_limit_order(self, **_kwargs):
+            raise AssertionError("crossing post-only should not submit")
+
+    class _Risk:
+        def pre_trade_check(self, _opp, size):
+            return True, "", size
+
+        def record_execution(self, *_args, **_kwargs):
+            raise AssertionError("rejected quote should not book risk")
+
+    sig = _signal(
+        tier=StrategyTier.MARKET_MAKING,
+        payload={
+            "quote": {
+                "fair_value": 0.50,
+                "bid_price": 0.49,
+                "ask_price": None,
+                "bid_size": 1.0,
+                "ask_size": 0.0,
+            }
+        },
+    )
+
+    success, reason, delta = execute_strategy_signal(
+        signal=sig,
+        config=_config(dry_run=True),
+        active_markets=[_binary_market()],
+        ob_analyzer=SimpleNamespace(
+            get_snapshot=lambda _token_id: SimpleNamespace(tick_size=0.01, best_ask=0.48)
+        ),
+        executor=_Executor(),
+        risk_mgr=_Risk(),
+        orchestrator=StrategyOrchestrator(total_bankroll=10.0),
+        dash_state=DashboardState(),
+        event_recorder=_Recorder(),
+        maker_strategy=MakerStrategy(default_size=1.0),
+        notifier=_Notifier(),
+    )
+
+    assert success is False
+    assert reason == "post_only_would_cross_best_ask"
+    assert delta == ExecutionDelta()
+
+
 # ---------- ExecutionDelta dataclass shape -----------------------------------
 
 

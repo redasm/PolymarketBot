@@ -4,7 +4,7 @@
 
 ## 策略体系
 
-本系统实现 **4 层策略**，按优先级从高到低执行：
+本系统实现 **4 层执行策略 + 3 个可选量化信号源**，按优先级从高到低执行：
 
 ```
                     ┌──────────────┐
@@ -20,6 +20,12 @@
          │ T3 做市 + 流动性奖励               │  0% 费率 | 连续收入 | 年化 ~15-30%
          └───────────────────────────────────┘
 ```
+
+可选量化信号源默认不凭空启用，必须提供离线验证/外部数据输入：
+
+- **逻辑约束**: 显式规则发现 `P(子事件) > P(上界事件)` 这类确定性关系违背，长-only 买入被低估的 bound 市场。
+- **事件日历**: 对 CPI、选举、体育赛程等已知 catalyst，用外部 baseline probability 与当前盘口做 markout。
+- **钱包 alpha**: 只跟随已通过 shadow/离线验证的钱包；候选钱包先进入 shadow-only lane，不能直接实盘。
 
 ### T0 — 结构性套利
 
@@ -71,6 +77,8 @@ FairValueModel (log-normal GBM)  ──┐
 - **价格动量**: 短期趋势延续信号
 - **跨市场逻辑约束**: P(Trump wins) > P(Republican wins) 是逻辑矛盾
 - **现货锚定**: UPDOWN 市场中 BTC 现货价 vs 参考价的 z-score
+- **事件日历 baseline**: 外部概率基准与盘口偏差，适合有明确发布时间/赛程的市场
+- **钱包 alpha**: 仅消费已晋级钱包画像与新观察，不自动相信公开盈利地址
 
 ### T3 — 做市策略
 
@@ -111,6 +119,10 @@ polymarket_arb/
     ├── optimal_stopping.py            # Bellman/MDP 最优退出与分批止盈阈值
     ├── cross_platform.py              # T1 跨平台套利（Polymarket vs Kalshi）
     ├── statistical_model.py           # T2 贝叶斯定价 + FairValueModel 现货锚定
+    ├── logical_constraints.py         # 可选逻辑约束信号（显式包含/上界关系）
+    ├── event_calendar_model.py        # 可选事件日历 baseline 定价信号
+    ├── wallet_alpha.py                # 可选已验证钱包跟随信号
+    ├── sniper_gate.py                 # 高置信度/低相关性过滤器
     ├── maker_strategy.py              # T3 做市策略（VolEstimator 驱动 spread）
     └── strategy_orchestrator.py       # 策略编排器（优先级调度 + 资金分配）
 
@@ -701,6 +713,24 @@ python -m research.backtest.run --strategy logical-constraint --dataset default
 python -m research.backtest.run --strategy event-calendar --dataset default
 python -m research.backtest.run --strategy wallet-alpha --dataset default
 ```
+
+从现有 tick 先生成回测数据集：
+
+```bash
+python scripts/build_backtest_datasets.py --ticks-dir data/ticks --output-root data/backtest --prefix current
+```
+
+这三个策略的回测依赖额外字段/配置：`logical-constraint` 需要 `LOGICAL_CONSTRAINTS_JSON` 或文件；`event-calendar` 需要每行 snapshot 带 `baseline_probability/confidence/time_to_event_sec`；`wallet-alpha` 需要 `WALLET_ALPHA_PROFILES_JSON` 和 snapshot/观察行中的 `wallet_address/action/category`。如果直接用普通 tick 数据运行，通常会得到 0 信号，这是正常的。
+
+最近一次本地敏感性样本（`data/backtest/current_quant_sample`，40 个世界杯冠军相关市场、27 个时间步；baseline/钱包/逻辑规则为离线构造，不代表真实 alpha）：
+
+```bash
+python -m research.backtest.run --strategy logical-constraint --dataset current_quant_sample --dotenv-path data/backtest/current_quant_sample.env --output-dir research/backtest/output/current_quant_sample/logical --execution-model top --holding-period-ms 300000 --max-open-positions 5 --max-total-exposure 100
+python -m research.backtest.run --strategy event-calendar --dataset current_quant_sample --dotenv-path data/backtest/current_quant_sample.env --output-dir research/backtest/output/current_quant_sample/event --execution-model top --holding-period-ms 300000 --max-open-positions 5 --max-total-exposure 100
+python -m research.backtest.run --strategy wallet-alpha --dataset current_quant_sample --dotenv-path data/backtest/current_quant_sample.env --output-dir research/backtest/output/current_quant_sample/wallet --execution-model top --holding-period-ms 300000 --max-open-positions 5 --max-total-exposure 100
+```
+
+本次结果：逻辑约束 `30/135` fills，净 PnL `-28.18`; 事件日历 `30/1080` fills，净 PnL `-51.80`; 钱包 alpha `10/400` fills，净 PnL `-17.27`。在这个假设样本里三者都不能进入实盘，只能说明 runner 和执行/markout 管线可用。
 
 ### 使用 tmux（远程服务器）
 
