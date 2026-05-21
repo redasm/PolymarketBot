@@ -227,12 +227,18 @@ def get_or_create_event_loop() -> asyncio.AbstractEventLoop:
     need to know that detail.
     """
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         if loop.is_closed():
             raise RuntimeError
     except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        policy = asyncio.get_event_loop_policy()
+        try:
+            loop = policy.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
     return loop
 
 

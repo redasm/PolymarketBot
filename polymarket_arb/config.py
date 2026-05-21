@@ -303,6 +303,26 @@ class ArbConfig:
     backtest_slippage_bps: float
     backtest_reports_dir: str
 
+    # New quant strategy gates (default off / inert unless configured)
+    sniper_gate_enabled: bool = False
+    sniper_min_net_edge_bps: float = 250.0
+    sniper_min_confidence: float = 0.75
+    sniper_min_liquidity: float = 0.0
+    sniper_min_volume_24h: float = 0.0
+    sniper_max_correlation_score: float = 0.80
+    logical_constraints_json: str = ""
+    event_baselines_json: str = ""
+    wallet_alpha_profiles_json: str = ""
+    wallet_alpha_observations_json: str = ""
+    logical_constraints_file: str = ""
+    event_baselines_file: str = ""
+    wallet_alpha_profiles_file: str = ""
+    wallet_alpha_observations_file: str = ""
+    wallet_alpha_candidate_shadow_enabled: bool = False
+    wallet_alpha_shadow_validation_enabled: bool = True
+    wallet_alpha_shadow_max_signals_per_cycle: int = 5
+    wallet_alpha_shadow_max_exec_ms_per_cycle: float = 250.0
+
     def __post_init__(self) -> None:
         self.validate()
 
@@ -487,6 +507,18 @@ class ArbConfig:
             raise ValueError("T3_FLOW_BIAS_INVENTORY_WEIGHT 不能为负数")
         if self.shadow_maker_fill_latency_sec < 0:
             raise ValueError("SHADOW_MAKER_FILL_LATENCY_SEC 不能为负数")
+        if self.sniper_min_net_edge_bps < 0:
+            raise ValueError("SNIPER_MIN_NET_EDGE_BPS 不能为负数")
+        if not 0 <= self.sniper_min_confidence <= 1:
+            raise ValueError("SNIPER_MIN_CONFIDENCE 必须在 [0, 1] 区间")
+        if self.sniper_min_liquidity < 0 or self.sniper_min_volume_24h < 0:
+            raise ValueError("SNIPER_MIN_LIQUIDITY 和 SNIPER_MIN_VOLUME_24H 不能为负数")
+        if not 0 <= self.sniper_max_correlation_score <= 1:
+            raise ValueError("SNIPER_MAX_CORRELATION_SCORE 必须在 [0, 1] 区间")
+        if self.wallet_alpha_shadow_max_signals_per_cycle < 0:
+            raise ValueError("WALLET_ALPHA_SHADOW_MAX_SIGNALS_PER_CYCLE 不能为负数")
+        if self.wallet_alpha_shadow_max_exec_ms_per_cycle < 0:
+            raise ValueError("WALLET_ALPHA_SHADOW_MAX_EXEC_MS_PER_CYCLE 不能为负数")
         if not self.dry_run:
             if not self.live_trading_ack:
                 raise ValueError("实盘前必须设置 LIVE_TRADING_ACK=true")
@@ -507,7 +539,9 @@ class ArbConfig:
         require_wallet: bool = True,
     ) -> ArbConfig:
         """从 .env 文件和环境变量构建配置."""
-        if dotenv_path:
+        if str(dotenv_path or "") == "__ENV_ONLY__":
+            pass
+        elif dotenv_path:
             load_dotenv(dotenv_path, override=True)
         else:
             load_dotenv(override=True)
@@ -728,6 +762,30 @@ class ArbConfig:
             backtest_default_dataset=_env("BACKTEST_DEFAULT_DATASET", "default"),
             backtest_slippage_bps=_env_float("BACKTEST_SLIPPAGE_BPS", 5.0),
             backtest_reports_dir=_env("BACKTEST_REPORTS_DIR", "research/backtest/output"),
+            sniper_gate_enabled=_env_bool("SNIPER_GATE_ENABLED", False),
+            sniper_min_net_edge_bps=_env_float("SNIPER_MIN_NET_EDGE_BPS", 250.0),
+            sniper_min_confidence=_env_float("SNIPER_MIN_CONFIDENCE", 0.75),
+            sniper_min_liquidity=_env_float("SNIPER_MIN_LIQUIDITY", 0.0),
+            sniper_min_volume_24h=_env_float("SNIPER_MIN_VOLUME_24H", 0.0),
+            sniper_max_correlation_score=_env_float("SNIPER_MAX_CORRELATION_SCORE", 0.80),
+            logical_constraints_json=_env("LOGICAL_CONSTRAINTS_JSON", ""),
+            event_baselines_json=_env("EVENT_BASELINES_JSON", ""),
+            wallet_alpha_profiles_json=_env("WALLET_ALPHA_PROFILES_JSON", ""),
+            wallet_alpha_observations_json=_env("WALLET_ALPHA_OBSERVATIONS_JSON", ""),
+            logical_constraints_file=_env("LOGICAL_CONSTRAINTS_FILE", ""),
+            event_baselines_file=_env("EVENT_BASELINES_FILE", ""),
+            wallet_alpha_profiles_file=_env("WALLET_ALPHA_PROFILES_FILE", ""),
+            wallet_alpha_observations_file=_env("WALLET_ALPHA_OBSERVATIONS_FILE", ""),
+            wallet_alpha_candidate_shadow_enabled=_env_bool("WALLET_ALPHA_CANDIDATE_SHADOW_ENABLED", False),
+            wallet_alpha_shadow_validation_enabled=_env_bool("WALLET_ALPHA_SHADOW_VALIDATION_ENABLED", True),
+            wallet_alpha_shadow_max_signals_per_cycle=_env_int(
+                "WALLET_ALPHA_SHADOW_MAX_SIGNALS_PER_CYCLE",
+                5,
+            ),
+            wallet_alpha_shadow_max_exec_ms_per_cycle=_env_float(
+                "WALLET_ALPHA_SHADOW_MAX_EXEC_MS_PER_CYCLE",
+                250.0,
+            ),
         )
 
         LOG.info(

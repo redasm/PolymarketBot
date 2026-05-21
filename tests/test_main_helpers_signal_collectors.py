@@ -15,8 +15,11 @@ import pytest
 from polymarket_arb.main_helpers.flow_aggregator import FlowAggregator
 from polymarket_arb.main_helpers.signal_collectors import (
     collect_cross_platform_strategy_signals,
+    collect_event_calendar_strategy_signals,
+    collect_logical_constraint_strategy_signals,
     collect_maker_strategy_signals,
     collect_statistical_strategy_signals,
+    collect_wallet_alpha_strategy_signals,
 )
 from polymarket_arb.models import MarketInfo, OrderBookLevel, OrderBookSnapshot, TokenInfo
 from polymarket_arb.strategies.strategy_orchestrator import StrategyTier
@@ -119,6 +122,200 @@ def test_collect_cross_platform_translates_each_opportunity():
     assert len(sig.description) <= 120
     assert sig.payload["pair_id"] == "pair-X"
     assert sig.payload["edge_pct"] == 0.012
+
+
+# --------- new quant strategies ----------
+
+
+def test_collect_logical_constraints_returns_empty_without_rules():
+    cfg = make_test_config()
+    snapshots = {"a-yes": _balanced_snapshot("a-yes"), "b-yes": _balanced_snapshot("b-yes")}
+
+    out = collect_logical_constraint_strategy_signals(
+        config=cfg,
+        candidate_markets=[_binary_market("a"), _binary_market("b")],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        rules=[],
+    )
+
+    assert out == []
+
+
+def test_collect_logical_constraints_uses_yes_mid_prices_from_books():
+    cfg = make_test_config(default_order_size_usdc=11.0)
+    snapshots = {
+        "candidate-yes": _balanced_snapshot("candidate-yes", mid=0.62),
+        "party-yes": _balanced_snapshot("party-yes", mid=0.55),
+    }
+
+    out = collect_logical_constraint_strategy_signals(
+        config=cfg,
+        candidate_markets=[
+            _binary_market("candidate", yes_price=0.62),
+            _binary_market("party", yes_price=0.55),
+        ],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        rules=[
+            {
+                "subject_market_id": "candidate",
+                "bound_market_id": "party",
+                "relation_type": "subject_lte_bound",
+                "min_violation_bps": 200,
+            }
+        ],
+    )
+
+    assert len(out) == 1
+    assert out[0].signal_type == "logical_constraint_buy_bound"
+    assert out[0].market_id == "party"
+    assert out[0].recommended_size_usdc == 11.0
+
+
+def test_collect_event_calendar_uses_market_raw_baseline_metadata():
+    cfg = make_test_config(default_order_size_usdc=9.0)
+    market = _binary_market("event")
+    market.raw.update(
+        {
+            "event_baseline_probability": 0.55,
+            "event_confidence": 0.80,
+            "time_to_event_sec": 3600,
+        }
+    )
+    snapshots = {"event-yes": _balanced_snapshot("event-yes", mid=0.45)}
+
+    out = collect_event_calendar_strategy_signals(
+        config=cfg,
+        candidate_markets=[market],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+    )
+
+    assert len(out) == 1
+    assert out[0].signal_type == "event_calendar_buy_yes"
+    assert out[0].market_id == "event"
+    assert out[0].recommended_size_usdc == 9.0
+
+
+def test_collect_event_calendar_returns_empty_without_baseline_metadata():
+    cfg = make_test_config()
+
+    out = collect_event_calendar_strategy_signals(
+        config=cfg,
+        candidate_markets=[_binary_market("event")],
+        ob_analyzer=_StubBookAnalyzer({"event-yes": _balanced_snapshot("event-yes", mid=0.45)}),
+    )
+
+    assert out == []
+
+
+def test_collect_wallet_alpha_converts_accepted_observation_to_signal():
+    cfg = make_test_config(default_order_size_usdc=7.0)
+    market = _binary_market("weather")
+    profiles = {
+        "0xgood": {
+            "trade_count": 40,
+            "realized_roi": 0.25,
+            "lagged_follow_roi": 0.08,
+            "max_drawdown": 0.10,
+            "concentration_score": 0.20,
+            "category_edges": {"weather": 0.09},
+        }
+    }
+    observations = [
+        {
+            "wallet_address": "0xgood",
+            "market_id": "weather",
+            "category": "weather",
+            "action": "BUY_YES",
+            "observed_size_usdc": 100.0,
+        }
+    ]
+
+    out = collect_wallet_alpha_strategy_signals(
+        config=cfg,
+        candidate_markets=[market],
+        profiles=profiles,
+        observations=observations,
+    )
+
+    assert len(out) == 1
+    assert out[0].signal_type == "wallet_alpha_buy_yes"
+    assert out[0].market_id == "weather"
+    assert out[0].recommended_size_usdc == 7.0
+    assert out[0].payload["wallet_address"] == "0xgood"
+
+
+def test_collect_wallet_alpha_rejects_unfollowable_wallet_profile():
+    cfg = make_test_config()
+    profiles = {
+        "0xflash": {
+            "trade_count": 4,
+            "realized_roi": 2.0,
+            "lagged_follow_roi": -0.05,
+            "max_drawdown": 0.60,
+            "concentration_score": 0.90,
+            "category_edges": {"crypto": 2.0},
+        }
+    }
+
+    out = collect_wallet_alpha_strategy_signals(
+        config=cfg,
+        candidate_markets=[_binary_market("crypto")],
+        profiles=profiles,
+        observations=[
+            {
+                "wallet_address": "0xflash",
+                "market_id": "crypto",
+                "category": "crypto",
+                "action": "BUY_YES",
+            }
+        ],
+    )
+
+    assert out == []
+
+
+def test_collect_wallet_alpha_can_emit_unvalidated_candidate_only_in_dry_run():
+    cfg = make_test_config(dry_run=True, wallet_alpha_candidate_shadow_enabled=True)
+
+    out = collect_wallet_alpha_strategy_signals(
+        config=cfg,
+        candidate_markets=[_binary_market("m1")],
+        profiles={},
+        observations=[
+            {
+                "wallet_address": "0xcandidate",
+                "market_id": "m1",
+                "category": "macro",
+                "action": "BUY_YES",
+                "observed_size_usdc": 12,
+            }
+        ],
+    )
+
+    assert len(out) == 1
+    assert out[0].signal_type == "wallet_alpha_candidate_buy_yes"
+    assert out[0].payload["wallet_profile_status"] == "candidate_unvalidated"
+    assert out[0].payload["deviation"] > 0
+    assert out[0].expected_edge > 0
+
+
+def test_collect_wallet_alpha_candidate_shadow_is_disabled_in_live_mode():
+    cfg = make_test_config(
+        dry_run=False,
+        live_trading_ack=True,
+        portfolio_sync_enabled=True,
+        polymarket_taker_fee_rate=0.02,
+        wallet_alpha_candidate_shadow_enabled=True,
+    )
+
+    out = collect_wallet_alpha_strategy_signals(
+        config=cfg,
+        candidate_markets=[_binary_market("m1")],
+        profiles={},
+        observations=[{"wallet_address": "0xcandidate", "market_id": "m1", "action": "BUY_YES"}],
+    )
+
+    assert out == []
 
 
 # --------- T2: statistical ----------

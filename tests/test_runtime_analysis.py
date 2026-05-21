@@ -118,3 +118,36 @@ def test_summarize_runtime_artifacts_reads_rotated_telemetry_files(tmp_path: Pat
     assert summary["signals"]["by_tier"] == {"MARKET_MAKING": 1, "STATISTICAL_ARB": 1}
     assert summary["trades"]["live_successes"] == 1
     assert summary["trades"]["expected_profit_total"] == 0.01
+
+
+def test_summarize_runtime_artifacts_groups_new_quant_strategy_signals(tmp_path: Path):
+    log_path = tmp_path / "arb_bot.log"
+    telemetry_dir = tmp_path / "telemetry"
+    ticks_dir = tmp_path / "ticks"
+    telemetry_dir.mkdir()
+    ticks_dir.mkdir()
+
+    log_path.write_text("2026-04-15 [INFO] main_loop | 模式: DRY RUN (仅扫描)", encoding="utf-8")
+    (telemetry_dir / "2026-04-14.strategy_signals.ndjson").write_text(
+        (
+            '{"tier":"STATISTICAL_ARB","signal_type":"logical_constraint_buy_bound",'
+            '"submitted":true,"expected_edge":700,"confidence":0.82}\n'
+            '{"tier":"STATISTICAL_ARB","signal_type":"event_calendar_buy_yes",'
+            '"submitted":false,"expected_edge":350,"confidence":0.76}\n'
+            '{"tier":"STATISTICAL_ARB","signal_type":"wallet_alpha_buy_yes",'
+            '"submitted":true,"expected_edge":800,"confidence":0.81}\n'
+            '{"tier":"STATISTICAL_ARB","signal_type":"statistical_buy_yes",'
+            '"submitted":true,"expected_edge":120,"confidence":0.65}\n'
+        ),
+        encoding="utf-8",
+    )
+
+    summary = summarize_runtime_artifacts(log_path=log_path, telemetry_dir=telemetry_dir, ticks_dir=ticks_dir)
+    quant = summary["signals"]["quant_strategies"]
+
+    assert quant["logical_constraint"]["count"] == 1
+    assert quant["logical_constraint"]["submitted"] == 1
+    assert quant["event_calendar"]["count"] == 1
+    assert quant["event_calendar"]["submitted"] == 0
+    assert quant["wallet_alpha"]["avg_expected_edge_bps"] == 800.0
+    assert "statistical_buy_yes" not in quant

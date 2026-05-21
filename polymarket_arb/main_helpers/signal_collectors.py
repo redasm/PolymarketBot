@@ -19,6 +19,7 @@ Why a separate module:
 from __future__ import annotations
 
 import logging
+import json
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -36,9 +37,12 @@ from polymarket_arb.main_helpers.signal_helpers import (
 )
 from polymarket_arb.models import MarketInfo
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
+from polymarket_arb.strategies.event_calendar_model import EventCalendarModel, EventPricingInput
+from polymarket_arb.strategies.logical_constraints import LogicalConstraintDetector, RelationRule
 from polymarket_arb.strategies.maker_strategy import MakerStrategy
 from polymarket_arb.strategies.statistical_model import StatisticalMispricingDetector
 from polymarket_arb.strategies.strategy_orchestrator import StrategySignal, StrategyTier
+from polymarket_arb.strategies.wallet_alpha import WalletAlphaScorer, WalletProfile
 
 LOG = logging.getLogger("main_loop")
 
@@ -135,6 +139,180 @@ def collect_cross_platform_strategy_signals(
     return signals
 
 
+def collect_logical_constraint_strategy_signals(
+    *,
+    config: ArbConfig,
+    candidate_markets: list[MarketInfo],
+    ob_analyzer: OrderBookAnalyzer,
+    rules: list[dict[str, Any] | RelationRule] | str | None = None,
+) -> list[StrategySignal]:
+    """Emit relationship-violation signals from explicit market rules.
+
+    No rules means no signals. This keeps the collector safe to call from the
+    main loop while operators build a vetted relation list.
+    """
+    parsed_rules = _parse_relation_rules(rules)
+    if not parsed_rules:
+        return []
+
+    markets_by_id = {market.condition_id: market for market in candidate_markets}
+    yes_prices: dict[str, float] = {}
+    for market in candidate_markets:
+        token = _yes_token(market)
+        if token is None:
+            continue
+        snap = ob_analyzer.get_snapshot(token.token_id)
+        if snap is not None and snap.mid is not None:
+            yes_prices[market.condition_id] = float(snap.mid)
+        elif token.price > 0:
+            yes_prices[market.condition_id] = float(token.price)
+
+    detector = LogicalConstraintDetector(
+        rules=parsed_rules,
+        default_size_usdc=config.default_order_size_usdc,
+    )
+    return detector.detect(markets=markets_by_id, yes_prices=yes_prices)
+
+
+def collect_event_calendar_strategy_signals(
+    *,
+    config: ArbConfig,
+    candidate_markets: list[MarketInfo],
+    ob_analyzer: OrderBookAnalyzer,
+    baselines: dict[str, dict[str, Any]] | str | None = None,
+) -> list[StrategySignal]:
+    """Emit event-baseline signals from market metadata or explicit baselines."""
+    baseline_map = _parse_event_baselines(baselines)
+    model = EventCalendarModel(default_size_usdc=config.default_order_size_usdc)
+    signals: list[StrategySignal] = []
+    for market in candidate_markets:
+        token = _yes_token(market)
+        if token is None:
+            continue
+        snap = ob_analyzer.get_snapshot(token.token_id)
+        market_price = float(snap.mid) if snap is not None and snap.mid is not None else float(token.price)
+        if market_price <= 0:
+            continue
+
+        raw_baseline = _event_baseline_for_market(market, baseline_map)
+        if raw_baseline is None:
+            continue
+
+        item = EventPricingInput(
+            market=market,
+            market_price=market_price,
+            baseline_probability=float(raw_baseline["baseline_probability"]),
+            confidence=float(raw_baseline["confidence"]),
+            time_to_event_sec=float(raw_baseline["time_to_event_sec"]),
+            taker_fee_rate=config.polymarket_taker_fee_rate,
+        )
+        signal = model.evaluate(item)
+        if signal is not None:
+            signals.append(signal)
+    return signals
+
+
+def collect_wallet_alpha_strategy_signals(
+    *,
+    config: ArbConfig,
+    candidate_markets: list[MarketInfo],
+    profiles: dict[str, dict[str, Any] | WalletProfile] | str | None = None,
+    observations: list[dict[str, Any]] | str | None = None,
+    scorer: WalletAlphaScorer | None = None,
+) -> list[StrategySignal]:
+    """Convert vetted wallet observations into follow signals.
+
+    This collector is intentionally data-source agnostic. A future activity
+    adapter can feed `observations`; the strategy logic here only accepts
+    wallets whose lagged-follow profile has already proven repeatable.
+    """
+    parsed_profiles = _parse_wallet_profiles(profiles)
+    parsed_observations = _parse_wallet_observations(observations)
+    if not parsed_observations:
+        return []
+    candidate_shadow_enabled = bool(
+        config.dry_run and getattr(config, "wallet_alpha_candidate_shadow_enabled", False)
+    )
+    if not parsed_profiles and not candidate_shadow_enabled:
+        return []
+
+    markets = {market.condition_id: market for market in candidate_markets}
+    alpha_scorer = scorer or WalletAlphaScorer()
+    signals: list[StrategySignal] = []
+    for obs in parsed_observations:
+        wallet = str(obs.get("wallet_address", ""))
+        market_id = str(obs.get("market_id", ""))
+        action = str(obs.get("action", "BUY_YES")).upper()
+        profile = parsed_profiles.get(wallet)
+        market = markets.get(market_id)
+        if market is None:
+            continue
+        category = str(obs.get("category", "") or "")
+        if profile is None:
+            if candidate_shadow_enabled:
+                candidate_signal = _wallet_alpha_candidate_signal(config, market, obs, action, wallet, category)
+                if candidate_signal is not None:
+                    signals.append(candidate_signal)
+            continue
+        decision = alpha_scorer.evaluate(profile, category=category or None)
+        if not decision.accepted:
+            continue
+        if action not in {"BUY_YES", "BUY_NO"}:
+            continue
+
+        signals.append(
+            StrategySignal(
+                tier=StrategyTier.STATISTICAL_ARB,
+                signal_type=f"wallet_alpha_{action.lower()}",
+                market_id=market.condition_id,
+                description=f"wallet alpha follow {wallet[:10]} on {market.question[:80]}",
+                expected_edge=max(0.0, profile.lagged_follow_roi) * 10_000.0,
+                confidence=decision.confidence,
+                recommended_size_usdc=config.default_order_size_usdc,
+                urgency=0.65,
+                payload={
+                    "action": action,
+                    "wallet_address": wallet,
+                    "category": category,
+                    "observed_size_usdc": float(obs.get("observed_size_usdc", 0.0) or 0.0),
+                    "lagged_follow_roi": profile.lagged_follow_roi,
+                    "wallet_reasons": list(decision.reasons),
+                },
+            )
+        )
+    return signals
+
+
+def _wallet_alpha_candidate_signal(
+    config: ArbConfig,
+    market: MarketInfo,
+    obs: dict[str, Any],
+    action: str,
+    wallet: str,
+    category: str,
+) -> StrategySignal | None:
+    if action not in {"BUY_YES", "BUY_NO"}:
+        return None
+    return StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type=f"wallet_alpha_candidate_{action.lower()}",
+        market_id=market.condition_id,
+        description=f"wallet alpha candidate shadow {wallet[:10]} on {market.question[:80]}",
+        expected_edge=300.0,
+        confidence=0.10,
+        recommended_size_usdc=config.default_order_size_usdc,
+        urgency=0.35,
+        payload={
+            "action": action,
+            "deviation": 0.03,
+            "wallet_address": wallet,
+            "category": category,
+            "observed_size_usdc": float(obs.get("observed_size_usdc", 0.0) or 0.0),
+            "wallet_profile_status": "candidate_unvalidated",
+        },
+    )
+
+
 def collect_statistical_strategy_signals(
     *,
     config: ArbConfig,
@@ -228,6 +406,147 @@ def collect_statistical_strategy_signals(
         )[:10],
     }
     return signals
+
+
+def _yes_token(market: MarketInfo):
+    if not market.tokens:
+        return None
+    return next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
+
+
+def _parse_relation_rules(raw_rules: list[dict[str, Any] | RelationRule] | str | None) -> list[RelationRule]:
+    if not raw_rules:
+        return []
+    rows: Any = raw_rules
+    if isinstance(raw_rules, str):
+        try:
+            rows = json.loads(raw_rules)
+        except json.JSONDecodeError:
+            LOG.warning("LOGICAL_CONSTRAINTS_JSON 解析失败，忽略逻辑约束策略")
+            return []
+    parsed: list[RelationRule] = []
+    for row in rows or []:
+        if isinstance(row, RelationRule):
+            parsed.append(row)
+            continue
+        if not isinstance(row, dict):
+            continue
+        try:
+            parsed.append(
+                RelationRule(
+                    subject_market_id=str(row["subject_market_id"]),
+                    bound_market_id=str(row["bound_market_id"]),
+                    relation_type=str(row.get("relation_type", "subject_lte_bound")),
+                    min_violation_bps=float(row.get("min_violation_bps", 200.0)),
+                    max_size_usdc=(
+                        float(row["max_size_usdc"])
+                        if row.get("max_size_usdc") not in (None, "")
+                        else None
+                    ),
+                    tags=tuple(str(tag) for tag in row.get("tags", []) or []),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            LOG.debug("跳过无效逻辑约束规则: %s", row)
+    return parsed
+
+
+def _parse_event_baselines(raw: dict[str, dict[str, Any]] | str | None) -> dict[str, dict[str, Any]]:
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return {str(key): dict(value) for key, value in raw.items() if isinstance(value, dict)}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        LOG.warning("EVENT_BASELINES_JSON 解析失败，忽略事件基线策略")
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {str(key): dict(value) for key, value in payload.items() if isinstance(value, dict)}
+
+
+def _event_baseline_for_market(
+    market: MarketInfo,
+    baseline_map: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    raw = baseline_map.get(market.condition_id) or baseline_map.get(market.slug)
+    if raw is None:
+        raw = market.raw
+    baseline = _first_float(raw, ("event_baseline_probability", "baseline_probability"))
+    confidence = _first_float(raw, ("event_confidence", "confidence"))
+    time_to_event = _first_float(raw, ("time_to_event_sec", "seconds_to_event"))
+    if baseline is None or confidence is None or time_to_event is None:
+        return None
+    return {
+        "baseline_probability": baseline,
+        "confidence": confidence,
+        "time_to_event_sec": time_to_event,
+    }
+
+
+def _first_float(raw: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        if key not in raw or raw[key] in (None, ""):
+            continue
+        try:
+            return float(raw[key])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _parse_wallet_profiles(raw: dict[str, dict[str, Any] | WalletProfile] | str | None) -> dict[str, WalletProfile]:
+    if not raw:
+        return {}
+    payload: Any = raw
+    if isinstance(raw, str):
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            LOG.warning("WALLET_ALPHA_PROFILES_JSON 解析失败，忽略钱包 alpha 策略")
+            return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    parsed: dict[str, WalletProfile] = {}
+    for wallet, row in payload.items():
+        if isinstance(row, WalletProfile):
+            parsed[str(wallet)] = row
+            continue
+        if not isinstance(row, dict):
+            continue
+        try:
+            parsed[str(wallet)] = WalletProfile(
+                wallet_address=str(row.get("wallet_address") or wallet),
+                trade_count=int(row.get("trade_count", 0)),
+                realized_roi=float(row.get("realized_roi", 0.0)),
+                lagged_follow_roi=float(row.get("lagged_follow_roi", 0.0)),
+                max_drawdown=float(row.get("max_drawdown", 1.0)),
+                concentration_score=float(row.get("concentration_score", 1.0)),
+                category_edges={
+                    str(key): float(value)
+                    for key, value in dict(row.get("category_edges", {}) or {}).items()
+                },
+            )
+        except (TypeError, ValueError):
+            LOG.debug("跳过无效钱包画像: %s", row)
+    return parsed
+
+
+def _parse_wallet_observations(raw: list[dict[str, Any]] | str | None) -> list[dict[str, Any]]:
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [dict(item) for item in raw if isinstance(item, dict)]
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        LOG.warning("WALLET_ALPHA_OBSERVATIONS_JSON 解析失败，忽略钱包观察")
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [dict(item) for item in payload if isinstance(item, dict)]
 
 
 def _market_horizon_days(market: MarketInfo) -> float | None:

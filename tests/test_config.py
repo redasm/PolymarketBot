@@ -143,6 +143,45 @@ def test_from_env_loads_new_edge_and_cooldown_config(tmp_path, monkeypatch):
     assert cfg.data_research_cache_max_gb == 1.0
 
 
+def test_from_env_loads_quant_strategy_json_config(tmp_path, monkeypatch):
+    env_path = write_test_env(tmp_path)
+    env_path.write_text(
+        env_path.read_text(encoding="utf-8")
+        + '\nLOGICAL_CONSTRAINTS_JSON=[{"subject_market_id":"a","bound_market_id":"b"}]\n'
+        + '\nEVENT_BASELINES_JSON={"m":{"baseline_probability":0.55}}\n'
+        + '\nWALLET_ALPHA_PROFILES_JSON={"0xabc":{"lagged_follow_roi":0.05}}\n'
+        + '\nWALLET_ALPHA_OBSERVATIONS_JSON=[{"wallet_address":"0xabc","market_id":"m"}]\n'
+        + "\nLOGICAL_CONSTRAINTS_FILE=data/quant_inputs/logical_constraints.json\n"
+        + "\nEVENT_BASELINES_FILE=data/quant_inputs/event_baselines.json\n"
+        + "\nWALLET_ALPHA_PROFILES_FILE=data/quant_inputs/wallet_profiles.json\n"
+        + "\nWALLET_ALPHA_OBSERVATIONS_FILE=data/quant_inputs/wallet_observations.json\n",
+        encoding="utf-8",
+    )
+    for key in (
+        "LOGICAL_CONSTRAINTS_JSON",
+        "EVENT_BASELINES_JSON",
+        "WALLET_ALPHA_PROFILES_JSON",
+        "WALLET_ALPHA_OBSERVATIONS_JSON",
+        "LOGICAL_CONSTRAINTS_FILE",
+        "EVENT_BASELINES_FILE",
+        "WALLET_ALPHA_PROFILES_FILE",
+        "WALLET_ALPHA_OBSERVATIONS_FILE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    cfg = ArbConfig.from_env(env_path)
+
+    assert cfg.logical_constraints_json.startswith("[")
+    assert cfg.event_baselines_json.startswith("{")
+    assert cfg.wallet_alpha_profiles_json.startswith("{")
+    assert cfg.wallet_alpha_observations_json.startswith("[")
+    assert cfg.logical_constraints_file == "data/quant_inputs/logical_constraints.json"
+    assert cfg.event_baselines_file == "data/quant_inputs/event_baselines.json"
+    assert cfg.wallet_alpha_profiles_file == "data/quant_inputs/wallet_profiles.json"
+    assert cfg.wallet_alpha_observations_file == "data/quant_inputs/wallet_observations.json"
+    assert cfg.wallet_alpha_shadow_validation_enabled is True
+
+
 def test_from_env_requires_wallet_when_requested(tmp_path, monkeypatch):
     env_path = tmp_path / ".env.missing-wallet"
     env_path.write_text("ARB_DRY_RUN=true\n", encoding="utf-8")
@@ -152,6 +191,32 @@ def test_from_env_requires_wallet_when_requested(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="PRIVATE_KEY"):
         ArbConfig.from_env(env_path)
+
+
+def test_from_env_can_disable_wallet_alpha_shadow_validation(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "PRIVATE_KEY=0xabc\nPOLYMARKET_FUNDER=0xfunder\nWALLET_ALPHA_SHADOW_VALIDATION_ENABLED=false\n",
+        encoding="utf-8",
+    )
+
+    cfg = ArbConfig.from_env(env_path)
+
+    assert cfg.wallet_alpha_shadow_validation_enabled is False
+
+
+def test_from_env_env_only_sentinel_uses_process_environment(monkeypatch):
+    monkeypatch.setenv("PRIVATE_KEY", "env-only-key")
+    monkeypatch.setenv("POLYMARKET_FUNDER", "env-only-funder")
+    monkeypatch.setenv("WALLET_ALPHA_SHADOW_MAX_SIGNALS_PER_CYCLE", "3")
+    monkeypatch.setenv("WALLET_ALPHA_SHADOW_MAX_EXEC_MS_PER_CYCLE", "50")
+
+    cfg = ArbConfig.from_env("__ENV_ONLY__")
+
+    assert cfg.private_key == "env-only-key"
+    assert cfg.funder_address == "env-only-funder"
+    assert cfg.wallet_alpha_shadow_max_signals_per_cycle == 3
+    assert cfg.wallet_alpha_shadow_max_exec_ms_per_cycle == 50.0
 
 
 def test_live_mode_requires_explicit_ack():

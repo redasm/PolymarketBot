@@ -92,7 +92,35 @@ def _summarize_signals(rows: list[dict[str, Any]]) -> dict[str, Any]:
             {"signal_type": signal_type, "count": count}
             for signal_type, count in by_type.most_common(10)
         ],
+        "quant_strategies": _summarize_quant_strategy_signals(rows),
     }
+
+
+def _summarize_quant_strategy_signals(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    groups = {
+        "logical_constraint": "logical_constraint_",
+        "event_calendar": "event_calendar_",
+        "wallet_alpha": "wallet_alpha_",
+    }
+    out: dict[str, dict[str, Any]] = {}
+    for name, prefix in groups.items():
+        subset = [
+            row for row in rows
+            if str(row.get("signal_type") or "").startswith(prefix)
+        ]
+        if not subset:
+            continue
+        edges = [float(row.get("expected_edge") or 0.0) for row in subset]
+        confidences = [float(row.get("confidence") or 0.0) for row in subset]
+        submitted = sum(1 for row in subset if bool(row.get("submitted", False)))
+        out[name] = {
+            "count": len(subset),
+            "submitted": submitted,
+            "rejected": len(subset) - submitted,
+            "avg_expected_edge_bps": round(sum(edges) / len(edges), 6) if edges else 0.0,
+            "avg_confidence": round(sum(confidences) / len(confidences), 6) if confidences else 0.0,
+        }
+    return out
 
 
 def _summarize_ticks(rows: list[dict[str, Any]]) -> dict[str, Any]:

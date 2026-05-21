@@ -208,6 +208,10 @@ def execute_strategy_signal(
             "signal_type": signal.signal_type,
             "market_id": signal.market_id,
             "event_title": opportunity.event_title,
+            "wallet_address": signal.payload.get("wallet_address", ""),
+            "wallet_profile_status": signal.payload.get("wallet_profile_status", ""),
+            "category": signal.payload.get("category", ""),
+            "lagged_follow_roi": signal.payload.get("lagged_follow_roi", None),
         }
         trades = executor.execute_arbitrage(
             opportunity,

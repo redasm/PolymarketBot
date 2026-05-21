@@ -269,6 +269,10 @@ def make_test_config(**overrides) -> ArbConfig:
         backtest_default_dataset="default",
         backtest_slippage_bps=5.0,
         backtest_reports_dir="research/backtest/output",
+        wallet_alpha_candidate_shadow_enabled=False,
+        wallet_alpha_shadow_validation_enabled=True,
+        wallet_alpha_shadow_max_signals_per_cycle=5,
+        wallet_alpha_shadow_max_exec_ms_per_cycle=250.0,
     )
     defaults.update(overrides)
     return ArbConfig(**defaults)

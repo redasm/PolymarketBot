@@ -278,6 +278,59 @@ def test_statistical_arb_blocked_by_collateral() -> None:
     assert reason == "insufficient_balance"
 
 
+def test_wallet_alpha_candidate_shadow_signal_can_execute_in_dry_run() -> None:
+    class _Executor:
+        def ensure_sufficient_collateral(self, _amount):
+            return True, "", None
+
+        def execute_arbitrage(self, opp, size, **kwargs):
+            assert kwargs["virtual_fill_context"]["wallet_address"] == "0xwallet"
+            return [
+                TradeRecord(
+                    trade_id="trade-1",
+                    arb_id="arb-1",
+                    token_id=opp.legs[0].token_id,
+                    condition_id=opp.legs[0].condition_id,
+                    side=opp.legs[0].side,
+                    price=opp.legs[0].price,
+                    size=size,
+                    status=TradeStatus.FILLED,
+                    fill_price=opp.legs[0].price,
+                    fill_size=size,
+                    simulated=True,
+                )
+            ]
+
+        def is_successful_execution(self, _opp, trades):
+            return bool(trades)
+
+    ob = SimpleNamespace(
+        get_snapshot=lambda _t: SimpleNamespace(
+            best_ask=0.5,
+            best_bid=0.49,
+            asks=[SimpleNamespace(price=0.5, size=100.0)],
+            bids=[SimpleNamespace(price=0.49, size=100.0)],
+        ),
+        get_executable_ask_price=lambda _t, _s: (0.5, 2.0),
+    )
+    sig = _signal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="wallet_alpha_candidate_buy_yes",
+        payload={
+            "action": "BUY_YES",
+            "deviation": 0.03,
+            "wallet_address": "0xwallet",
+            "wallet_profile_status": "candidate_unvalidated",
+        },
+    )
+
+    success, reason, delta = _run(sig, ob_analyzer=ob, executor=_Executor())
+
+    assert success is True
+    assert reason == ""
+    assert delta.simulated_successes == 1
+
+
 # ---------- T3 (market making) early returns ---------------------------------
 
 

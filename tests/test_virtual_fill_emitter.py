@@ -94,8 +94,8 @@ def test_record_fill_emits_full_13_field_schema(tmp_path: Path) -> None:
     assert row["side"] == "BUY"
     assert row["is_maker"] is False
     assert row["tier"] == "T0_STRUCTURAL"
-    # Taker fee = 0.02 × fill_price × size = 0.02 × 0.515 × 10
-    assert row["fee"] == pytest.approx(0.103, rel=1e-3)
+    # Polymarket CLOB taker fee shape: fee_rate × price × (1 - price) × filled_size.
+    assert row["fee"] == pytest.approx(0.02 * 0.515 * (1 - 0.515) * 10.0, rel=1e-6)
     # Slippage = fill_price - intended_price = 0.005
     assert row["slippage"] == pytest.approx(0.005, abs=1e-6)
     assert row["decision_context"]["best_bid_at_decision"] == 0.49
@@ -182,8 +182,8 @@ def test_partial_fill_fee_uses_actual_filled_size(tmp_path: Path) -> None:
     recorder.close()
 
     row = _read_only_row(tmp_path)
-    # fee = 0.02 × 0.51 × 7.0 = 0.0714, NOT 0.02 × 0.51 × 100.0
-    assert row["fee"] == pytest.approx(0.02 * 0.51 * 7.0, rel=1e-6)
+    # fee uses the actual filled size, not request size.
+    assert row["fee"] == pytest.approx(0.02 * 0.51 * (1 - 0.51) * 7.0, rel=1e-6)
     assert row["result"]["filled_size"] == pytest.approx(7.0)
 
 

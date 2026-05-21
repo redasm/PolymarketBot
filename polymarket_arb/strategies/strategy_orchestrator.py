@@ -129,6 +129,7 @@ class StrategyOrchestrator:
         *,
         max_signals_per_market_per_hour: int = 2,
         tail_risk_classifier: Optional[TailRiskClassifier] = None,
+        sniper_gate: Any | None = None,
     ):
         self._bankroll = total_bankroll
         alloc_map = allocations or self.DEFAULT_ALLOCATIONS
@@ -137,9 +138,15 @@ class StrategyOrchestrator:
         for tier, pct in alloc_map.items():
             self._allocations[tier] = StrategyAllocation(tier=tier, allocation_pct=pct)
         self._tail_risk_classifier = tail_risk_classifier or TailRiskClassifier()
+        self._sniper_gate = sniper_gate
 
         self._pending_signals: list[StrategySignal] = []
         self._executed_signals: list[StrategySignal] = []
+        self._sniper_gate_stats = {
+            "applied": 0,
+            "accepted": 0,
+            "rejected": 0,
+        }
         self._research_overlay_stats = {
             "applied": 0,
             "boosted": 0,
@@ -171,6 +178,35 @@ class StrategyOrchestrator:
         research_report: dict | Any | None = None,
         research_signals: list[Any] | None = None,
     ) -> bool:
+        active_markets = active_markets or []
+        if self._sniper_gate is not None:
+            market = self._find_market(signal.market_id, active_markets)
+            gate_decision = self._sniper_gate.evaluate(signal, market=market)
+            self._record_sniper_gate(gate_decision)
+            if not gate_decision.accepted:
+                self._record_process_skip(signal, "sniper_gate_reject")
+                LOG.info(
+                    "策略信号被 sniper gate 拦截: tier=%s market=%s reasons=%s",
+                    signal.tier,
+                    signal.market_id[:12] if signal.market_id else "?",
+                    gate_decision.reasons,
+                )
+                return False
+            if getattr(gate_decision, "size_multiplier", 1.0) != 1.0:
+                signal = replace(
+                    signal,
+                    recommended_size_usdc=max(
+                        0.0,
+                        signal.recommended_size_usdc * float(gate_decision.size_multiplier),
+                    ),
+                    payload={
+                        **dict(signal.payload),
+                        "sniper_gate": {
+                            "size_multiplier": round(float(gate_decision.size_multiplier), 3),
+                            "reasons": list(gate_decision.reasons),
+                        },
+                    },
+                )
         if not self._check_per_market_rate_cap(signal):
             self._record_process_skip(signal, "per_market_rate_cap")
             self._log_rate_cap_skip(signal)
@@ -180,7 +216,7 @@ class StrategyOrchestrator:
         signal_copy = replace(signal, payload=dict(signal.payload))
         overlay = self._apply_research_overlay(
             signal_copy,
-            active_markets=active_markets or [],
+            active_markets=active_markets,
             research_report=research_report,
             research_signals=research_signals or [],
         )
@@ -196,7 +232,7 @@ class StrategyOrchestrator:
             return False
         tail_risk = self._apply_tail_risk_adjustment(
             signal_copy,
-            active_markets=active_markets or [],
+            active_markets=active_markets,
         )
         signal_copy.payload["tail_risk"] = tail_risk
         self._record_tail_risk(tail_risk)
@@ -321,6 +357,7 @@ class StrategyOrchestrator:
             "executed_signals": len(self._executed_signals),
             "research_overlay": dict(self._research_overlay_stats),
             "tail_risk": dict(self._tail_risk_stats),
+            "sniper_gate": dict(self._sniper_gate_stats),
             "recent_overlays": list(self._overlay_history[-10:]),
             "last_skip_reasons": dict(self._last_skip_reasons),
             "last_skipped_by_tier": dict(self._last_skipped_by_tier),
@@ -650,6 +687,13 @@ class StrategyOrchestrator:
             self._tail_risk_stats["penalized"] += 1
         if tail_risk.get("risk_class") == "high_tail":
             self._tail_risk_stats["high_risk"] += 1
+
+    def _record_sniper_gate(self, decision: Any) -> None:
+        self._sniper_gate_stats["applied"] += 1
+        if getattr(decision, "accepted", False):
+            self._sniper_gate_stats["accepted"] += 1
+        else:
+            self._sniper_gate_stats["rejected"] += 1
 
     def _match_research_rows(
         self,

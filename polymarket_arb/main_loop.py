@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections import deque
+from dataclasses import replace
 import json
 import logging
 import os
@@ -87,8 +88,11 @@ from polymarket_arb.main_helpers.research_refresh import (
 )
 from polymarket_arb.main_helpers.signal_collectors import (
     collect_cross_platform_strategy_signals as _collect_cross_platform_strategy_signals,
+    collect_event_calendar_strategy_signals as _collect_event_calendar_strategy_signals,
+    collect_logical_constraint_strategy_signals as _collect_logical_constraint_strategy_signals,
     collect_maker_strategy_signals as _collect_maker_strategy_signals,
     collect_statistical_strategy_signals as _collect_statistical_strategy_signals,
+    collect_wallet_alpha_strategy_signals as _collect_wallet_alpha_strategy_signals,
 )
 from polymarket_arb.main_helpers.signal_helpers import (
     apply_maker_fill_to_inventory as _apply_maker_fill_to_inventory,
@@ -151,11 +155,13 @@ from polymarket_arb.models import (
 from polymarket_arb.notifier import NotificationManager
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
 from polymarket_arb.portfolio_sync import PortfolioSync
+from polymarket_arb.quant_input_store import QuantInputStore
 from polymarket_arb.risk_manager import RiskManager
 from polymarket_arb.strategies.maker_strategy import DynamicSpreadCalculator, MakerStrategy
 from polymarket_arb.strategies.recent_exit_cooldown import make_recent_exit_cooldown_store
 from polymarket_arb.strategies.t2_exit_manager import T2ExitManager, t2_exit_telemetry
 from polymarket_arb.strategies.statistical_model import StatisticalMispricingDetector
+from polymarket_arb.strategies.sniper_gate import SniperGate, SniperGateConfig
 from polymarket_arb.strategies.strategy_orchestrator import (
     StrategyOrchestrator,
     StrategySignal,
@@ -359,6 +365,17 @@ def main(dotenv_path: str | None = None) -> None:
     executor = ExecutionEngine(config, trading_client or ro_client)
     risk_mgr = RiskManager(config)
     notifier = NotificationManager(config)
+    shadow_validation_enabled = bool(
+        not config.dry_run
+        and getattr(config, "wallet_alpha_shadow_validation_enabled", True)
+    )
+    shadow_config = replace(
+        config,
+        dry_run=True,
+        wallet_alpha_candidate_shadow_enabled=True,
+    ) if shadow_validation_enabled else config
+    shadow_executor = ExecutionEngine(shadow_config, ro_client) if shadow_validation_enabled else None
+    shadow_risk_mgr = RiskManager(shadow_config) if shadow_validation_enabled else None
 
     enhanced_store = EnhancedBookStore()
     vol_estimator = VolEstimator(
@@ -399,7 +416,7 @@ def main(dotenv_path: str | None = None) -> None:
         async_write=config.telemetry_async_write,
         queue_size=config.telemetry_async_queue_size,
     )
-    if config.dry_run:
+    if config.dry_run or shadow_validation_enabled:
         shadow_lifecycle = _ShadowPositionLifecycle(
             event_recorder=event_recorder,
             book_snapshot_provider=lambda token_id: ob_analyzer.get_snapshot(
@@ -414,7 +431,10 @@ def main(dotenv_path: str | None = None) -> None:
             taker_fee_rate=config.polymarket_taker_fee_rate,
             lifecycle=shadow_lifecycle,
         )
-        executor.set_virtual_fill_emitter(virtual_fill_emitter)
+        if config.dry_run:
+            executor.set_virtual_fill_emitter(virtual_fill_emitter)
+        elif shadow_executor is not None:
+            shadow_executor.set_virtual_fill_emitter(virtual_fill_emitter)
     else:
         shadow_lifecycle = None
     data_janitor = DataJanitor(
@@ -457,10 +477,33 @@ def main(dotenv_path: str | None = None) -> None:
         })
     if config.data_cleanup_enabled:
         LOG.info("Data 定期清理已开启: interval=%.0fs", config.data_cleanup_interval_sec)
+    quant_input_store = QuantInputStore.from_config(config)
 
+    sniper_gate = (
+        SniperGate(
+            SniperGateConfig(
+                min_net_edge_bps=config.sniper_min_net_edge_bps,
+                min_confidence=config.sniper_min_confidence,
+                min_liquidity=config.sniper_min_liquidity,
+                min_volume_24h=config.sniper_min_volume_24h,
+                max_correlation_score=config.sniper_max_correlation_score,
+            )
+        )
+        if config.sniper_gate_enabled
+        else None
+    )
     orchestrator = StrategyOrchestrator(
         total_bankroll=config.max_total_exposure,
         max_signals_per_market_per_hour=config.t2_max_signals_per_market_per_hour,
+        sniper_gate=sniper_gate,
+    )
+    shadow_orchestrator = (
+        StrategyOrchestrator(
+            total_bankroll=shadow_config.max_total_exposure,
+            max_signals_per_market_per_hour=shadow_config.t2_max_signals_per_market_per_hour,
+        )
+        if shadow_validation_enabled
+        else None
     )
     flow_aggregator: Optional[FlowAggregator] = None
     flow_ingest: Optional[FlowIngest] = None
@@ -495,6 +538,16 @@ def main(dotenv_path: str | None = None) -> None:
         risk_manager=risk_mgr,
         notifier=notifier,
         cooldown_store=cooldown_store,
+    )
+    shadow_t2_exit_manager = (
+        T2ExitManager(
+            config=shadow_config,
+            executor=shadow_executor,
+            ob_analyzer=ob_analyzer,
+            risk_manager=shadow_risk_mgr,
+        )
+        if shadow_validation_enabled and shadow_executor is not None and shadow_risk_mgr is not None
+        else None
     )
     LOG.info(
         "T2 退出策略: stop_loss=%.0fbps tp_capture=%.0f%% max_hold=%.0fs eval=%.0fs optimal_stopping=%s",
@@ -955,6 +1008,47 @@ def main(dotenv_path: str | None = None) -> None:
             detector=statistical_detector,
         )
         strategy_signals.extend(statistical_signals)
+        quant_inputs = quant_input_store.snapshot()
+        strategy_signals.extend(
+            _collect_logical_constraint_strategy_signals(
+                config=config,
+                candidate_markets=scanned_markets,
+                ob_analyzer=ob_analyzer,
+                rules=quant_inputs.logical_constraints_json,
+            )
+        )
+        strategy_signals.extend(
+            _collect_event_calendar_strategy_signals(
+                config=config,
+                candidate_markets=scanned_markets,
+                ob_analyzer=ob_analyzer,
+                baselines=quant_inputs.event_baselines_json,
+            )
+        )
+        strategy_signals.extend(
+            _collect_wallet_alpha_strategy_signals(
+                config=config,
+                candidate_markets=scanned_markets,
+                profiles=quant_inputs.wallet_alpha_profiles_json,
+                observations=quant_inputs.wallet_alpha_observations_json,
+            )
+        )
+        shadow_candidate_signals = []
+        if shadow_validation_enabled:
+            shadow_candidate_signals = [
+                signal for signal in _collect_wallet_alpha_strategy_signals(
+                    config=shadow_config,
+                    candidate_markets=scanned_markets,
+                    profiles=quant_inputs.wallet_alpha_profiles_json,
+                    observations=quant_inputs.wallet_alpha_observations_json,
+                )
+                if signal.signal_type.startswith("wallet_alpha_candidate_")
+            ]
+            max_shadow_signals = int(getattr(config, "wallet_alpha_shadow_max_signals_per_cycle", 5) or 0)
+            if max_shadow_signals > 0:
+                shadow_candidate_signals = shadow_candidate_signals[:max_shadow_signals]
+            else:
+                shadow_candidate_signals = []
         fair_values_by_market = {
             signal.market_id: float(signal.payload.get("model_prob"))
             for signal in statistical_signals
@@ -1008,6 +1102,24 @@ def main(dotenv_path: str | None = None) -> None:
                 )
                 for compressed_payload in signal_telemetry.consume(signal_payload):
                     event_recorder.write_event("strategy_signals", compressed_payload)
+
+        if shadow_orchestrator is not None:
+            for candidate_signal in shadow_candidate_signals:
+                _ensure_signal_id(candidate_signal)
+                submitted = shadow_orchestrator.submit_signal(
+                    candidate_signal,
+                    active_markets=active_markets_for_overlay,
+                    research_report=research_report,
+                    research_signals=research_signals,
+                )
+                if event_recorder.is_enabled:
+                    signal_payload = _serialize_strategy_signal(
+                        _find_pending_signal(shadow_orchestrator, candidate_signal) or candidate_signal,
+                        submitted=submitted,
+                        research_overlay=_find_pending_signal_overlay(shadow_orchestrator, candidate_signal),
+                    )
+                    for compressed_payload in signal_telemetry.consume(signal_payload):
+                        event_recorder.write_event("strategy_signals", compressed_payload)
 
         cycle_timing["strategy_sec"] += time.perf_counter() - phase_start
         t2_collector_skips = dict(getattr(_collect_statistical_strategy_signals, "last_skip_summary", {}) or {})
@@ -1196,6 +1308,65 @@ def main(dotenv_path: str | None = None) -> None:
                 },
                 "total": sum(insufficient_balance_skips.values()),
             })
+        if (
+            shadow_orchestrator is not None
+            and shadow_executor is not None
+            and shadow_risk_mgr is not None
+        ):
+            shadow_exec_start = time.perf_counter()
+            shadow_exec_budget_sec = (
+                float(getattr(config, "wallet_alpha_shadow_max_exec_ms_per_cycle", 250.0) or 0.0)
+                / 1000.0
+            )
+            for shadow_signal in shadow_orchestrator.process_signals():
+                if shadow_exec_budget_sec > 0 and (time.perf_counter() - shadow_exec_start) >= shadow_exec_budget_sec:
+                    shadow_orchestrator.record_processed(shadow_signal)
+                    if event_recorder.is_enabled:
+                        event_recorder.write_event("strategy_executions", {
+                            "execution_id": "",
+                            "signal_id": getattr(shadow_signal, "signal_id", ""),
+                            "tier": shadow_signal.tier.name,
+                            "signal_type": shadow_signal.signal_type,
+                            "market_id": shadow_signal.market_id,
+                            "status": "skipped",
+                            "mode": "shadow_validation",
+                            "reason": "shadow_validation_budget_exhausted",
+                        })
+                    continue
+                executed, reason, delta = _execute_strategy_signal(
+                    signal=shadow_signal,
+                    config=shadow_config,
+                    active_markets=execution_markets,
+                    ob_analyzer=ob_analyzer,
+                    executor=shadow_executor,
+                    risk_mgr=shadow_risk_mgr,
+                    orchestrator=shadow_orchestrator,
+                    dash_state=dash_state,
+                    event_recorder=event_recorder,
+                    maker_strategy=maker_strategy,
+                    notifier=notifier,
+                    t2_exit_manager=shadow_t2_exit_manager,
+                    cooldown_store=None,
+                )
+                total_simulated_successes += delta.simulated_successes
+                total_simulated_submissions += delta.simulated_submissions
+                total_simulated_expected_profit += delta.simulated_profit_total
+                if executed:
+                    continue
+                shadow_orchestrator.record_processed(shadow_signal)
+                if event_recorder.is_enabled:
+                    event_recorder.write_event("strategy_executions", {
+                        "execution_id": "",
+                        "signal_id": getattr(shadow_signal, "signal_id", ""),
+                        "tier": shadow_signal.tier.name,
+                        "signal_type": shadow_signal.signal_type,
+                        "market_id": shadow_signal.market_id,
+                        "status": "skipped",
+                        "mode": "shadow_validation",
+                        "reason": reason,
+                        **_structured_skip_reason(reason),
+                        "execution_check": dict(shadow_signal.payload.get("execution_check") or {}),
+                    })
         cycle_timing["strategy_execution_sec"] = time.perf_counter() - phase_start
 
         # T2 exit evaluation: stop-loss / take-profit / time-stop / optimal stopping.
@@ -1238,6 +1409,27 @@ def main(dotenv_path: str | None = None) -> None:
                 )
         except Exception as exc:
             LOG.warning("T2 退出评估异常: %s", exc)
+
+        if shadow_t2_exit_manager is not None:
+            try:
+                shadow_exit_result = shadow_t2_exit_manager.evaluate(active_markets=execution_markets)
+                if shadow_exit_result.attempted > 0 and event_recorder.is_enabled:
+                    event_recorder.write_event(
+                        "strategy_executions",
+                        {
+                            "tier": StrategyTier.STATISTICAL_ARB.name,
+                            "signal_type": "wallet_alpha_candidate_shadow_exit",
+                            "market_id": "",
+                            "status": "shadow_exit_attempted",
+                            "trade_count": shadow_exit_result.triggered,
+                            "attempted_count": shadow_exit_result.attempted,
+                            "partial_count": shadow_exit_result.partial,
+                            "failed_count": shadow_exit_result.failed,
+                            "open_positions": len(shadow_t2_exit_manager.open_positions),
+                        },
+                    )
+            except Exception as exc:
+                LOG.warning("wallet alpha shadow 退出评估异常: %s", exc)
 
         if not config.dry_run:
             _sync_live_order_statuses(
@@ -1290,9 +1482,12 @@ def main(dotenv_path: str | None = None) -> None:
             )
 
         shadow_snapshot: dict[str, Any] = {}
-        if config.dry_run and shadow_lifecycle is not None:
+        if shadow_lifecycle is not None:
             shadow_snapshot = shadow_lifecycle.snapshot()
-            risk_mgr.update_shadow_snapshot(shadow_snapshot)
+            if config.dry_run:
+                risk_mgr.update_shadow_snapshot(shadow_snapshot)
+            elif shadow_risk_mgr is not None:
+                shadow_risk_mgr.update_shadow_snapshot(shadow_snapshot)
         telemetry_risk_state = risk_mgr.state
 
         vol_snap = vol_estimator.snapshot()

@@ -272,6 +272,19 @@ cp .env.example .env
 | `AI_AUTO_RECOVER_SEC` | AI 降级后自动恢复等待时间 | 1800s |
 | `RESEARCH_SIGNAL_ENABLED` | 启用研究信号摘要 | false |
 | `BACKTEST_ENABLED` | 启用回测状态展示 | false |
+| `SNIPER_GATE_ENABLED` | 启用方向性信号高置信门禁 | false |
+| `LOGICAL_CONSTRAINTS_JSON` | 逻辑约束策略规则 JSON | 空 |
+| `EVENT_BASELINES_JSON` | 事件时间节点 baseline JSON | 空 |
+| `WALLET_ALPHA_PROFILES_JSON` | 已离线验证的钱包画像 JSON | 空 |
+| `WALLET_ALPHA_OBSERVATIONS_JSON` | 钱包最新观察 JSON | 空 |
+| `LOGICAL_CONSTRAINTS_FILE` | 逻辑约束 JSON 文件，主循环热加载 | 空 |
+| `EVENT_BASELINES_FILE` | 事件 baseline JSON 文件，主循环热加载 | 空 |
+| `WALLET_ALPHA_PROFILES_FILE` | 钱包画像 JSON 文件，主循环热加载 | 空 |
+| `WALLET_ALPHA_OBSERVATIONS_FILE` | 钱包观察 JSON 文件，主循环热加载 | 空 |
+| `WALLET_ALPHA_CANDIDATE_SHADOW_ENABLED` | dry-run 下允许未验证钱包生成候选影子信号 | false |
+| `WALLET_ALPHA_SHADOW_VALIDATION_ENABLED` | live 单实例内启用候选钱包 shadow-only 验证通道 | true |
+| `WALLET_ALPHA_SHADOW_MAX_SIGNALS_PER_CYCLE` | live 内部 shadow 验证每周期最多处理候选数 | 5 |
+| `WALLET_ALPHA_SHADOW_MAX_EXEC_MS_PER_CYCLE` | live 内部 shadow 验证每周期最多占用毫秒数 | 250 |
 
 完整配置见 `.env.example`。
 
@@ -327,7 +340,157 @@ cp .env.example .env
 
 - T0 结构性套利继续进入 `opportunities` / `trades`
 - T1/T2/T3 的信号会额外写入 `data/telemetry/*.strategy_signals.ndjson`
+- 新增逻辑约束、事件日历、钱包 alpha 信号也进入 `strategy_signals`，并在 runtime summary 的 `signals.quant_strategies` 下单独聚合
 - 因此以后看到 “0 arbs” 时，要同时检查 `strategy_signals`，不要再把它误解成“整套策略都没有信号”
+
+### 可选量化策略输入
+
+这几类策略默认通过文件热加载输入。推荐的常态不是“影子跑完再手动切实盘”，而是四条链路一直跑：
+
+```text
+影子模式一直跑
+实盘一直跑
+扫描器一直跑
+晋级器一直跑
+实盘只吃通过验证的数据
+```
+
+一键拉起这条链路：
+
+```bash
+python scripts/run_automated_quant_pipeline.py --dotenv-path .env
+```
+
+这个编排入口不会复制 `.env`，只启动一份 bot 主循环，再启动两个旁路数据进程：
+
+- `bot`: 只读根目录 `.env`；如果是 live 模式，内部 shadow-only lane 会验证未晋级钱包
+- `wallet-scanner`: 持续从 Polymarket Data API 自动发现活跃钱包，刷新 `wallet_observations.json`
+- `wallet-promoter`: 持续读取 shadow telemetry，只有通过 `min_trades / ROI / 集中度 / 回撤` 的钱包才写入 `wallet_profiles.json`
+
+bot 进程读取同一组热加载文件：
+
+```bash
+LOGICAL_CONSTRAINTS_FILE=data/quant_inputs/logical_constraints.json
+EVENT_BASELINES_FILE=data/quant_inputs/event_baselines.json
+WALLET_ALPHA_PROFILES_FILE=data/quant_inputs/wallet_profiles.json
+WALLET_ALPHA_OBSERVATIONS_FILE=data/quant_inputs/wallet_observations.json
+```
+
+因此未验证钱包最多进入内部 shadow-only 验证通道；实盘执行通道只会消费已经晋级到 `wallet_profiles.json` 的钱包。数据扫描和晋级在旁路进程中按自己的 interval 跑，不会阻塞实盘扫描周期。`.env` 里仍必须显式配置实盘安全确认，例如 `LIVE_TRADING_ACK=true` 和小额的 `LIVE_MAX_*` 限额，否则 live 进程会按安全校验退出。
+
+生成 `.env` 模板：
+
+```bash
+python scripts/quant_strategy_config_template.py --format env
+```
+
+从 CSV/JSON 生成配置片段：
+
+```bash
+python scripts/build_quant_strategy_inputs.py logical-constraints --input data/logical_constraints.csv
+python scripts/build_quant_strategy_inputs.py event-baselines --input data/event_baselines.csv
+python scripts/build_quant_strategy_inputs.py wallet-observations --input data/wallet_observations.csv
+```
+
+自动扫描候选输入：
+
+```bash
+# 直接从 Gamma 拉活跃 events，生成同事件逻辑关系候选，供 LLM 复核
+python scripts/scan_quant_strategy_inputs.py logical-candidates --fetch-gamma --event-limit 100 --output data/quant_inputs/logical_candidates.json
+
+# 用已配置的 AI_PROVIDER/AI_API_KEY 对候选关系做严格筛选，只保留确定性包含/上界关系
+python scripts/scan_quant_strategy_inputs.py logical-rules-llm --candidates data/quant_inputs/logical_candidates.json --output data/quant_inputs/logical_constraints.json
+
+# 从 Polymarket Data API 拉指定钱包最近成交，生成 WALLET_ALPHA_OBSERVATIONS_JSON 候选
+python scripts/scan_quant_strategy_inputs.py wallet-observations --wallet 0xabc... --limit 200
+
+# 从你自己的离线 markout/settlement 结果生成 WALLET_ALPHA_PROFILES_JSON
+python scripts/scan_quant_strategy_inputs.py wallet-profiles --input data/wallet_markouts.csv --min-trades 30
+```
+
+手动运行时也应使用文件热加载，避免复制环境变量后重启：
+
+```bash
+LOGICAL_CONSTRAINTS_FILE=data/quant_inputs/logical_constraints.json
+EVENT_BASELINES_FILE=data/quant_inputs/event_baselines.json
+WALLET_ALPHA_PROFILES_FILE=data/quant_inputs/wallet_profiles.json
+WALLET_ALPHA_OBSERVATIONS_FILE=data/quant_inputs/wallet_observations.json
+```
+
+扫描脚本支持 `--output` 原子写入这些文件，主循环每个扫描周期自动读取最新有效 JSON；如果文件暂时损坏或接口失败，会继续使用上一次有效内容。
+
+```bash
+python scripts/scan_quant_strategy_inputs.py wallet-observations --wallet 0xabc... --limit 200 --output data/quant_inputs/wallet_observations.json
+python scripts/scan_quant_strategy_inputs.py wallet-profiles --input data/wallet_markouts.csv --min-trades 30 --output data/quant_inputs/wallet_profiles.json
+```
+
+钱包观察不需要提供钱包名单，可以直接从 Polymarket 最近成交里自动发现活跃钱包并持续刷新：
+
+```bash
+python scripts/scan_quant_strategy_inputs.py auto-wallet-observations \
+  --min-trades 3 \
+  --min-notional 100 \
+  --max-wallets 25 \
+  --repeat-interval-sec 120 \
+  --repeat-count 0 \
+  --output data/quant_inputs/wallet_observations.json
+```
+
+这个命令只生成“观察”，不会自动把活跃钱包当成可跟单钱包；`WALLET_ALPHA_PROFILES_FILE` 必须来自影子验证后的自动晋级结果。
+
+如果不用总编排脚本，也可以拆开跑：
+
+```bash
+# bot 主进程：live 时内部 shadow-only 验证候选钱包；实盘只吃已晋级 profiles
+ARB_DRY_RUN=false
+WALLET_ALPHA_SHADOW_VALIDATION_ENABLED=true
+WALLET_ALPHA_CANDIDATE_SHADOW_ENABLED=false
+WALLET_ALPHA_OBSERVATIONS_FILE=data/quant_inputs/wallet_observations.json
+WALLET_ALPHA_PROFILES_FILE=data/quant_inputs/wallet_profiles.json
+```
+
+```bash
+# 旁路扫描器：自动发现钱包并刷新观察文件
+python scripts/scan_quant_strategy_inputs.py auto-wallet-observations \
+  --min-trades 3 \
+  --min-notional 100 \
+  --max-wallets 25 \
+  --repeat-interval-sec 120 \
+  --repeat-count 0 \
+  --output data/quant_inputs/wallet_observations.json
+```
+
+```bash
+# 旁路晋级器：从影子 telemetry 生成 markouts，并只晋级通过验证的钱包
+python scripts/scan_quant_strategy_inputs.py auto-promote-wallet-profiles \
+  --telemetry-dir data/telemetry \
+  --lookback-days 7 \
+  --min-trades 30 \
+  --min-lagged-roi 0.04 \
+  --max-concentration 0.35 \
+  --max-drawdown 0.35 \
+  --repeat-interval-sec 300 \
+  --repeat-count 0 \
+  --output data/quant_inputs/wallet_profiles.json
+```
+
+实盘执行通道读取 `WALLET_ALPHA_PROFILES_FILE` 和 `WALLET_ALPHA_OBSERVATIONS_FILE`，但不要开启 `WALLET_ALPHA_CANDIDATE_SHADOW_ENABLED`；这样只有已晋级的钱包会进入实盘信号。未晋级钱包由 `WALLET_ALPHA_SHADOW_VALIDATION_ENABLED=true` 的内部 shadow-only lane 处理。
+
+CSV 字段约定：
+
+- `logical-constraints`: `subject_market_id,bound_market_id,relation_type,min_violation_bps,tags,max_size_usdc`
+- `event-baselines`: `condition_id,baseline_probability,confidence,time_to_event_sec`
+- `wallet-observations`: `wallet_address,market_id,category,action,observed_size_usdc`
+
+钱包跟单需要同时配置 `WALLET_ALPHA_PROFILES_JSON` 和 `WALLET_ALPHA_OBSERVATIONS_JSON`：前者是离线验证后的钱包质量，后者是你观察到的新动作。只给公开“盈利地址”不会触发信号。
+
+观察运行结果：
+
+```bash
+python scripts/summarize_runtime_artifacts.py --telemetry-dir data/telemetry --ticks-dir data/ticks
+```
+
+其中 `logical_constraint` 只做显式包含/上界关系，例如 `P(候选人胜) <= P(党派胜)`；`event_calendar` 只比较你提供的 baseline 与当前盘口；`wallet_alpha` 只接受已经离线验证过“延迟跟单仍为正”的钱包观察，不会自动相信公开盈利地址。
 
 如果你处在“先跑 3-7 天，看 bot 到底能不能看到机会”的观测期，建议把配置切到更偏探索的档位：
 
@@ -529,6 +692,18 @@ with open("data/ticks/2026-04-11.ndjson") as f:
         decision = engine.evaluate(store)
         if decision.direction != "NONE":
             print(f"[{tick['ts_ms']}] {decision.direction} edge={decision.edge_bps:.0f}bps")
+```
+
+新增的逻辑约束、事件日历、钱包 alpha 策略也提供离线 adapter：
+`research.backtest.adapters.LogicalConstraintBacktestAdapter`、
+`EventCalendarBacktestAdapter`、`WalletAlphaBacktestAdapter`。它们复用线上策略模型，把 snapshot/观察行转换为 `StrategySignal`，适合先在 notebook 或小脚本里做离线筛选，再决定是否放进 shadow 配置。
+
+也可以直接走 runner：
+
+```bash
+python -m research.backtest.run --strategy logical-constraint --dataset default
+python -m research.backtest.run --strategy event-calendar --dataset default
+python -m research.backtest.run --strategy wallet-alpha --dataset default
 ```
 
 ### 使用 tmux（远程服务器）
