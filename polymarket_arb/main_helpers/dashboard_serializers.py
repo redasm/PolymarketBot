@@ -24,6 +24,7 @@ from polymarket_arb.book_store import EnhancedBookStore
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.execution_engine import ExecutionEngine
 from polymarket_arb.models import ArbOpportunity, MarketInfo
+from polymarket_arb.signal_attribution import infer_signal_attribution
 from polymarket_arb.strategies.strategy_orchestrator import StrategySignal
 
 
@@ -208,10 +209,16 @@ def serialize_strategy_signal(
     submitted: bool,
     research_overlay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    attribution = infer_signal_attribution(signal.signal_type, signal.payload)
+    payload = dict(signal.payload)
+    payload.setdefault("signal_source", attribution["signal_source"])
+    payload.setdefault("signal_components", list(attribution["signal_components"]))
     return {
         "signal_id": getattr(signal, "signal_id", ""),
         "tier": signal.tier.name,
         "signal_type": signal.signal_type,
+        "signal_source": attribution["signal_source"],
+        "signal_components": list(attribution["signal_components"]),
         "market_id": signal.market_id,
         "description": signal.description,
         "expected_edge": signal.expected_edge,
@@ -220,7 +227,7 @@ def serialize_strategy_signal(
         "urgency": signal.urgency,
         "submitted": submitted,
         "research_overlay": dict(research_overlay or {}),
-        "payload": dict(signal.payload),
+        "payload": payload,
         "timestamp": signal.timestamp,
     }
 

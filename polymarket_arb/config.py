@@ -300,7 +300,7 @@ class ArbConfig:
 
     # New quant strategy gates (default off / inert unless configured)
     sniper_gate_enabled: bool = False
-    sniper_min_net_edge_bps: float = 250.0
+    sniper_min_net_edge_bps: float = 500.0
     sniper_min_confidence: float = 0.75
     sniper_min_liquidity: float = 0.0
     sniper_min_volume_24h: float = 0.0
@@ -660,7 +660,7 @@ class ArbConfig:
             edge_volatility_spike_penalty=_env_float("EDGE_VOLATILITY_SPIKE_PENALTY", 0.7),
             edge_volatility_calm_ratio=_env_float("EDGE_VOLATILITY_CALM_RATIO", 0.8),
             edge_volatility_calm_boost=_env_float("EDGE_VOLATILITY_CALM_BOOST", 1.1),
-            t2_min_deviation=_env_float("T2_MIN_DEVIATION", 0.02),
+            t2_min_deviation=_env_float("T2_MIN_DEVIATION", 0.05),
             t2_max_spread_bps=_env_float("T2_MAX_SPREAD_BPS", 80.0),
             t2_min_top_depth=_env_float("T2_MIN_TOP_DEPTH", 100.0),
             t2_max_complement_error_bps=_env_float("T2_MAX_COMPLEMENT_ERROR_BPS", 150.0),
@@ -753,7 +753,7 @@ class ArbConfig:
             backtest_slippage_bps=_env_float("BACKTEST_SLIPPAGE_BPS", 5.0),
             backtest_reports_dir=_env("BACKTEST_REPORTS_DIR", "research/backtest/output"),
             sniper_gate_enabled=_env_bool("SNIPER_GATE_ENABLED", False),
-            sniper_min_net_edge_bps=_env_float("SNIPER_MIN_NET_EDGE_BPS", 250.0),
+            sniper_min_net_edge_bps=_env_float("SNIPER_MIN_NET_EDGE_BPS", 500.0),
             sniper_min_confidence=_env_float("SNIPER_MIN_CONFIDENCE", 0.75),
             sniper_min_liquidity=_env_float("SNIPER_MIN_LIQUIDITY", 0.0),
             sniper_min_volume_24h=_env_float("SNIPER_MIN_VOLUME_24H", 0.0),

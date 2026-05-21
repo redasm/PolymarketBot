@@ -1053,9 +1053,10 @@ def main(dotenv_path: str | None = None) -> None:
                 ob_analyzer=ob_analyzer,
                 maker_strategy=maker_strategy,
                 fair_values_by_market=fair_values_by_market,
-                detector=statistical_detector,
-                flow_aggregator=flow_aggregator,
-            )
+            detector=statistical_detector,
+            flow_aggregator=flow_aggregator,
+            event_baselines=quant_inputs.event_baselines_json,
+        )
             if config.maker_strategy_enabled
             else []
         )

@@ -597,6 +597,14 @@ def _parse_wallet_profiles(raw: dict[str, dict[str, Any] | WalletProfile] | str 
             return {}
     if not isinstance(payload, dict):
         return {}
+    if "schema_version" in payload and "wallets" in payload:
+        expires_at = _first_float(payload, ("expires_at",))
+        if expires_at is not None and expires_at < time.time():
+            return {}
+        wallets_payload = payload.get("wallets")
+        if not isinstance(wallets_payload, dict):
+            return {}
+        payload = wallets_payload
 
     parsed: dict[str, WalletProfile] = {}
     for wallet, row in payload.items():
@@ -656,6 +664,7 @@ def collect_maker_strategy_signals(
     fair_values_by_market: dict[str, float],
     detector: StatisticalMispricingDetector | None = None,
     flow_aggregator: FlowAggregator | None = None,
+    event_baselines: dict[str, dict[str, Any]] | str | None = None,
 ) -> list[StrategySignal]:
     """T3 maker quote signals around model fair value.
 
@@ -673,6 +682,7 @@ def collect_maker_strategy_signals(
     signals: list[StrategySignal] = []
     skip_reasons: dict[str, int] = {}
     skip_by_market: dict[str, dict[str, Any]] = {}
+    event_baseline_map = _parse_event_baselines(event_baselines)
     for market in candidate_markets:
         if len(market.tokens) != 2 or market.closed or not market.active:
             _record_skip(skip_reasons, skip_by_market, market.condition_id, "non_binary_or_inactive")
@@ -716,6 +726,7 @@ def collect_maker_strategy_signals(
             if flow_snapshot is not None and flow_snapshot.is_stable
             else None
         )
+        event_toxicity = _maker_event_time_toxicity(market, event_baseline_map)
         quote = maker_strategy.compute_quote(
             token_id=yes_token.token_id,
             condition_id=market.condition_id,
@@ -723,6 +734,7 @@ def collect_maker_strategy_signals(
             tick_size=max(float(getattr(snap, "tick_size", 0.01) or 0.01), 0.01),
             mid_price=float(snap.mid),
             flow_bias_yes_share=flow_share,
+            spread_multiplier=float(event_toxicity["spread_multiplier"]),
         )
         if quote is None or (quote.bid_price is None and quote.ask_price is None):
             _record_skip(skip_reasons, skip_by_market, market.condition_id, "maker_no_quote")
@@ -773,7 +785,10 @@ def collect_maker_strategy_signals(
             },
             "category": category,
             "category_maker_taker_gap_pp": gap_pp,
+            "queue_position": _maker_queue_position_payload(snap, quote),
         }
+        if event_toxicity["applied"]:
+            payload["event_time_toxicity"] = event_toxicity
         if flow_bias_payload is not None:
             payload["flow_bias"] = flow_bias_payload
 
@@ -785,7 +800,7 @@ def collect_maker_strategy_signals(
                 description=f"{market.question[:80]} | maker fair={fair_value:.4f} spread={quote.spread:.4f} cat={category}",
                 expected_edge=per_fill_edge * 10_000.0,
                 confidence=0.5,
-                recommended_size_usdc=max(quote.bid_size, quote.ask_size),
+                recommended_size_usdc=max(quote.bid_size, quote.ask_size) * float(event_toxicity["size_multiplier"]),
                 urgency=urgency,
                 payload=payload,
             )
@@ -800,6 +815,61 @@ def collect_maker_strategy_signals(
         )[:10],
     }
     return signals
+
+
+def _maker_queue_position_payload(snap: OrderBookSnapshot, quote: Any) -> dict[str, Any]:
+    bid_price = getattr(quote, "bid_price", None)
+    ask_price = getattr(quote, "ask_price", None)
+    return {
+        "telemetry_only": True,
+        "bid_price": bid_price,
+        "ask_price": ask_price,
+        "bid_ahead_size": round(_depth_at_price(getattr(snap, "bids", []), bid_price), 8),
+        "ask_ahead_size": round(_depth_at_price(getattr(snap, "asks", []), ask_price), 8),
+    }
+
+
+def _depth_at_price(levels: list[Any], price: Any) -> float:
+    if price is None:
+        return 0.0
+    target = float(price)
+    return sum(
+        float(getattr(level, "size", 0.0) or 0.0)
+        for level in levels
+        if abs(float(getattr(level, "price", 0.0) or 0.0) - target) <= 1e-9
+    )
+
+
+def _maker_event_time_toxicity(
+    market: MarketInfo,
+    baseline_map: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    raw = baseline_map.get(market.condition_id) or baseline_map.get(market.slug)
+    remaining = _time_to_event_sec(raw, now_ts=time.time()) if raw else None
+    if remaining is None:
+        return {"applied": False, "spread_multiplier": 1.0, "size_multiplier": 1.0}
+    if remaining <= 5 * 60:
+        return {
+            "applied": True,
+            "time_to_event_sec": round(float(remaining), 3),
+            "spread_multiplier": 2.0,
+            "size_multiplier": 0.50,
+            "reason": "event_within_5m",
+        }
+    if remaining <= 30 * 60:
+        return {
+            "applied": True,
+            "time_to_event_sec": round(float(remaining), 3),
+            "spread_multiplier": 1.5,
+            "size_multiplier": 0.75,
+            "reason": "event_within_30m",
+        }
+    return {
+        "applied": False,
+        "time_to_event_sec": round(float(remaining), 3),
+        "spread_multiplier": 1.0,
+        "size_multiplier": 1.0,
+    }
 
 
 reset_signal_collector_skip_summaries()

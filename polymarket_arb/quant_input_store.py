@@ -43,17 +43,6 @@ class _FileValue:
             text = self.cached_text or self.fallback
             source = "cached_file" if self.cached_text else "fallback"
             return text, _metadata_for_text(text, source=source, path=self.path)
-        if (
-            self.cached_mtime_ns == stat.st_mtime_ns
-            and self.cached_size == stat.st_size
-            and self.cached_text
-        ):
-            return self.cached_text, _metadata_for_text(
-                self.cached_text,
-                source="file",
-                path=self.path,
-                mtime_ns=stat.st_mtime_ns,
-            )
         try:
             text = file_path.read_text(encoding="utf-8-sig").strip()
             json.loads(text)

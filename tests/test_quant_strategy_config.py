@@ -19,6 +19,7 @@ def test_build_quant_strategy_env_template_contains_parseable_json_values() -> N
     wallet_observations = json.loads(template["WALLET_ALPHA_OBSERVATIONS_JSON"])
 
     assert template["SNIPER_GATE_ENABLED"] == "true"
+    assert template["SNIPER_MIN_NET_EDGE_BPS"] == "500"
     assert logical[0]["relation_type"] == "subject_lte_bound"
     assert "baseline_probability" in next(iter(event.values()))
     assert next(iter(wallet_profiles.values()))["lagged_follow_roi"] > 0

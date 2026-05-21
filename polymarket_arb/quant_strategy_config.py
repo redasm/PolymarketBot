@@ -47,7 +47,7 @@ def build_quant_strategy_env_template() -> dict[str, str]:
     ]
     return {
         "SNIPER_GATE_ENABLED": "true",
-        "SNIPER_MIN_NET_EDGE_BPS": "250",
+        "SNIPER_MIN_NET_EDGE_BPS": "500",
         "SNIPER_MIN_CONFIDENCE": "0.75",
         "SNIPER_MIN_LIQUIDITY": "1000",
         "SNIPER_MIN_VOLUME_24H": "500",

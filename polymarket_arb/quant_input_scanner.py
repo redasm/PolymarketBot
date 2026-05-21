@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
@@ -348,9 +349,19 @@ def promote_wallet_profiles_from_markout_rows(
     min_lagged_roi: float = 0.04,
     max_concentration: float = 0.35,
     max_drawdown: float = 0.35,
-) -> dict[str, dict[str, Any]]:
+    holdout_sec: float = 24 * 3600.0,
+    now_ts: float | None = None,
+    min_t_stat: float = 2.0,
+    profile_expires_sec: float = 30 * 60.0,
+) -> dict[str, Any]:
     """Return only wallet profiles that pass the live wallet-alpha gate."""
-    profiles = build_wallet_profiles_from_markout_rows(rows, min_trades=min_trades)
+    generated_at = float(time.time() if now_ts is None else now_ts)
+    training_rows = _exclude_holdout_rows(
+        rows,
+        now_ts=generated_at,
+        holdout_sec=holdout_sec,
+    )
+    profiles = build_wallet_profiles_from_markout_rows(training_rows, min_trades=min_trades)
     scorer = WalletAlphaScorer(
         min_trades=min_trades,
         min_lagged_roi=min_lagged_roi,
@@ -373,12 +384,30 @@ def promote_wallet_profiles_from_markout_rows(
         )
         decision = scorer.evaluate(profile)
         if decision.accepted:
+            pnl_values = [
+                _float(item.get("lagged_follow_pnl_usdc") or item.get("lagged_follow_pnl"))
+                for item in training_rows
+                if str(item.get("wallet_address") or item.get("proxyWallet") or "").strip() == wallet
+            ]
+            t_stat = _t_stat(pnl_values)
+            if t_stat < min_t_stat:
+                continue
             promoted[wallet] = {
                 **row,
                 "promotion_reasons": list(decision.reasons),
                 "promotion_confidence": decision.confidence,
+                "promotion_t_stat": round(t_stat, 8) if math.isfinite(t_stat) else "inf",
+                "promotion_generated_at": generated_at,
+                "promotion_expires_at": generated_at + max(0.0, float(profile_expires_sec)),
             }
-    return promoted
+    return {
+        "schema_version": 1,
+        "generated_at": generated_at,
+        "expires_at": generated_at + max(0.0, float(profile_expires_sec)),
+        "holdout_sec": float(holdout_sec),
+        "min_t_stat": float(min_t_stat),
+        "wallets": promoted,
+    }
 
 
 def build_wallet_markouts_from_shadow_rows(
@@ -422,17 +451,48 @@ def build_wallet_markouts_from_shadow_rows(
         )
         if lagged is None:
             continue
-        markouts.append(
-            {
-                "wallet_address": str(context.get("wallet_address") or ""),
-                "market_id": str(row.get("market_id") or entry.get("market_id") or ""),
-                "category": str(context.get("category") or ""),
-                "notional_usdc": round(notional, 8),
-                "realized_pnl_usdc": round(realized, 8),
-                "lagged_follow_pnl_usdc": round(lagged, 8),
-            }
-        )
+        out = {
+            "wallet_address": str(context.get("wallet_address") or ""),
+            "market_id": str(row.get("market_id") or entry.get("market_id") or ""),
+            "category": str(context.get("category") or ""),
+            "notional_usdc": round(notional, 8),
+            "realized_pnl_usdc": round(realized, 8),
+            "lagged_follow_pnl_usdc": round(lagged, 8),
+        }
+        close_ts = _first_present_float(row, ("close_ts", "timestamp", "ts"))
+        if close_ts is not None:
+            out["close_ts"] = round(close_ts, 3)
+        markouts.append(out)
     return markouts
+
+
+def _exclude_holdout_rows(
+    rows: list[dict[str, Any]],
+    *,
+    now_ts: float,
+    holdout_sec: float,
+) -> list[dict[str, Any]]:
+    cutoff = now_ts - max(0.0, float(holdout_sec))
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        row_ts = _first_present_float(row, ("close_ts", "entry_ts", "timestamp", "ts"))
+        if row_ts is not None and row_ts > cutoff:
+            continue
+        out.append(row)
+    return out
+
+
+def _t_stat(values: list[float]) -> float:
+    clean = [value for value in values if math.isfinite(value)]
+    if len(clean) < 2:
+        return 0.0
+    mean = sum(clean) / len(clean)
+    if mean <= 0.0:
+        return 0.0
+    variance = sum((value - mean) ** 2 for value in clean) / (len(clean) - 1)
+    if variance <= 0.0:
+        return math.inf
+    return mean / math.sqrt(variance / len(clean))
 
 
 def _category_edges(rows: list[dict[str, Any]]) -> dict[str, float]:

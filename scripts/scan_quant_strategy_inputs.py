@@ -100,6 +100,9 @@ def main() -> int:
     p_promote.add_argument("--min-lagged-roi", type=float, default=0.04)
     p_promote.add_argument("--max-concentration", type=float, default=0.35)
     p_promote.add_argument("--max-drawdown", type=float, default=0.35)
+    p_promote.add_argument("--holdout-sec", type=float, default=24 * 3600.0)
+    p_promote.add_argument("--min-t-stat", type=float, default=2.0)
+    p_promote.add_argument("--profile-expires-sec", type=float, default=30 * 60.0)
     p_promote.add_argument("--repeat-interval-sec", type=float, default=0.0)
     p_promote.add_argument("--repeat-count", type=int, default=1, help="Use 0 to repeat forever")
 
@@ -138,6 +141,9 @@ def main() -> int:
     p_auto_promote.add_argument("--min-lagged-roi", type=float, default=0.04)
     p_auto_promote.add_argument("--max-concentration", type=float, default=0.35)
     p_auto_promote.add_argument("--max-drawdown", type=float, default=0.35)
+    p_auto_promote.add_argument("--holdout-sec", type=float, default=24 * 3600.0)
+    p_auto_promote.add_argument("--min-t-stat", type=float, default=2.0)
+    p_auto_promote.add_argument("--profile-expires-sec", type=float, default=30 * 60.0)
     p_auto_promote.add_argument("--repeat-interval-sec", type=float, default=0.0)
     p_auto_promote.add_argument("--repeat-count", type=int, default=1, help="Use 0 to repeat forever")
 
@@ -250,6 +256,9 @@ def _build_payload(args) -> Any:
             min_lagged_roi=args.min_lagged_roi,
             max_concentration=args.max_concentration,
             max_drawdown=args.max_drawdown,
+            holdout_sec=args.holdout_sec,
+            min_t_stat=args.min_t_stat,
+            profile_expires_sec=args.profile_expires_sec,
         )
     return promote_wallet_profiles_from_markout_rows(
         _load_rows(Path(args.input)),
@@ -257,6 +266,9 @@ def _build_payload(args) -> Any:
         min_lagged_roi=args.min_lagged_roi,
         max_concentration=args.max_concentration,
         max_drawdown=args.max_drawdown,
+        holdout_sec=args.holdout_sec,
+        min_t_stat=args.min_t_stat,
+        profile_expires_sec=args.profile_expires_sec,
     )
 
 

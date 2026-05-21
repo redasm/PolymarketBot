@@ -280,6 +280,35 @@ def test_collect_wallet_alpha_converts_accepted_observation_to_signal():
     assert out[0].payload["quant_input"]["observations"]["sha256"] == "observations"
 
 
+def test_collect_wallet_alpha_rejects_expired_profile_schema():
+    cfg = make_test_config(default_order_size_usdc=7.0)
+    market = _binary_market("weather")
+    profiles = {
+        "schema_version": 1,
+        "generated_at": time.time() - 7200,
+        "expires_at": time.time() - 3600,
+        "wallets": {
+            "0xgood": {
+                "trade_count": 40,
+                "realized_roi": 0.25,
+                "lagged_follow_roi": 0.08,
+                "max_drawdown": 0.10,
+                "concentration_score": 0.20,
+                "category_edges": {"weather": 0.09},
+            }
+        },
+    }
+
+    out = collect_wallet_alpha_strategy_signals(
+        config=cfg,
+        candidate_markets=[market],
+        profiles=profiles,
+        observations=[{"wallet_address": "0xgood", "market_id": "weather", "action": "BUY_YES"}],
+    )
+
+    assert out == []
+
+
 def test_collect_wallet_alpha_rejects_unfollowable_wallet_profile():
     cfg = make_test_config()
     profiles = {
@@ -507,6 +536,38 @@ def test_collect_maker_uses_supplied_fair_value():
     assert detector.estimate_calls == []  # didn't fall back
 
 
+def test_collect_maker_records_queue_position_telemetry():
+    snapshots = {
+        "m-yes": OrderBookSnapshot(
+            token_id="m-yes",
+            best_bid=0.49,
+            best_ask=0.51,
+            bids=[
+                OrderBookLevel(price=0.49, size=25.0),
+                OrderBookLevel(price=0.48, size=100.0),
+            ],
+            asks=[
+                OrderBookLevel(price=0.51, size=40.0),
+                OrderBookLevel(price=0.52, size=100.0),
+            ],
+            tick_size=0.01,
+        )
+    }
+    maker = _StubMaker(quote=_maker_quote(bid=0.49, ask=0.51))
+
+    out = collect_maker_strategy_signals(
+        candidate_markets=[_binary_market("m")],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        maker_strategy=maker,
+        fair_values_by_market={"m": 0.50},
+    )
+
+    queue = out[0].payload["queue_position"]
+    assert queue["bid_ahead_size"] == 25.0
+    assert queue["ask_ahead_size"] == 40.0
+    assert queue["telemetry_only"] is True
+
+
 def test_collect_maker_falls_back_to_detector_when_no_fair_value():
     snapshots = {"m-yes": _balanced_snapshot("m-yes", mid=0.50)}
     detector = _StubDetector(model_prob=0.50)
@@ -571,6 +632,33 @@ def test_collect_maker_attaches_flow_bias_when_aggregator_has_data():
     assert bias["taker_yes_share"] == pytest.approx(0.70)
     assert bias["lean"] == "yes"
     assert bias["is_stable"] is True
+
+
+def test_collect_maker_applies_event_time_toxic_flow_spread_multiplier():
+    now = time.time()
+    snapshots = {"m-yes": _balanced_snapshot("m-yes", mid=0.50)}
+    maker = _StubMaker(quote=_maker_quote())
+
+    out = collect_maker_strategy_signals(
+        candidate_markets=[_binary_market("m")],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        maker_strategy=maker,
+        fair_values_by_market={"m": 0.50},
+        event_baselines={
+            "m": {
+                "baseline_probability": 0.50,
+                "confidence": 0.80,
+                "time_to_event_sec": 20 * 60,
+                "generated_at": now,
+            }
+        },
+    )
+
+    assert len(out) == 1
+    assert maker.calls[0]["spread_multiplier"] == pytest.approx(1.5)
+    assert out[0].payload["event_time_toxicity"]["applied"] is True
+    assert out[0].payload["event_time_toxicity"]["size_multiplier"] == pytest.approx(0.75)
+    assert out[0].recommended_size_usdc == pytest.approx(9.0)
 
 
 def test_collect_maker_omits_flow_bias_when_aggregator_has_no_data():

@@ -16,7 +16,7 @@ from polymarket_arb.strategies.strategy_orchestrator import StrategySignal, Stra
 
 @dataclass(frozen=True)
 class SniperGateConfig:
-    min_net_edge_bps: float = 250.0
+    min_net_edge_bps: float = 500.0
     min_confidence: float = 0.75
     min_liquidity: float = 0.0
     min_volume_24h: float = 0.0

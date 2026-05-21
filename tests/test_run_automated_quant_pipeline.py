@@ -54,7 +54,7 @@ def test_automated_pipeline_builds_shadow_live_scanner_and_promoter(tmp_path: Pa
     assert specs[0].env["WALLET_ALPHA_PROFILES_FILE"].endswith("wallet_profiles.json")
     assert specs[0].env["TELEMETRY_RECORD_ENABLED"] == "true"
     assert "auto-wallet-observations" in specs[1].args
-    assert "wallet-markouts-from-recent-trades" in specs[2].args
+    assert "wallet-markouts-from-telemetry" in specs[2].args
     assert "promote-wallet-profiles" in specs[3].args
     assert specs[1].critical is False
     assert specs[2].critical is False

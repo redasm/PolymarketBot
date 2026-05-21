@@ -167,6 +167,7 @@ class MakerStrategy:
         mid_price: Optional[float] = None,
         reward_delta: Optional[float] = None,
         flow_bias_yes_share: Optional[float] = None,
+        spread_multiplier: float = 1.0,
     ) -> Optional[QuoteUpdate]:
         """计算做市报价.
 
@@ -212,6 +213,9 @@ class MakerStrategy:
         bid_off, ask_off = self._spread_calc.compute_spread(
             token_id, tick_size, inventory=effective_inv
         )
+        multiplier = max(1.0, float(spread_multiplier))
+        bid_off *= multiplier
+        ask_off *= multiplier
 
         raw_bid = fair_value - bid_off
         raw_ask = fair_value + ask_off

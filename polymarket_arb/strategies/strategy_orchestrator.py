@@ -133,6 +133,7 @@ class StrategyOrchestrator:
         max_signal_size_multiplier: float = 1.35,
     ):
         self._bankroll = total_bankroll
+        self._peak_equity = max(0.0, float(total_bankroll))
         alloc_map = allocations or self.DEFAULT_ALLOCATIONS
 
         self._allocations: dict[StrategyTier, StrategyAllocation] = {}
@@ -240,6 +241,11 @@ class StrategyOrchestrator:
         signal_copy.payload["tail_risk"] = tail_risk
         self._record_tail_risk(tail_risk)
         self._cap_signal_size(signal_copy, original_size)
+        drawdown_scaling = self._apply_drawdown_size_scaling(signal_copy)
+        signal_copy.payload["drawdown_size_scaling"] = drawdown_scaling
+        if drawdown_scaling.get("blocked"):
+            self._record_process_skip(signal_copy, "drawdown_size_scaling_block")
+            return False
         self._record_per_market_submission(signal_copy)
         self._pending_signals.append(signal_copy)
         return True
@@ -317,6 +323,7 @@ class StrategyOrchestrator:
             alloc.trade_count += 1
             alloc.last_trade_ts = time.time()
         alloc.realized_pnl += pnl
+        self._refresh_peak_equity()
         self._append_executed_signal(signal)
 
     def record_processed(self, signal: StrategySignal) -> None:
@@ -329,9 +336,11 @@ class StrategyOrchestrator:
         if alloc:
             alloc.current_exposure = max(0, alloc.current_exposure - amount)
             alloc.realized_pnl += pnl
+            self._refresh_peak_equity()
 
     def update_bankroll(self, new_bankroll: float) -> None:
         self._bankroll = new_bankroll
+        self._refresh_peak_equity()
 
     def _append_executed_signal(self, signal: StrategySignal) -> None:
         self._executed_signals.append(signal)
@@ -362,6 +371,11 @@ class StrategyOrchestrator:
             "research_overlay": dict(self._research_overlay_stats),
             "tail_risk": dict(self._tail_risk_stats),
             "sniper_gate": dict(self._sniper_gate_stats),
+            "equity": {
+                "current": round(self._current_equity(), 8),
+                "peak": round(self._peak_equity, 8),
+                "drawdown": round(self._current_drawdown(), 8),
+            },
             "recent_overlays": list(self._overlay_history[-10:]),
             "last_skip_reasons": dict(self._last_skip_reasons),
             "last_skipped_by_tier": dict(self._last_skipped_by_tier),
@@ -704,6 +718,49 @@ class StrategyOrchestrator:
             "base_size_usdc": round(original_size, 8),
             "capped_size_usdc": round(max_size, 8),
         }
+
+    def _apply_drawdown_size_scaling(self, signal: StrategySignal) -> dict[str, Any]:
+        if signal.tier not in {StrategyTier.STATISTICAL_ARB, StrategyTier.CROSS_PLATFORM}:
+            return {"applied": False, "multiplier": 1.0, "drawdown": round(self._current_drawdown(), 8)}
+        drawdown = self._current_drawdown()
+        multiplier = self._drawdown_multiplier(drawdown)
+        payload = {
+            "applied": multiplier < 1.0,
+            "blocked": multiplier <= 0.0,
+            "multiplier": multiplier,
+            "drawdown": round(drawdown, 8),
+            "current_equity": round(self._current_equity(), 8),
+            "peak_equity": round(self._peak_equity, 8),
+        }
+        if multiplier <= 0.0:
+            signal.recommended_size_usdc = 0.0
+            return payload
+        if multiplier < 1.0:
+            signal.recommended_size_usdc = max(0.0, signal.recommended_size_usdc * multiplier)
+        return payload
+
+    @staticmethod
+    def _drawdown_multiplier(drawdown: float) -> float:
+        if drawdown >= 0.15:
+            return 0.0
+        if drawdown >= 0.10:
+            return 0.25
+        if drawdown >= 0.05:
+            return 0.50
+        if drawdown >= 0.03:
+            return 0.75
+        return 1.0
+
+    def _current_equity(self) -> float:
+        return float(self._bankroll) + sum(float(alloc.realized_pnl) for alloc in self._allocations.values())
+
+    def _current_drawdown(self) -> float:
+        if self._peak_equity <= 0:
+            return 0.0
+        return max(0.0, (self._peak_equity - self._current_equity()) / self._peak_equity)
+
+    def _refresh_peak_equity(self) -> None:
+        self._peak_equity = max(self._peak_equity, self._current_equity())
 
     def _record_sniper_gate(self, decision: Any) -> None:
         self._sniper_gate_stats["applied"] += 1

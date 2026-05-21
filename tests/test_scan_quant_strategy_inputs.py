@@ -334,7 +334,8 @@ def test_scan_quant_strategy_inputs_promotes_only_validated_wallet_profiles(tmp_
     assert scan_quant_strategy_inputs.main() == 0
 
     payload = json.loads(output_path.read_text(encoding="utf-8"))
-    assert list(payload) == ["0xgood"]
+    assert payload["schema_version"] == 1
+    assert list(payload["wallets"]) == ["0xgood"]
 
 
 def test_scan_quant_strategy_inputs_builds_wallet_markouts_from_shadow_telemetry(tmp_path, monkeypatch) -> None:
@@ -516,7 +517,7 @@ def test_scan_quant_strategy_inputs_auto_promotes_from_shadow_telemetry(tmp_path
     assert scan_quant_strategy_inputs.main() == 0
 
     payload = json.loads(output_path.read_text(encoding="utf-8"))
-    assert payload["0xgood"]["trade_count"] == 2
+    assert payload["wallets"]["0xgood"]["trade_count"] == 2
 
 
 def test_scan_quant_strategy_inputs_repeat_keeps_running_after_transient_error(tmp_path, monkeypatch) -> None:

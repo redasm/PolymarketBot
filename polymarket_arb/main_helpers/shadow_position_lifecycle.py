@@ -32,6 +32,7 @@ class ShadowLot:
     tier: str = ""
     fees: float = 0.0
     source_trade_ids: list[str] = field(default_factory=list)
+    decision_context: dict[str, Any] = field(default_factory=dict)
 
 
 class ShadowPositionLifecycle:
@@ -79,6 +80,7 @@ class ShadowPositionLifecycle:
                 fill_size=filled_size,
                 fee=fee,
                 tier=tier,
+                decision_context=decision_context or {},
             )
             return
         if side == OrderSide.SELL.value:
@@ -131,6 +133,7 @@ class ShadowPositionLifecycle:
         fill_size: float,
         fee: float,
         tier: str,
+        decision_context: dict[str, Any],
     ) -> None:
         self._seq += 1
         position_id = f"shadow-pos-{int(time.time())}-{self._seq}"
@@ -147,6 +150,7 @@ class ShadowPositionLifecycle:
             tier=tier,
             fees=max(0.0, float(fee)),
             source_trade_ids=[trade.trade_id],
+            decision_context=dict(decision_context),
         )
         self._lots_by_token.setdefault(trade.token_id, []).append(lot)
         if self._event_recorder.is_enabled:
@@ -164,6 +168,7 @@ class ShadowPositionLifecycle:
                 "remaining_size": fill_size,
                 "fees": round(float(fee), 6),
                 "tier": tier,
+                "decision_context": dict(decision_context),
             })
 
     def _close_lots(
@@ -217,11 +222,13 @@ class ShadowPositionLifecycle:
                     "close_size": close_size,
                     "remaining_size": lot.remaining_size,
                     "realized_pnl": round(realized, 6),
+                    "lagged_follow_pnl_usdc": round(realized, 6),
+                    "markout_pnl_usdc": round(realized, 6),
                     "fees": round(buy_fee_alloc + sell_fee_alloc, 6),
                     "hold_sec": round(max(0.0, now_ts - lot.open_ts), 4),
                     "tier": lot.tier or tier,
                     "exit_tier": tier,
-                    "decision_context": decision_context,
+                    "decision_context": dict(lot.decision_context or decision_context),
                 })
         self._lots_by_token[trade.token_id] = [
             lot for lot in lots if lot.remaining_size > 1e-9

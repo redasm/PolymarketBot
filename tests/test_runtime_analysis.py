@@ -151,3 +151,31 @@ def test_summarize_runtime_artifacts_groups_new_quant_strategy_signals(tmp_path:
     assert quant["event_calendar"]["submitted"] == 0
     assert quant["wallet_alpha"]["avg_expected_edge_bps"] == 800.0
     assert "statistical_buy_yes" not in quant
+
+
+def test_summarize_runtime_artifacts_attributes_shadow_pnl_by_signal_source(tmp_path: Path):
+    log_path = tmp_path / "arb_bot.log"
+    telemetry_dir = tmp_path / "telemetry"
+    ticks_dir = tmp_path / "ticks"
+    telemetry_dir.mkdir()
+    ticks_dir.mkdir()
+
+    log_path.write_text("2026-04-15 [INFO] main_loop | 模式: DRY RUN (仅扫描)", encoding="utf-8")
+    (telemetry_dir / "2026-04-14.positions_lifecycle.ndjson").write_text(
+        (
+            '{"event":"position_closed","realized_pnl":1.25,"fees":0.05,'
+            '"decision_context":{"signal_source":"wallet_alpha","signal_components":["wallet_alpha"]}}\n'
+            '{"event":"position_closed","realized_pnl":-0.75,"fees":0.02,'
+            '"decision_context":{"signal_source":"statistical_model","signal_components":["obi","momentum"]}}\n'
+        ),
+        encoding="utf-8",
+    )
+
+    summary = summarize_runtime_artifacts(log_path=log_path, telemetry_dir=telemetry_dir, ticks_dir=ticks_dir)
+
+    attribution = summary["pnl_attribution"]["by_source"]
+    assert attribution["wallet_alpha"]["closed_positions"] == 1
+    assert attribution["wallet_alpha"]["realized_pnl"] == 1.25
+    assert attribution["wallet_alpha"]["win_rate"] == 1.0
+    assert attribution["statistical_model"]["realized_pnl"] == -0.75
+    assert summary["pnl_attribution"]["by_component"]["obi"]["realized_pnl"] == -0.75

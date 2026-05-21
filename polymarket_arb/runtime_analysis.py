@@ -96,6 +96,33 @@ def _summarize_signals(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _summarize_pnl_attribution(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    closed = [
+        row for row in rows
+        if str(row.get("event") or "") in {"position_closed", "position_partially_closed"}
+    ]
+    by_source: dict[str, dict[str, Any]] = {}
+    by_component: dict[str, dict[str, Any]] = {}
+    for row in closed:
+        pnl = _to_float(row.get("realized_pnl"))
+        fees = _to_float(row.get("fees"))
+        context = row.get("decision_context") if isinstance(row.get("decision_context"), dict) else {}
+        source = str(context.get("signal_source") or row.get("signal_source") or "unknown")
+        components = _component_list(context.get("signal_components") or row.get("signal_components"))
+        if not components:
+            components = [source]
+        _add_pnl_bucket(by_source, source, pnl=pnl, fees=fees)
+        for component in components:
+            _add_pnl_bucket(by_component, component, pnl=pnl, fees=fees)
+    return {
+        "closed_positions": len(closed),
+        "realized_pnl": round(sum(_to_float(row.get("realized_pnl")) for row in closed), 6),
+        "fees": round(sum(_to_float(row.get("fees")) for row in closed), 6),
+        "by_source": _finalize_pnl_buckets(by_source),
+        "by_component": _finalize_pnl_buckets(by_component),
+    }
+
+
 def _summarize_quant_strategy_signals(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     groups = {
         "logical_constraint": "logical_constraint_",
@@ -133,6 +160,48 @@ def _summarize_ticks(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "unique_conditions": len(condition_ids),
         "unique_tokens": len(token_ids),
     }
+
+
+def _add_pnl_bucket(bucket_map: dict[str, dict[str, Any]], key: str, *, pnl: float, fees: float) -> None:
+    bucket = bucket_map.setdefault(
+        key or "unknown",
+        {"closed_positions": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0, "fees": 0.0},
+    )
+    bucket["closed_positions"] += 1
+    bucket["wins"] += 1 if pnl > 0 else 0
+    bucket["losses"] += 1 if pnl < 0 else 0
+    bucket["realized_pnl"] += pnl
+    bucket["fees"] += fees
+
+
+def _finalize_pnl_buckets(bucket_map: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for key, bucket in sorted(bucket_map.items()):
+        count = int(bucket["closed_positions"])
+        out[key] = {
+            "closed_positions": count,
+            "wins": int(bucket["wins"]),
+            "losses": int(bucket["losses"]),
+            "win_rate": round(float(bucket["wins"]) / count, 6) if count else 0.0,
+            "realized_pnl": round(float(bucket["realized_pnl"]), 6),
+            "fees": round(float(bucket["fees"]), 6),
+        }
+    return out
+
+
+def _component_list(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    return []
+
+
+def _to_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _build_issues(*, run_mode: str, trade_rows: list[dict[str, Any]]) -> list[str]:
@@ -194,6 +263,7 @@ def summarize_runtime_artifacts(
     opportunity_rows = _load_ndjson_rows(_telemetry_category_paths(telemetry_dir, "opportunities"))
     trade_rows = _load_ndjson_rows(_telemetry_category_paths(telemetry_dir, "trades"))
     signal_rows = _load_ndjson_rows(_telemetry_category_paths(telemetry_dir, "strategy_signals"))
+    lifecycle_rows = _load_ndjson_rows(_telemetry_category_paths(telemetry_dir, "positions_lifecycle"))
     tick_rows = _load_ndjson_rows(list(ticks_dir.glob("*.ndjson")))
 
     run_mode = _detect_run_mode(log_text)
@@ -204,6 +274,7 @@ def summarize_runtime_artifacts(
     opportunities = _summarize_opportunities(opportunity_rows)
     trades = _summarize_trades(trade_rows)
     signals = _summarize_signals(signal_rows)
+    pnl_attribution = _summarize_pnl_attribution(lifecycle_rows)
     ticks = _summarize_ticks(tick_rows)
     issues = _build_issues(run_mode=run_mode, trade_rows=trade_rows)
 
@@ -213,6 +284,7 @@ def summarize_runtime_artifacts(
         "opportunities": opportunities,
         "trades": trades,
         "signals": signals,
+        "pnl_attribution": pnl_attribution,
         "ticks": ticks,
         "issues": issues,
     }

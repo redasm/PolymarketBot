@@ -433,6 +433,61 @@ def test_record_execution_can_book_real_exposure_on_failed_trade():
     assert status["T0"]["trade_count"] == 1
 
 
+def test_drawdown_scaling_reduces_directional_signal_size_after_losses():
+    orchestrator = StrategyOrchestrator(total_bankroll=1000)
+    loss = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id="loss-market",
+        description="loss",
+        expected_edge=100.0,
+        confidence=0.8,
+        recommended_size_usdc=100.0,
+    )
+    orchestrator.record_execution(loss, success=True, pnl=-60.0, exposure_amount_usdc=0.0)
+    next_signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id="next-market",
+        description="next",
+        expected_edge=100.0,
+        confidence=0.8,
+        recommended_size_usdc=100.0,
+    )
+
+    assert orchestrator.submit_signal(next_signal) is True
+    ready = orchestrator.process_signals()
+
+    assert ready[0].recommended_size_usdc == 50.0
+    assert ready[0].payload["drawdown_size_scaling"]["multiplier"] == 0.5
+
+
+def test_drawdown_scaling_blocks_directional_signals_after_deep_drawdown():
+    orchestrator = StrategyOrchestrator(total_bankroll=1000)
+    loss = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id="loss-market",
+        description="loss",
+        expected_edge=100.0,
+        confidence=0.8,
+        recommended_size_usdc=100.0,
+    )
+    orchestrator.record_execution(loss, success=True, pnl=-160.0, exposure_amount_usdc=0.0)
+    next_signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id="next-market",
+        description="next",
+        expected_edge=100.0,
+        confidence=0.8,
+        recommended_size_usdc=100.0,
+    )
+
+    assert orchestrator.submit_signal(next_signal) is False
+    assert orchestrator.process_signals() == []
+
+
 def test_process_signals_prefers_higher_confidence_after_edge_normalization():
     orchestrator = StrategyOrchestrator(total_bankroll=1000)
     low_conf_large_edge = StrategySignal(

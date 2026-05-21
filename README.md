@@ -268,7 +268,7 @@ cp .env.example .env
 | `VOL_SLOW_MINUTES` | 慢速波动率窗口 | 360 分钟 |
 | `EDGE_MIN_BPS` | Edge 引擎最小触发阈值 | 100 bps |
 | `EDGE_MAX_SPREAD_BPS` | 最大可接受 spread | 500 bps |
-| `T2_MIN_DEVIATION` | T2 最小绝对概率偏差 | 0.02 |
+| `T2_MIN_DEVIATION` | T2 最小绝对概率偏差 | 0.05 |
 | `RESEARCH_SIGNAL_ENABLED` | 启用研究信号摘要 | false |
 | `BACKTEST_ENABLED` | 启用回测状态展示 | false |
 | `SNIPER_GATE_ENABLED` | 启用方向性信号高置信门禁 | false |
@@ -496,7 +496,7 @@ python scripts/summarize_runtime_artifacts.py --telemetry-dir data/telemetry --t
 - `ARB_MIN_LIQUIDITY=300~800`
 - `ARB_MIN_VOLUME_24H=200~500`
 - `WS_MAX_MARKETS=8~15`
-- `T2_MIN_DEVIATION=0.01`：让 T2 至少能看到 1% 级别的模型偏差
+- `T2_MIN_DEVIATION=0.01`：仅限 shadow 观测期，让 T2 至少能看到 1% 级别的模型偏差
 - `T2_MAX_SPREAD_BPS=800~1500`
 - `T2_MIN_TOP_DEPTH=20~50`
 - `T2_MAX_COMPLEMENT_ERROR_BPS=200~300`

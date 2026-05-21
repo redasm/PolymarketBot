@@ -244,7 +244,30 @@ def test_serialize_strategy_signal_round_trip():
     assert payload["tier"] == "STATISTICAL_ARB"
     assert payload["submitted"] is True
     assert payload["research_overlay"] == {"r": 1}
-    assert payload["payload"] == {"hint": "ok"}
+    assert payload["payload"] == {
+        "hint": "ok",
+        "signal_source": "unknown",
+        "signal_components": ["unknown"],
+    }
+
+
+def test_serialize_strategy_signal_adds_attribution_fields():
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="wallet_alpha_buy_yes",
+        market_id="cX",
+        description="wallet follow",
+        expected_edge=800.0,
+        confidence=0.8,
+        recommended_size_usdc=20.0,
+        payload={"wallet_address": "0xabc"},
+    )
+
+    payload = serialize_strategy_signal(signal, submitted=True)
+
+    assert payload["signal_source"] == "wallet_alpha"
+    assert payload["signal_components"] == ["wallet_alpha"]
+    assert payload["payload"]["signal_source"] == "wallet_alpha"
 
 
 def test_lookup_market_snapshot_exact_then_prefix_then_empty():

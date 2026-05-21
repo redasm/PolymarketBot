@@ -322,8 +322,43 @@ def test_promote_wallet_profiles_filters_only_validated_wallets() -> None:
         max_drawdown=0.5,
     )
 
-    assert list(promoted) == ["0xgood"]
-    assert promoted["0xgood"]["lagged_follow_roi"] == 0.06
+    assert promoted["schema_version"] == 1
+    assert list(promoted["wallets"]) == ["0xgood"]
+    assert promoted["wallets"]["0xgood"]["lagged_follow_roi"] == 0.06
+
+
+def test_promote_wallet_profiles_respects_holdout_and_t_stat() -> None:
+    promoted = promote_wallet_profiles_from_markout_rows(
+        [
+            {
+                "wallet_address": "0xlucky",
+                "notional_usdc": 100,
+                "lagged_follow_pnl_usdc": 20,
+                "close_ts": 2_000,
+            },
+            {
+                "wallet_address": "0xlucky",
+                "notional_usdc": 100,
+                "lagged_follow_pnl_usdc": -10,
+                "close_ts": 1_000,
+            },
+            {
+                "wallet_address": "0xlucky",
+                "notional_usdc": 100,
+                "lagged_follow_pnl_usdc": 0,
+                "close_ts": 1_000,
+            },
+        ],
+        min_trades=2,
+        min_lagged_roi=0.01,
+        max_concentration=1.0,
+        max_drawdown=1.0,
+        holdout_sec=500,
+        now_ts=2_000,
+        min_t_stat=2.0,
+    )
+
+    assert promoted["wallets"] == {}
 
 
 def test_build_wallet_markouts_from_shadow_rows_joins_entry_context_to_closed_positions() -> None:
@@ -349,6 +384,7 @@ def test_build_wallet_markouts_from_shadow_rows_joins_entry_context_to_closed_po
                 "open_price": 0.40,
                 "close_price": 0.55,
                 "close_size": 10,
+                "close_ts": 1234,
                 "realized_pnl": 1.4,
                 "lagged_follow_pnl_usdc": 0.9,
             }
@@ -363,5 +399,6 @@ def test_build_wallet_markouts_from_shadow_rows_joins_entry_context_to_closed_po
             "notional_usdc": 4.0,
             "realized_pnl_usdc": 1.4,
             "lagged_follow_pnl_usdc": 0.9,
+            "close_ts": 1234.0,
         }
     ]
