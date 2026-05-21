@@ -78,13 +78,20 @@ def test_scan_quant_strategy_inputs_builds_logical_candidates_from_events_file(t
     monkeypatch.setattr(
         sys,
         "argv",
-        ["scan_quant_strategy_inputs.py", "logical-candidates", "--events-json", str(input_path)],
+        [
+            "scan_quant_strategy_inputs.py",
+            "logical-candidates",
+            "--events-json",
+            str(input_path),
+            "--max-pairs-per-event",
+            "1",
+        ],
     )
 
     assert scan_quant_strategy_inputs.main() == 0
 
     payload = json.loads(capsys.readouterr().out)
-    assert len(payload) == 2
+    assert len(payload) == 1
     assert payload[0]["selector"] == "same_event_binary_pair"
 
 
@@ -228,6 +235,75 @@ def test_scan_quant_strategy_inputs_repeat_mode_refreshes_output(tmp_path, monke
     assert json.loads(output_path.read_text(encoding="utf-8"))[0]["market_id"] == "m2"
 
 
+def test_scan_quant_strategy_inputs_builds_wallet_markouts_from_recent_trades(tmp_path, monkeypatch) -> None:
+    from scripts import scan_quant_strategy_inputs
+
+    output_path = tmp_path / "wallet_markouts.json"
+
+    class _FakeClient:
+        def __init__(self, host):
+            self.host = host
+
+        def fetch_recent_trades(self, *, limit=500, offset=0):
+            return [
+                {
+                    "proxyWallet": "0xaaa",
+                    "conditionId": "m1",
+                    "outcome": "Yes",
+                    "side": "BUY",
+                    "price": 0.4,
+                    "size": 100,
+                    "timestamp": 1_700_000_000,
+                },
+                {
+                    "proxyWallet": "0xbbb",
+                    "conditionId": "m1",
+                    "outcome": "Yes",
+                    "side": "BUY",
+                    "price": 0.5,
+                    "size": 10,
+                    "timestamp": 1_700_000_300,
+                },
+            ]
+
+        def fetch_trades(self, wallet, *, limit=200, offset=0):
+            return [
+                {
+                    "proxyWallet": wallet,
+                    "conditionId": "m1",
+                    "outcome": "Yes",
+                    "side": "BUY",
+                    "price": 0.4,
+                    "size": 100,
+                    "timestamp": 1_700_000_000,
+                }
+            ]
+
+    monkeypatch.setattr(scan_quant_strategy_inputs, "DataApiWalletTradeClient", _FakeClient)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "scan_quant_strategy_inputs.py",
+            "wallet-markouts-from-recent-trades",
+            "--min-trades",
+            "1",
+            "--min-notional",
+            "10",
+            "--lag-sec",
+            "300",
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    assert scan_quant_strategy_inputs.main() == 0
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload[0]["wallet_address"] == "0xaaa"
+    assert payload[0]["lagged_follow_pnl_usdc"] == 10.0
+
+
 def test_scan_quant_strategy_inputs_promotes_only_validated_wallet_profiles(tmp_path, monkeypatch) -> None:
     from scripts import scan_quant_strategy_inputs
 
@@ -293,6 +369,7 @@ def test_scan_quant_strategy_inputs_builds_wallet_markouts_from_shadow_telemetry
                 "open_price": 0.4,
                 "close_size": 10,
                 "realized_pnl": 1.4,
+                "lagged_follow_pnl_usdc": 0.8,
             }
         )
         + "\n",
@@ -317,7 +394,7 @@ def test_scan_quant_strategy_inputs_builds_wallet_markouts_from_shadow_telemetry
 
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload[0]["wallet_address"] == "0xgood"
-    assert payload[0]["lagged_follow_pnl_usdc"] == 1.4
+    assert payload[0]["lagged_follow_pnl_usdc"] == 0.8
 
 
 def test_scan_quant_strategy_inputs_markouts_defaults_to_recent_dates(tmp_path, monkeypatch) -> None:
@@ -340,7 +417,14 @@ def test_scan_quant_strategy_inputs_markouts_defaults_to_recent_dates(tmp_path, 
         encoding="utf-8",
     )
     (telemetry_dir / "2026-05-21.positions_lifecycle.ndjson").write_text(
-        json.dumps({"event": "position_closed", "open_trade_id": "entry-1", "open_price": 0.4, "close_size": 10, "realized_pnl": 1.0})
+        json.dumps({
+            "event": "position_closed",
+            "open_trade_id": "entry-1",
+            "open_price": 0.4,
+            "close_size": 10,
+            "realized_pnl": 1.0,
+            "lagged_follow_pnl_usdc": 0.5,
+        })
         + "\n",
         encoding="utf-8",
     )
@@ -399,6 +483,7 @@ def test_scan_quant_strategy_inputs_auto_promotes_from_shadow_telemetry(tmp_path
                     "open_price": 0.4,
                     "close_size": 10,
                     "realized_pnl": 1.0,
+                    "lagged_follow_pnl_usdc": 0.5,
                 }
             )
             for idx in range(2)

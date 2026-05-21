@@ -21,6 +21,7 @@ from polymarket_arb.market_scanner import MarketScanner
 from polymarket_arb.market_scanner import _parse_event
 from polymarket_arb.quant_input_scanner import (
     DataApiWalletTradeClient,
+    build_wallet_markouts_from_trade_rows,
     build_wallet_markouts_from_shadow_rows,
     build_wallet_observations_from_trades,
     build_wallet_profiles_from_markout_rows,
@@ -60,6 +61,8 @@ def main() -> int:
     p_candidates.add_argument("--event-limit", type=int, default=50)
     p_candidates.add_argument("--min-liquidity", type=float, default=0.0)
     p_candidates.add_argument("--min-volume-24h", type=float, default=0.0)
+    p_candidates.add_argument("--max-markets-per-event", type=int, default=40)
+    p_candidates.add_argument("--max-pairs-per-event", type=int, default=80)
 
     p_rules = sub.add_parser("logical-rules-llm", help="Use configured LLM to select deterministic rules")
     p_rules.add_argument("--output", default=None, help="Optional JSON output file; written atomically")
@@ -107,6 +110,21 @@ def main() -> int:
     p_markouts.add_argument("--lookback-days", type=int, default=1, help="Used when --date is omitted")
     p_markouts.add_argument("--repeat-interval-sec", type=float, default=0.0)
     p_markouts.add_argument("--repeat-count", type=int, default=1, help="Use 0 to repeat forever")
+
+    p_trade_markouts = sub.add_parser(
+        "wallet-markouts-from-recent-trades",
+        help="Build independent wallet markouts from public recent trades",
+    )
+    p_trade_markouts.add_argument("--output", default=None, help="Optional JSON output file; written atomically")
+    p_trade_markouts.add_argument("--data-api-host", default="https://data-api.polymarket.com")
+    p_trade_markouts.add_argument("--recent-limit", type=int, default=1000)
+    p_trade_markouts.add_argument("--wallet-trade-limit", type=int, default=200)
+    p_trade_markouts.add_argument("--min-trades", type=int, default=3)
+    p_trade_markouts.add_argument("--min-notional", type=float, default=100.0)
+    p_trade_markouts.add_argument("--max-wallets", type=int, default=25)
+    p_trade_markouts.add_argument("--lag-sec", type=float, default=300.0)
+    p_trade_markouts.add_argument("--repeat-interval-sec", type=float, default=0.0)
+    p_trade_markouts.add_argument("--repeat-count", type=int, default=1, help="Use 0 to repeat forever")
 
     p_auto_promote = sub.add_parser(
         "auto-promote-wallet-profiles",
@@ -170,6 +188,8 @@ def _build_payload(args) -> Any:
             events,
             min_liquidity=args.min_liquidity,
             min_volume_24h=args.min_volume_24h,
+            max_markets_per_event=args.max_markets_per_event,
+            max_pairs_per_event=args.max_pairs_per_event,
         )
     if args.kind == "logical-rules-llm":
         config = ArbConfig.from_env(args.dotenv_path, require_wallet=False)
@@ -206,6 +226,23 @@ def _build_payload(args) -> Any:
         )
     if args.kind == "wallet-markouts-from-telemetry":
         return _build_wallet_markouts_from_telemetry(args)
+    if args.kind == "wallet-markouts-from-recent-trades":
+        client = DataApiWalletTradeClient(args.data_api_host)
+        recent_trades = client.fetch_recent_trades(limit=args.recent_limit)
+        wallets = discover_wallets_from_trades(
+            recent_trades,
+            min_trades=args.min_trades,
+            min_notional_usdc=args.min_notional,
+            max_wallets=args.max_wallets,
+        )
+        wallet_trades: list[dict[str, Any]] = []
+        for wallet in wallets:
+            wallet_trades.extend(client.fetch_trades(wallet, limit=args.wallet_trade_limit))
+        return build_wallet_markouts_from_trade_rows(
+            wallet_trades,
+            recent_trades,
+            lag_sec=args.lag_sec,
+        )
     if args.kind == "auto-promote-wallet-profiles":
         return promote_wallet_profiles_from_markout_rows(
             _build_wallet_markouts_from_telemetry(args),

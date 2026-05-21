@@ -39,13 +39,10 @@ def test_build_event_baselines_from_rows_skips_incomplete_rows() -> None:
         ]
     )
 
-    assert out == {
-        "c1": {
-            "baseline_probability": 0.58,
-            "confidence": 0.82,
-            "time_to_event_sec": 7200.0,
-        }
-    }
+    assert out["c1"]["baseline_probability"] == 0.58
+    assert out["c1"]["confidence"] == 0.82
+    assert out["c1"]["time_to_event_sec"] == 7200.0
+    assert out["c1"]["generated_at"] > 0
 
 
 def test_build_logical_constraints_from_rows_emits_subject_bound_rules() -> None:

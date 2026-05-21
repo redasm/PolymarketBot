@@ -13,7 +13,6 @@ covered with a focused unit test.
 
 from __future__ import annotations
 
-import asyncio
 import importlib
 import json
 import logging
@@ -89,11 +88,10 @@ def log_startup_summary(config: ArbConfig, run_id: str) -> None:
         config.portfolio_sync_interval_sec,
     )
     LOG.info(
-        "策略: maker=%s | 研究/AI: research=%s knowledge=%s ai=%s provider=%s model=%s",
+        "策略: maker=%s | 研究: research=%s knowledge=%s | LLM配置: provider=%s model=%s",
         config.maker_strategy_enabled,
         config.research_signal_enabled,
         config.research_signal_knowledge_enabled,
-        config.ai_enabled,
         config.ai_provider,
         config.ai_model,
     )
@@ -216,30 +214,6 @@ def create_cross_platform_scanner(
 def round_timing(value: float) -> float:
     """Clamp negative noise + round to 4 decimals for telemetry payloads."""
     return round(max(0.0, float(value or 0.0)), 4)
-
-
-def get_or_create_event_loop() -> asyncio.AbstractEventLoop:
-    """Return a usable event loop, creating one if needed.
-
-    `asyncio.get_event_loop()` raises in worker threads on Python 3.10+
-    when no loop is bound; this helper creates and binds one so callers
-    in non-async contexts (e.g. the AI advisor's sync wrappers) don't
-    need to know that detail.
-    """
-    try:
-        loop = asyncio.get_running_loop()
-        if loop.is_closed():
-            raise RuntimeError
-    except RuntimeError:
-        policy = asyncio.get_event_loop_policy()
-        try:
-            loop = policy.get_event_loop()
-            if loop.is_closed():
-                raise RuntimeError
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-    return loop
 
 
 def load_last_backtest_report(backtest_reports_dir: str) -> dict:

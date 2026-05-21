@@ -157,7 +157,7 @@ f* = (p·b - q) / b    (经典 Kelly)
 V_tau(m) = max(m, E[V_tau-1(m')])
 ```
 
-输入剩余时间、当前 token 价格、模型终端概率和 Markov 转移矩阵后，输出 HOLD/STOP 和分批止盈阈值。它适合接入 T2/AI 方向性持仓，避免只会进场、不会量化退出。
+输入剩余时间、当前 token 价格、模型终端概率和 Markov 转移矩阵后，输出 HOLD/STOP 和分批止盈阈值。它适合接入 T2/T3 方向性持仓，避免只会进场、不会量化退出。
 
 `StrategyOrchestrator` 还会在方向性信号入队前做两层调整:
 - **Research 共振**: 3 条以上同向、来源分散且置信度足够的研究信号会额外加权；强冲突共振会 veto。
@@ -269,7 +269,6 @@ cp .env.example .env
 | `EDGE_MIN_BPS` | Edge 引擎最小触发阈值 | 100 bps |
 | `EDGE_MAX_SPREAD_BPS` | 最大可接受 spread | 500 bps |
 | `T2_MIN_DEVIATION` | T2 最小绝对概率偏差 | 0.02 |
-| `AI_AUTO_RECOVER_SEC` | AI 降级后自动恢复等待时间 | 1800s |
 | `RESEARCH_SIGNAL_ENABLED` | 启用研究信号摘要 | false |
 | `BACKTEST_ENABLED` | 启用回测状态展示 | false |
 | `SNIPER_GATE_ENABLED` | 启用方向性信号高置信门禁 | false |
@@ -333,9 +332,6 @@ cp .env.example .env
   默认 `0.3%` 是偏保守的中位数假设。做跨平台利润回测时建议把它和真实账户成交单据对齐。
 - `CROSS_PLATFORM_PAIRS_JSON`
   T1 需要明确的 Poly/Kalshi 事件配对，默认留空。主循环现在支持把跨平台机会写进 telemetry，但不会在没有配对表时自行猜测映射。
-- `AI_AUTO_RECOVER_SEC`
-  默认 30 分钟，避免 AI 因短期连续亏损被永久锁死；如果你希望 AI 更谨慎，可以调到 `3600-7200`。
-
 当前主循环的观测口径：
 
 - T0 结构性套利继续进入 `opportunities` / `trades`
@@ -479,7 +475,7 @@ python scripts/scan_quant_strategy_inputs.py auto-promote-wallet-profiles \
 CSV 字段约定：
 
 - `logical-constraints`: `subject_market_id,bound_market_id,relation_type,min_violation_bps,tags,max_size_usdc`
-- `event-baselines`: `condition_id,baseline_probability,confidence,time_to_event_sec`
+- `event-baselines`: `condition_id,baseline_probability,confidence,time_to_event_sec`（脚本会写入 `generated_at`，运行时会扣除已流逝时间；更推荐直接提供 `resolution_at` / `resolution_ts`）
 - `wallet-observations`: `wallet_address,market_id,category,action,observed_size_usdc`
 
 钱包跟单需要同时配置 `WALLET_ALPHA_PROFILES_JSON` 和 `WALLET_ALPHA_OBSERVATIONS_JSON`：前者是离线验证后的钱包质量，后者是你观察到的新动作。只给公开“盈利地址”不会触发信号。
@@ -537,7 +533,7 @@ python -m research_signal.refresh --limit 10
 
 - 拉取活跃市场并按 `--query` 过滤
 - 输出 research signal 聚合报告、来源分布、cache hit 状态
-- 用 `--json` 导出结构化结果，方便后续接 AI context 或离线分析
+- 用 `--json` 导出结构化结果，方便后续离线分析
 
 Research layer 也支持两种可选扩展源：
 
@@ -598,7 +594,7 @@ python run_arb_bot.py
 
 - Dashboard 的 `Research Signals` 卡片里能看到信号数量和摘要
 - `strategy_status.meta.research_overlay` 会开始累计 `applied / boosted / penalized / vetoed`
-- `AI decisions` 里会附带 `research_overlay`
+- `strategy_status.meta.research_overlay` 会显示 overlay 的聚合效果
 
 4. 如需验证离线回放
 
@@ -615,7 +611,7 @@ python -m research.backtest.run --dataset default
 
 - 先确认 `research` 没有系统性反向误导
 - 先确认 `strategy overlay` 更多是在降噪，而不是频繁 veto 全部信号
-- 先确认 AI 成本、风控和 dashboard 状态都稳定
+- 先确认风控、执行和 dashboard 状态都稳定
 
 ## 测试
 

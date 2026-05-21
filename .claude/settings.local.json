@@ -44,7 +44,8 @@
       "PowerShell(python -c \"import polymarket_arb.main_loop\" 2>&1)",
       "PowerShell($out = python -c \"print\\('hello'\\)\" 2>&1; Write-Output \"EXIT=$LASTEXITCODE\"; Write-Output $out)",
       "PowerShell(Get-Command *)",
-      "PowerShell(py *)"
+      "PowerShell(py *)",
+      "Bash(findstr *)"
     ]
   }
 }

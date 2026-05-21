@@ -130,6 +130,7 @@ class StrategyOrchestrator:
         max_signals_per_market_per_hour: int = 2,
         tail_risk_classifier: Optional[TailRiskClassifier] = None,
         sniper_gate: Any | None = None,
+        max_signal_size_multiplier: float = 1.35,
     ):
         self._bankroll = total_bankroll
         alloc_map = allocations or self.DEFAULT_ALLOCATIONS
@@ -169,6 +170,7 @@ class StrategyOrchestrator:
         self._signal_history_by_market: dict[tuple[StrategyTier, str], list[float]] = {}
         self._max_signals_per_market_per_hour = max(0, int(max_signals_per_market_per_hour))
         self._rate_cap_log_state: dict[tuple[StrategyTier, str], tuple[float, int]] = {}
+        self._max_signal_size_multiplier = max(1.0, float(max_signal_size_multiplier))
 
     def submit_signal(
         self,
@@ -179,6 +181,7 @@ class StrategyOrchestrator:
         research_signals: list[Any] | None = None,
     ) -> bool:
         active_markets = active_markets or []
+        original_size = max(0.0, float(signal.recommended_size_usdc))
         if self._sniper_gate is not None:
             market = self._find_market(signal.market_id, active_markets)
             gate_decision = self._sniper_gate.evaluate(signal, market=market)
@@ -236,6 +239,7 @@ class StrategyOrchestrator:
         )
         signal_copy.payload["tail_risk"] = tail_risk
         self._record_tail_risk(tail_risk)
+        self._cap_signal_size(signal_copy, original_size)
         self._record_per_market_submission(signal_copy)
         self._pending_signals.append(signal_copy)
         return True
@@ -687,6 +691,19 @@ class StrategyOrchestrator:
             self._tail_risk_stats["penalized"] += 1
         if tail_risk.get("risk_class") == "high_tail":
             self._tail_risk_stats["high_risk"] += 1
+
+    def _cap_signal_size(self, signal: StrategySignal, original_size: float) -> None:
+        if original_size <= 0:
+            return
+        max_size = original_size * self._max_signal_size_multiplier
+        if signal.recommended_size_usdc <= max_size:
+            return
+        signal.recommended_size_usdc = max_size
+        signal.payload["risk_size_cap"] = {
+            "max_signal_size_multiplier": round(self._max_signal_size_multiplier, 3),
+            "base_size_usdc": round(original_size, 8),
+            "capped_size_usdc": round(max_size, 8),
+        }
 
     def _record_sniper_gate(self, decision: Any) -> None:
         self._sniper_gate_stats["applied"] += 1

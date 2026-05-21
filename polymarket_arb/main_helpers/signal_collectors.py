@@ -145,6 +145,7 @@ def collect_logical_constraint_strategy_signals(
     candidate_markets: list[MarketInfo],
     ob_analyzer: OrderBookAnalyzer,
     rules: list[dict[str, Any] | RelationRule] | str | None = None,
+    input_metadata: dict[str, Any] | None = None,
 ) -> list[StrategySignal]:
     """Emit relationship-violation signals from explicit market rules.
 
@@ -171,7 +172,9 @@ def collect_logical_constraint_strategy_signals(
         rules=parsed_rules,
         default_size_usdc=config.default_order_size_usdc,
     )
-    return detector.detect(markets=markets_by_id, yes_prices=yes_prices)
+    signals = detector.detect(markets=markets_by_id, yes_prices=yes_prices)
+    _attach_input_metadata(signals, "logical_constraints", input_metadata)
+    return signals
 
 
 def collect_event_calendar_strategy_signals(
@@ -180,6 +183,7 @@ def collect_event_calendar_strategy_signals(
     candidate_markets: list[MarketInfo],
     ob_analyzer: OrderBookAnalyzer,
     baselines: dict[str, dict[str, Any]] | str | None = None,
+    input_metadata: dict[str, Any] | None = None,
 ) -> list[StrategySignal]:
     """Emit event-baseline signals from market metadata or explicit baselines."""
     baseline_map = _parse_event_baselines(baselines)
@@ -208,6 +212,7 @@ def collect_event_calendar_strategy_signals(
         )
         signal = model.evaluate(item)
         if signal is not None:
+            _attach_input_metadata([signal], "event_baselines", input_metadata)
             signals.append(signal)
     return signals
 
@@ -219,6 +224,7 @@ def collect_wallet_alpha_strategy_signals(
     profiles: dict[str, dict[str, Any] | WalletProfile] | str | None = None,
     observations: list[dict[str, Any]] | str | None = None,
     scorer: WalletAlphaScorer | None = None,
+    input_metadata: dict[str, Any] | None = None,
 ) -> list[StrategySignal]:
     """Convert vetted wallet observations into follow signals.
 
@@ -252,6 +258,11 @@ def collect_wallet_alpha_strategy_signals(
             if candidate_shadow_enabled:
                 candidate_signal = _wallet_alpha_candidate_signal(config, market, obs, action, wallet, category)
                 if candidate_signal is not None:
+                    _attach_input_metadata(
+                        [candidate_signal],
+                        "wallet_alpha",
+                        input_metadata,
+                    )
                     signals.append(candidate_signal)
             continue
         decision = alpha_scorer.evaluate(profile, category=category or None)
@@ -260,27 +271,42 @@ def collect_wallet_alpha_strategy_signals(
         if action not in {"BUY_YES", "BUY_NO"}:
             continue
 
-        signals.append(
-            StrategySignal(
-                tier=StrategyTier.STATISTICAL_ARB,
-                signal_type=f"wallet_alpha_{action.lower()}",
-                market_id=market.condition_id,
-                description=f"wallet alpha follow {wallet[:10]} on {market.question[:80]}",
-                expected_edge=max(0.0, profile.lagged_follow_roi) * 10_000.0,
-                confidence=decision.confidence,
-                recommended_size_usdc=config.default_order_size_usdc,
-                urgency=0.65,
-                payload={
-                    "action": action,
-                    "wallet_address": wallet,
-                    "category": category,
-                    "observed_size_usdc": float(obs.get("observed_size_usdc", 0.0) or 0.0),
-                    "lagged_follow_roi": profile.lagged_follow_roi,
-                    "wallet_reasons": list(decision.reasons),
-                },
-            )
+        signal = StrategySignal(
+            tier=StrategyTier.STATISTICAL_ARB,
+            signal_type=f"wallet_alpha_{action.lower()}",
+            market_id=market.condition_id,
+            description=f"wallet alpha follow {wallet[:10]} on {market.question[:80]}",
+            expected_edge=max(0.0, profile.lagged_follow_roi) * 10_000.0,
+            confidence=decision.confidence,
+            recommended_size_usdc=config.default_order_size_usdc * decision.size_multiplier,
+            urgency=0.65,
+            payload={
+                "action": action,
+                "wallet_address": wallet,
+                "category": category,
+                "observed_size_usdc": float(obs.get("observed_size_usdc", 0.0) or 0.0),
+                "lagged_follow_roi": profile.lagged_follow_roi,
+                "wallet_size_multiplier": decision.size_multiplier,
+                "wallet_reasons": list(decision.reasons),
+            },
         )
+        _attach_input_metadata([signal], "wallet_alpha", input_metadata)
+        signals.append(signal)
     return signals
+
+
+def _attach_input_metadata(
+    signals: list[StrategySignal],
+    key: str,
+    metadata: dict[str, Any] | None,
+) -> None:
+    if not metadata:
+        return
+    for signal in signals:
+        signal.payload["quant_input"] = {
+            "name": key,
+            **dict(metadata),
+        }
 
 
 def _wallet_alpha_candidate_signal(
@@ -299,7 +325,7 @@ def _wallet_alpha_candidate_signal(
         market_id=market.condition_id,
         description=f"wallet alpha candidate shadow {wallet[:10]} on {market.question[:80]}",
         expected_edge=300.0,
-        confidence=0.10,
+        confidence=(config.sniper_min_confidence if config.sniper_gate_enabled else 0.10),
         recommended_size_usdc=config.default_order_size_usdc,
         urgency=0.35,
         payload={
@@ -472,10 +498,10 @@ def _event_baseline_for_market(
 ) -> dict[str, Any] | None:
     raw = baseline_map.get(market.condition_id) or baseline_map.get(market.slug)
     if raw is None:
-        raw = market.raw
+        return None
     baseline = _first_float(raw, ("event_baseline_probability", "baseline_probability"))
     confidence = _first_float(raw, ("event_confidence", "confidence"))
-    time_to_event = _first_float(raw, ("time_to_event_sec", "seconds_to_event"))
+    time_to_event = _time_to_event_sec(raw, now_ts=time.time())
     if baseline is None or confidence is None or time_to_event is None:
         return None
     return {
@@ -493,6 +519,69 @@ def _first_float(raw: dict[str, Any], keys: tuple[str, ...]) -> float | None:
             return float(raw[key])
         except (TypeError, ValueError):
             continue
+    return None
+
+
+def _time_to_event_sec(raw: dict[str, Any], *, now_ts: float) -> float | None:
+    absolute = _first_timestamp(
+        raw,
+        (
+            "resolution_ts",
+            "resolution_time_ts",
+            "resolution_at_ts",
+            "event_ts",
+            "event_time_ts",
+            "deadline_ts",
+        ),
+    )
+    if absolute is None:
+        absolute = _first_iso_timestamp(
+            raw,
+            (
+                "resolution_at",
+                "resolution_time",
+                "event_time",
+                "event_date",
+                "deadline",
+                "end_date",
+            ),
+        )
+    if absolute is not None:
+        remaining = absolute - now_ts
+        return remaining if remaining >= 0 else None
+    static_remaining = _first_float(raw, ("time_to_event_sec", "seconds_to_event"))
+    if static_remaining is None:
+        return None
+    generated_at = _first_timestamp(raw, ("generated_at", "source_generated_at", "created_at_ts"))
+    if generated_at is None:
+        generated_at = _first_iso_timestamp(raw, ("generated_at", "source_generated_at", "created_at"))
+    if generated_at is None:
+        return None
+    remaining = static_remaining - max(0.0, now_ts - generated_at)
+    return remaining if remaining >= 0 else None
+
+
+def _first_timestamp(raw: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = _first_float(raw, (key,))
+        if value is not None:
+            return value
+    return None
+
+
+def _first_iso_timestamp(raw: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = raw.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        text = value.strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
     return None
 
 

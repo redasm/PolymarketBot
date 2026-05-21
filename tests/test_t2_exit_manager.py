@@ -47,6 +47,14 @@ class _FakeRiskManager:
 
 
 @dataclass
+class _FakeOrchestrator:
+    settlements: list[tuple[Any, float, float]] = field(default_factory=list)
+
+    def record_settlement(self, tier: Any, amount: float, pnl: float) -> None:
+        self.settlements.append((tier, amount, pnl))
+
+
+@dataclass
 class _FakeNotifier:
     failures: list[dict[str, Any]] = field(default_factory=list)
     fatals: list[dict[str, Any]] = field(default_factory=list)
@@ -232,6 +240,7 @@ def test_register_then_stop_loss_triggers_sell():
 def test_successful_exit_releases_risk_exposure() -> None:
     executor = _StubExecutor()
     risk = _FakeRiskManager()
+    orchestrator = _FakeOrchestrator()
     config = make_test_config(
         t2_stop_loss_bps=99999.0,
         t2_take_profit_capture_pct=10.0,
@@ -240,7 +249,13 @@ def test_successful_exit_releases_risk_exposure() -> None:
         t2_exit_eval_interval_sec=0.0,
     )
     ob = _StubOB({"t-yes": _snap("t-yes", best_bid=0.50)})
-    mgr = T2ExitManager(config=config, executor=executor, ob_analyzer=ob, risk_manager=risk)
+    mgr = T2ExitManager(
+        config=config,
+        executor=executor,
+        ob_analyzer=ob,
+        risk_manager=risk,
+        orchestrator=orchestrator,
+    )
     market = _market()
     mgr.register_fills(
         signal_payload={"action": "BUY_YES", "model_prob": 0.55, "deviation": 0.05},
@@ -252,6 +267,7 @@ def test_successful_exit_releases_risk_exposure() -> None:
     mgr.evaluate(active_markets=[market])
 
     assert risk.releases == [("c1", pytest.approx(1.0))]
+    assert orchestrator.settlements[0][1] == pytest.approx(1.0)
 
 
 def test_take_profit_triggers_when_capture_pct_reached():

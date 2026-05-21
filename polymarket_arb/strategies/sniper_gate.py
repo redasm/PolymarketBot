@@ -68,6 +68,4 @@ class SniperGate:
         if reasons:
             return SniperGateDecision(accepted=False, size_multiplier=0.0, reasons=reasons)
 
-        surplus_edge = max(0.0, float(signal.expected_edge) - self._config.min_net_edge_bps)
-        size_multiplier = min(1.25, 1.0 + surplus_edge / 2000.0)
-        return SniperGateDecision(accepted=True, size_multiplier=size_multiplier, reasons=["accepted"])
+        return SniperGateDecision(accepted=True, size_multiplier=1.0, reasons=["accepted"])

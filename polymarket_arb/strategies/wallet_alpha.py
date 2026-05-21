@@ -73,6 +73,6 @@ class WalletAlphaScorer:
         drawdown_score = max(0.0, 1.0 - profile.max_drawdown / max(1e-9, self._max_drawdown))
         concentration_score = max(0.0, 1.0 - profile.concentration_score / max(1e-9, self._max_concentration))
         return round(
-            0.45 + (sample_score * 0.20) + (edge_score * 0.20) + (drawdown_score * 0.10) + (concentration_score * 0.05),
+            0.35 + (sample_score * 0.20) + (edge_score * 0.20) + (drawdown_score * 0.10) + (concentration_score * 0.05),
             6,
         )

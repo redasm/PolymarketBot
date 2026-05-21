@@ -101,7 +101,7 @@ def test_logical_constraint_detector_emits_signal_when_upper_bound_is_too_cheap(
     )
 
     assert len(signals) == 1
-    assert signals[0].signal_type == "logical_constraint_buy_bound"
+    assert signals[0].signal_type == "logical_constraint_directional_buy_bound"
     assert signals[0].market_id == "party-a"
     assert signals[0].expected_edge == 700.0
     assert signals[0].payload["relation_type"] == "subject_lte_bound"

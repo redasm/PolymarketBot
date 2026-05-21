@@ -5,6 +5,7 @@ import json
 from polymarket_arb.models import EventInfo, MarketInfo, TokenInfo
 from polymarket_arb.quant_input_scanner import (
     DataApiWalletTradeClient,
+    build_wallet_markouts_from_trade_rows,
     build_wallet_observations_from_trades,
     build_wallet_markouts_from_shadow_rows,
     build_wallet_profiles_from_markout_rows,
@@ -88,6 +89,29 @@ def test_generate_logical_constraint_candidates_groups_binary_markets_by_event()
     assert {candidates[0]["subject_market_id"], candidates[0]["bound_market_id"]} == {"candidate", "party"}
 
 
+def test_generate_logical_constraint_candidates_caps_and_ranks_large_events() -> None:
+    markets = [
+        _market(f"m{i}", f"Will outcome {i} happen?")
+        for i in range(5)
+    ]
+    for idx, market in enumerate(markets):
+        market.volume_24h = float(idx)
+        market.liquidity = float(idx * 10)
+    event = EventInfo(event_id="event", slug="e", title="Large event", markets=markets)
+
+    candidates = generate_logical_constraint_candidates(
+        [event],
+        max_markets_per_event=2,
+        max_pairs_per_event=10,
+    )
+
+    assert len(candidates) == 2
+    assert {
+        candidates[0]["subject_market_id"],
+        candidates[0]["bound_market_id"],
+    } == {"m3", "m4"}
+
+
 def test_select_logical_constraints_with_llm_returns_parseable_rules() -> None:
     rules = select_logical_constraints_with_llm(
         _FakeLLM(),
@@ -142,6 +166,8 @@ def test_discover_wallets_from_trades_ranks_by_trade_count_and_notional() -> Non
             {"proxyWallet": "0xaaa", "price": 0.5, "size": 100},
             {"proxyWallet": "0xaaa", "price": 0.5, "size": 100},
             {"proxyWallet": "0xbbb", "price": 0.9, "size": 10},
+            {"proxyWallet": "0xdirty", "price": 1_000_000, "size": 100},
+            {"proxyWallet": "0xdirty", "price": 1_000_000, "size": 100},
         ],
         min_trades=2,
         min_notional_usdc=50,
@@ -162,6 +188,24 @@ def test_build_wallet_observations_from_trades_maps_side_and_notional() -> None:
                 "price": 0.40,
                 "size": 50,
                 "marketSlug": "macro-event",
+            },
+            {
+                "proxyWallet": "0xabc",
+                "conditionId": "m1",
+                "outcome": "No",
+                "side": "SELL",
+                "price": 0.40,
+                "size": 50,
+                "marketSlug": "macro-event",
+            },
+            {
+                "proxyWallet": "0xabc",
+                "conditionId": "m1",
+                "outcome": "Yes",
+                "side": "BUY",
+                "price": 1_000_000,
+                "size": 50,
+                "marketSlug": "macro-event",
             }
         ]
     )
@@ -173,6 +217,52 @@ def test_build_wallet_observations_from_trades_maps_side_and_notional() -> None:
             "category": "macro-event",
             "action": "BUY_YES",
             "observed_size_usdc": 20.0,
+        }
+    ]
+
+
+def test_build_wallet_markouts_from_trade_rows_uses_lagged_public_price_tape() -> None:
+    wallet_rows = [
+        {
+            "proxyWallet": "0xabc",
+            "conditionId": "m1",
+            "outcome": "Yes",
+            "side": "BUY",
+            "price": 0.40,
+            "size": 50,
+            "timestamp": 1_700_000_000,
+            "marketSlug": "macro-event",
+        },
+        {
+            "proxyWallet": "0xabc",
+            "conditionId": "m1",
+            "outcome": "Yes",
+            "side": "SELL",
+            "price": 0.41,
+            "size": 50,
+            "timestamp": 1_700_000_010,
+        },
+    ]
+    tape_rows = [
+        {"conditionId": "m1", "outcome": "Yes", "price": 0.42, "size": 5, "timestamp": 1_700_000_100},
+        {"conditionId": "m1", "outcome": "Yes", "price": 0.46, "size": 5, "timestamp": 1_700_000_300},
+        {"conditionId": "m1", "outcome": "No", "price": 0.55, "size": 5, "timestamp": 1_700_000_300},
+    ]
+
+    markouts = build_wallet_markouts_from_trade_rows(wallet_rows, tape_rows, lag_sec=300)
+
+    assert markouts == [
+        {
+            "wallet_address": "0xabc",
+            "market_id": "m1",
+            "category": "macro-event",
+            "outcome": "yes",
+            "entry_ts": 1_700_000_000,
+            "markout_lag_sec": 300.0,
+            "entry_price": 0.4,
+            "markout_price": 0.46,
+            "notional_usdc": 20.0,
+            "lagged_follow_pnl_usdc": 3.0,
         }
     ]
 
@@ -260,6 +350,7 @@ def test_build_wallet_markouts_from_shadow_rows_joins_entry_context_to_closed_po
                 "close_price": 0.55,
                 "close_size": 10,
                 "realized_pnl": 1.4,
+                "lagged_follow_pnl_usdc": 0.9,
             }
         ],
     )
@@ -271,6 +362,6 @@ def test_build_wallet_markouts_from_shadow_rows_joins_entry_context_to_closed_po
             "category": "macro",
             "notional_usdc": 4.0,
             "realized_pnl_usdc": 1.4,
-            "lagged_follow_pnl_usdc": 1.4,
+            "lagged_follow_pnl_usdc": 0.9,
         }
     ]

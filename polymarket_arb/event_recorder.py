@@ -1,4 +1,4 @@
-"""轻量事件录制器：将机会/交易/AI/风控事件写入 NDJSON，便于离线分析."""
+"""轻量事件录制器：将机会/交易/风控事件写入 NDJSON，便于离线分析."""
 
 from __future__ import annotations
 

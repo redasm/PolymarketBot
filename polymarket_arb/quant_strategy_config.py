@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 
@@ -22,6 +23,7 @@ def build_quant_strategy_env_template() -> dict[str, str]:
             "baseline_probability": 0.55,
             "confidence": 0.80,
             "time_to_event_sec": 3600,
+            "generated_at": time.time(),
         }
     }
     wallet_profiles = {
@@ -78,6 +80,7 @@ def build_event_baselines_from_rows(rows: list[dict[str, Any]]) -> dict[str, dic
             "baseline_probability": baseline,
             "confidence": confidence,
             "time_to_event_sec": time_to_event,
+            "generated_at": _to_float(row.get("generated_at")) or time.time(),
         }
     return out
 

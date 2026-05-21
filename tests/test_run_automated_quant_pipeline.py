@@ -24,8 +24,10 @@ def test_automated_pipeline_builds_shadow_live_scanner_and_promoter(tmp_path: Pa
         telemetry_dir=str(tmp_path / "telemetry"),
         scanner_interval_sec=120.0,
         promoter_interval_sec=300.0,
+        markout_interval_sec=300.0,
         wallet_recent_limit=500,
         wallet_trade_limit=100,
+        wallet_markout_lag_sec=300.0,
         min_wallet_trades=3,
         min_wallet_notional=100.0,
         max_wallets=25,
@@ -41,6 +43,7 @@ def test_automated_pipeline_builds_shadow_live_scanner_and_promoter(tmp_path: Pa
     assert [spec.name for spec in specs] == [
         "bot",
         "wallet-scanner",
+        "wallet-markout-scanner",
         "wallet-promoter",
     ]
     assert ENV_ONLY_SENTINEL in specs[0].args[-1]
@@ -51,8 +54,10 @@ def test_automated_pipeline_builds_shadow_live_scanner_and_promoter(tmp_path: Pa
     assert specs[0].env["WALLET_ALPHA_PROFILES_FILE"].endswith("wallet_profiles.json")
     assert specs[0].env["TELEMETRY_RECORD_ENABLED"] == "true"
     assert "auto-wallet-observations" in specs[1].args
-    assert "auto-promote-wallet-profiles" in specs[2].args
+    assert "wallet-markouts-from-recent-trades" in specs[2].args
+    assert "promote-wallet-profiles" in specs[3].args
     assert specs[1].critical is False
     assert specs[2].critical is False
+    assert specs[3].critical is False
     assert not (tmp_path / "runtime" / ".env.shadow").exists()
     assert not (tmp_path / "runtime" / ".env.live").exists()

@@ -15,7 +15,7 @@ class EventPricingInput:
     baseline_probability: float
     confidence: float
     time_to_event_sec: float
-    taker_fee_rate: float = 0.05
+    taker_fee_rate: float
 
 
 class EventCalendarModel:

@@ -24,8 +24,6 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
-from polymarket_arb.ai_advisor import AIAdvisor, create_ai_advisor
-from polymarket_arb.ai_context import MarketContextBuilder
 from polymarket_arb.arbitrage_detector import ArbitrageDetector
 from polymarket_arb.book_store import EnhancedBookStore
 from polymarket_arb.client_factory import build_readonly_client, build_trading_client
@@ -36,10 +34,6 @@ from polymarket_arb.edge_engine import EdgeEngine
 from polymarket_arb.event_recorder import EventRecorder
 from polymarket_arb.execution_engine import ExecutionEngine
 from polymarket_arb.logger_setup import setup_logging
-from polymarket_arb.main_helpers.ai_cycle import (
-    AI_EVAL_TIMEOUT_SEC as _AI_EVAL_TIMEOUT_SEC,
-    run_ai_cycle as _run_ai_cycle,
-)
 from polymarket_arb.main_helpers.cycle_runners import (
     find_pending_signal as _find_pending_signal,
     find_pending_signal_overlay as _find_pending_signal_overlay,
@@ -72,7 +66,6 @@ from polymarket_arb.main_helpers.cli_setup import (
     build_run_instance_id as _build_run_instance_id,
     create_cross_platform_scanner as _create_cross_platform_scanner,
     create_research_signal_service as _create_research_signal_service,
-    get_or_create_event_loop as _get_or_create_event_loop,
     load_last_backtest_report as _load_last_backtest_report,
     log_startup_summary as _log_startup_summary,
     parse_extra_rss_feeds as _parse_extra_rss_feeds,
@@ -127,7 +120,7 @@ from polymarket_arb.main_helpers.dirty_market_tracker import DirtyMarketTracker
 from polymarket_arb.main_helpers.dashboard_serializers import (
     build_dashboard_trade_rows as _build_dashboard_trade_rows,
     build_ws_status as _build_ws_status,
-    estimate_ai_trade_outcome as _estimate_ai_trade_outcome,
+    estimate_trade_outcome as _estimate_trade_outcome,
     is_live_execution_success as _is_live_execution_success,
     serialize_opportunity_event as _serialize_opportunity_event,
     serialize_strategy_signal as _serialize_strategy_signal,
@@ -317,7 +310,7 @@ def _signal_dedupe_key(signal: StrategySignal) -> tuple[Any, ...]:
 
 # Startup / parsing / boot helpers (build_run_instance_id, log_startup_summary,
 # parse_extra_rss_feeds, parse_http_json_sources, create_research_signal_service,
-# create_cross_platform_scanner, round_timing, get_or_create_event_loop,
+# create_cross_platform_scanner, round_timing,
 # load_last_backtest_report) were extracted to
 # `polymarket_arb.main_helpers.cli_setup` and re-imported above under their
 # underscore aliases to keep the existing call graph stable.
@@ -472,7 +465,6 @@ def main(dotenv_path: str | None = None) -> None:
             "focus_keywords": focus_keywords,
             "ws_enabled": config.ws_enabled,
             "research_enabled": config.research_signal_enabled,
-            "ai_enabled": config.ai_enabled,
             "maker_enabled": config.maker_strategy_enabled,
         })
     if config.data_cleanup_enabled:
@@ -538,6 +530,7 @@ def main(dotenv_path: str | None = None) -> None:
         risk_manager=risk_mgr,
         notifier=notifier,
         cooldown_store=cooldown_store,
+        orchestrator=orchestrator,
     )
     shadow_t2_exit_manager = (
         T2ExitManager(
@@ -545,6 +538,7 @@ def main(dotenv_path: str | None = None) -> None:
             executor=shadow_executor,
             ob_analyzer=ob_analyzer,
             risk_manager=shadow_risk_mgr,
+            orchestrator=shadow_orchestrator,
         )
         if shadow_validation_enabled and shadow_executor is not None and shadow_risk_mgr is not None
         else None
@@ -557,7 +551,6 @@ def main(dotenv_path: str | None = None) -> None:
         config.t2_exit_eval_interval_sec,
         config.t2_optimal_stopping_enabled,
     )
-    ctx_builder = MarketContextBuilder()
     research_signal_service: Optional["ResearchSignalService"] = _create_research_signal_service(config)
     research_signal_enabled = bool(config.research_signal_enabled and research_signal_service is not None)
     research_executor: ThreadPoolExecutor | None = (
@@ -575,15 +568,6 @@ def main(dotenv_path: str | None = None) -> None:
             config.portfolio_sync_timeout_sec,
             (portfolio_sync.source_address[:10] + "…") if portfolio_sync.source_address else "",
         )
-
-    ai_advisor: Optional[AIAdvisor] = None
-    if config.ai_enabled:
-        ai_advisor = create_ai_advisor(config)
-        if ai_advisor:
-            LOG.info(
-                "AI 决策引擎已启用: provider=%s, model=%s, interval=%.0fs",
-                config.ai_provider, config.ai_model, config.ai_eval_interval_sec,
-            )
 
     ws_feed: Optional[WebSocketFeed] = None
     ws_mirror: Optional[OrderBookMirror] = None
@@ -687,7 +671,6 @@ def main(dotenv_path: str | None = None) -> None:
             "research_sec": 0.0,
             "strategy_sec": 0.0,
             "execution_sec": 0.0,
-            "ai_sec": 0.0,
         }
         ob_analyzer.snapshot_stats(reset=True)
         scanned_markets: list[MarketInfo] = []
@@ -1015,6 +998,7 @@ def main(dotenv_path: str | None = None) -> None:
                 candidate_markets=scanned_markets,
                 ob_analyzer=ob_analyzer,
                 rules=quant_inputs.logical_constraints_json,
+                input_metadata=quant_inputs.input_metadata("logical_constraints"),
             )
         )
         strategy_signals.extend(
@@ -1023,6 +1007,7 @@ def main(dotenv_path: str | None = None) -> None:
                 candidate_markets=scanned_markets,
                 ob_analyzer=ob_analyzer,
                 baselines=quant_inputs.event_baselines_json,
+                input_metadata=quant_inputs.input_metadata("event_baselines"),
             )
         )
         strategy_signals.extend(
@@ -1031,6 +1016,10 @@ def main(dotenv_path: str | None = None) -> None:
                 candidate_markets=scanned_markets,
                 profiles=quant_inputs.wallet_alpha_profiles_json,
                 observations=quant_inputs.wallet_alpha_observations_json,
+                input_metadata={
+                    "profiles": quant_inputs.input_metadata("wallet_alpha_profiles"),
+                    "observations": quant_inputs.input_metadata("wallet_alpha_observations"),
+                },
             )
         )
         shadow_candidate_signals = []
@@ -1041,6 +1030,10 @@ def main(dotenv_path: str | None = None) -> None:
                     candidate_markets=scanned_markets,
                     profiles=quant_inputs.wallet_alpha_profiles_json,
                     observations=quant_inputs.wallet_alpha_observations_json,
+                    input_metadata={
+                        "profiles": quant_inputs.input_metadata("wallet_alpha_profiles"),
+                        "observations": quant_inputs.input_metadata("wallet_alpha_observations"),
+                    },
                 )
                 if signal.signal_type.startswith("wallet_alpha_candidate_")
             ]
@@ -1161,7 +1154,6 @@ def main(dotenv_path: str | None = None) -> None:
                 executor=executor,
                 risk_mgr=risk_mgr,
                 notifier=notifier,
-                ai_advisor=ai_advisor,
                 dash_state=dash_state,
                 event_recorder=event_recorder,
             )
@@ -1182,26 +1174,6 @@ def main(dotenv_path: str | None = None) -> None:
                     execution_blocked_by_forced_sync = True
                     break
         cycle_timing["execution_sec"] += time.perf_counter() - phase_start
-
-        if ai_advisor and ai_advisor.should_evaluate():
-            phase_start = time.perf_counter()
-            _run_ai_cycle(
-                ai_advisor=ai_advisor,
-                ctx_builder=ctx_builder,
-                active_markets=universe_markets if universe_markets else scanned_markets,
-                recent_trades=executor.get_recent_trades(),
-                book_store=enhanced_store,
-                vol_estimator=vol_estimator,
-                edge_decision=edge_decision,
-                risk_mgr=risk_mgr,
-                orchestrator=orchestrator,
-                dash_state=dash_state,
-                config=config,
-                research_report=research_report,
-                research_signals=research_signals,
-                event_recorder=event_recorder,
-            )
-            cycle_timing["ai_sec"] += time.perf_counter() - phase_start
 
         phase_start = time.perf_counter()
         # T2/T3 信号从 scanned_markets 生成（含 event markets），universe_markets 可能不含这些市场；
@@ -1697,7 +1669,7 @@ def main(dotenv_path: str | None = None) -> None:
     )
 
 
-# Telemetry / dashboard serialisation / pending-signal lookups / AI
-# cycle were extracted to `polymarket_arb.main_helpers.{dashboard_serializers,
-# cycle_runners, ai_cycle}` and re-imported above under their underscore
-# aliases so the call graph here stays unchanged.
+# Telemetry / dashboard serialisation / pending-signal lookups were
+# extracted to `polymarket_arb.main_helpers.{dashboard_serializers,
+# cycle_runners}` and re-imported above under their underscore aliases
+# so the call graph here stays unchanged.

@@ -288,16 +288,6 @@
     <div class="metric"><span class="label">最新价格</span><span class="value" id="volLastClose">-</span></div>
   </div>
 
-  <!-- AI 决策状态 -->
-  <div class="card">
-    <h2>AI 决策状态</h2>
-    <div class="metric"><span class="label">状态</span><span class="value" id="aiEnabled">-</span></div>
-    <div class="metric"><span class="label">模型</span><span class="value mono-sm" id="aiModel">-</span></div>
-    <div class="metric"><span class="label">今日调用</span><span class="value" id="aiCallCount">0</span></div>
-    <div class="metric"><span class="label">今日成本</span><span class="value" id="aiCost">-</span></div>
-    <div class="metric"><span class="label">最近决策</span><span class="value" id="aiDecisionCount">0</span></div>
-  </div>
-
   <!-- Research Signals -->
   <div class="card">
     <h2>Research Signals</h2>
@@ -353,17 +343,10 @@
     <div id="tradeTable"></div>
   </div>
 
-  <!-- AI 决策历史 -->
-  <div class="card wide">
-    <h2>AI 决策历史</h2>
-    <div id="aiDecisionTable"></div>
-  </div>
-
 </div>
 
 <script>
 const API = '/api/status';
-const API_AI = '/api/ai';
 let pnlCanvas, pnlCtx;
 
 function $(id) { return document.getElementById(id); }
@@ -473,30 +456,6 @@ function renderUniverseStatus(universe) {
   } else {
     $('universeRefresh').textContent = '-';
   }
-}
-
-function renderAI(payload) {
-  const status = payload && payload.status ? payload.status : null;
-  const decisions = payload && payload.decisions ? payload.decisions : [];
-
-  if (!status || !status.enabled) {
-    $('aiEnabled').innerHTML = '<span class="badge badge-yellow">未启用</span>';
-    $('aiModel').textContent = '-';
-    $('aiCallCount').textContent = '0';
-    $('aiCost').textContent = '-';
-    $('aiDecisionCount').textContent = '0';
-  } else {
-    const statusBadge = status.degraded
-      ? '<span class="badge badge-red">已降级</span>'
-      : '<span class="badge badge-green">运行中</span>';
-    $('aiEnabled').innerHTML = statusBadge;
-    $('aiModel').textContent = [status.provider, status.model].filter(Boolean).join(' / ') || '-';
-    $('aiCallCount').textContent = status.call_count || 0;
-    $('aiCost').textContent = '$' + fmtNum(status.daily_cost_usd || 0, 4);
-    $('aiDecisionCount').textContent = decisions.length;
-  }
-
-  renderAIDecisions(decisions);
 }
 
 function renderWsStatus(ws) {
@@ -822,70 +781,11 @@ function renderPnlChart(history) {
   ctx.fillText(formatPnl(last), W - 10, 30);
 }
 
-function renderAIDecisions(decisions) {
-  const el = $('aiDecisionTable');
-  if (!decisions.length) {
-    el.innerHTML = '<div class="empty-state">暂无 AI 决策</div>';
-    return;
-  }
-
-  let html = '<div class="scroll-table"><table><tr><th>时间</th><th>动作</th><th>市场</th><th>入场</th><th>当前</th><th>变化</th><th>置信度</th><th>仓位</th><th>提交</th><th>验证</th><th>理由</th></tr>';
-  for (const row of decisions.slice().reverse()) {
-    const ts = row.timestamp ? new Date(row.timestamp * 1000).toLocaleTimeString() : '-';
-    const market = row.market_question || row.market_id || '-';
-    const validation = row.validation || {};
-    const submitted = row.submitted
-      ? '<span class="badge badge-green">已提交</span>'
-      : '<span class="badge badge-yellow">未提交</span>';
-    html += `<tr>
-      <td>${ts}</td>
-      <td>${renderActionBadge(row.action)}</td>
-      <td class="mono-sm">${market.slice(0, 48)}</td>
-      <td>${fmtNum(row.decision_price, 4)}</td>
-      <td>${fmtNum(row.current_price, 4)}</td>
-      <td class="${pnlClass(row.price_delta || 0)}">${fmtDeltaPts(row.price_delta_pct_pts)}</td>
-      <td>${row.confidence != null ? (row.confidence * 100).toFixed(1) + '%' : '-'}</td>
-      <td>${row.recommended_size_pct != null ? (row.recommended_size_pct * 100).toFixed(1) + '%' : '-'}</td>
-      <td>${submitted}</td>
-      <td>${renderValidationBadge(validation)}</td>
-      <td class="reason-cell">${(row.reasoning || '').slice(0, 120)}</td>
-    </tr>`;
-  }
-  el.innerHTML = html + '</table></div>';
-}
-
-function renderActionBadge(action) {
-  if (action === 'BUY_YES') return '<span class="badge badge-green">BUY YES</span>';
-  if (action === 'BUY_NO') return '<span class="badge badge-cyan">BUY NO</span>';
-  if (action === 'SELL_YES' || action === 'SELL_NO') return '<span class="badge badge-red">' + action + '</span>';
-  return '<span class="badge badge-yellow">' + (action || 'N/A') + '</span>';
-}
-
-function renderValidationBadge(validation) {
-  const status = validation.status || 'pending';
-  const label = validation.label || '待验证';
-  const detail = validation.detail ? `<div class="muted mono-sm">${validation.detail}</div>` : '';
-  let klass = 'badge-yellow';
-  if (status === 'correct') klass = 'badge-green';
-  else if (status === 'wrong') klass = 'badge-red';
-  else if (status === 'neutral' || status === 'not_applicable') klass = 'badge-blue';
-  return `<span class="badge ${klass}">${label}</span>${detail}`;
-}
-
-function fmtDeltaPts(v) {
-  if (v == null || Number.isNaN(Number(v))) return '-';
-  const n = Number(v);
-  const sign = n > 0 ? '+' : '';
-  return sign + n.toFixed(2) + 'pp';
-}
-
 async function refresh() {
   try {
-    const [statusResp, aiResp] = await Promise.all([fetch(API), fetch(API_AI)]);
+    const statusResp = await fetch(API);
     const data = await statusResp.json();
-    const aiData = await aiResp.json();
     renderStatus(data);
-    renderAI(aiData);
   } catch (e) {
     $('statusDot').className = 'status-dot stopped';
     $('statusText').textContent = '连接断开';

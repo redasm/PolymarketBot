@@ -7,7 +7,6 @@ import time
 
 import pytest
 
-from polymarket_arb.dashboard_api import _enrich_ai_decision
 from polymarket_arb.market_scanner import MarketScanner
 from polymarket_arb.main_loop import (
     _BoundedDedupeSet,
@@ -23,7 +22,7 @@ from polymarket_arb.main_loop import (
     _collect_statistical_strategy_signals,
     _evaluate_t2_market_quality,
     main,
-    _estimate_ai_trade_outcome,
+    _estimate_trade_outcome,
     _build_run_instance_id,
     _build_t2_related_market_context,
     _extract_market_deadline,
@@ -225,7 +224,7 @@ def test_build_ws_status_reads_snapshot_only_once(monkeypatch):
     assert call_count["count"] == 1
 
 
-def test_estimate_ai_trade_outcome_uses_realized_cost_on_failed_partial_fill():
+def test_estimate_trade_outcome_uses_realized_cost_on_failed_partial_fill():
     opp = _make_opp()
     trades = [
         TradeRecord(
@@ -254,12 +253,12 @@ def test_estimate_ai_trade_outcome_uses_realized_cost_on_failed_partial_fill():
         ),
     ]
 
-    outcome = _estimate_ai_trade_outcome(opp, trades, arb_success=False, adj_size=5)
+    outcome = _estimate_trade_outcome(opp, trades, arb_success=False, adj_size=5)
 
     assert outcome == -0.9
 
 
-def test_estimate_ai_trade_outcome_uses_smallest_filled_leg_on_success():
+def test_estimate_trade_outcome_uses_smallest_filled_leg_on_success():
     opp = _make_opp()
     trades = [
         TradeRecord(
@@ -288,7 +287,7 @@ def test_estimate_ai_trade_outcome_uses_smallest_filled_leg_on_success():
         ),
     ]
 
-    outcome = _estimate_ai_trade_outcome(opp, trades, arb_success=True, adj_size=5)
+    outcome = _estimate_trade_outcome(opp, trades, arb_success=True, adj_size=5)
 
     assert outcome == opp.net_edge * 3
 
@@ -297,7 +296,7 @@ def test_find_pending_signal_overlay_reads_overlay_from_orchestrator_copy():
     orchestrator = StrategyOrchestrator(total_bankroll=1000)
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="test_buy_yes",
         market_id="market-1",
         description="signal",
         expected_edge=10.0,
@@ -312,28 +311,6 @@ def test_find_pending_signal_overlay_reads_overlay_from_orchestrator_copy():
 
     assert overlay["applied"] is False
     assert signal.payload == {"action": "BUY_YES"}
-
-
-def test_enrich_ai_decision_overrides_stale_current_price_from_market_catalog():
-    decision = {
-        "market_id": "market-1",
-        "action": "BUY_YES",
-        "decision_price": 0.44,
-        "current_price": 0.44,
-        "timestamp": 0.0,
-    }
-    market_catalog = {
-        "market-1": {
-            "question": "Will BTC go up?",
-            "yes_price": 0.51,
-            "volume_24h": 1000.0,
-            "liquidity": 2000.0,
-        }
-    }
-
-    enriched = _enrich_ai_decision(decision, market_catalog)
-
-    assert enriched["current_price"] == 0.51
 
 
 def test_serialize_opportunity_event_includes_leg_details():

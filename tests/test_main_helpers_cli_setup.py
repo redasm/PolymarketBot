@@ -19,7 +19,6 @@ import pytest
 from polymarket_arb.main_helpers.cli_setup import (
     build_run_instance_id,
     create_research_signal_service,
-    get_or_create_event_loop,
     load_last_backtest_report,
     log_startup_summary,
     parse_extra_rss_feeds,
@@ -115,16 +114,6 @@ def test_create_research_signal_service_handles_missing_module(monkeypatch, capl
         out = create_research_signal_service(cfg)
     assert out is None
     assert any("模块导入失败" in record.getMessage() for record in caplog.records)
-
-
-def test_get_or_create_event_loop_reuses_existing_loop():
-    loop = get_or_create_event_loop()
-    try:
-        loop2 = get_or_create_event_loop()
-        assert loop is loop2
-        assert not loop.is_closed()
-    finally:
-        loop.close()
 
 
 def test_load_last_backtest_report_missing_dir_returns_disabled():

@@ -45,9 +45,9 @@ def test_research_overlay_boosts_aligned_signal():
     )
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id=market.condition_id[:12],
-        description="LLM sees positive edge",
+        description="Stat arb positive edge",
         expected_edge=80.0,
         confidence=0.60,
         recommended_size_usdc=100.0,
@@ -104,9 +104,9 @@ def test_research_overlay_adds_resonance_for_three_aligned_sources():
     ]
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id=market.condition_id[:12],
-        description="LLM sees positive edge",
+        description="Stat arb positive edge",
         expected_edge=80.0,
         confidence=0.60,
         recommended_size_usdc=100.0,
@@ -120,6 +120,37 @@ def test_research_overlay_adds_resonance_for_three_aligned_sources():
     assert overlay["source_diversity"] == 3
     assert overlay["resonance_score"] >= 0.70
     assert ready[0].recommended_size_usdc > 110.0
+
+
+def test_signal_size_cap_limits_compounded_overlay_boosts():
+    orchestrator = StrategyOrchestrator(total_bankroll=1000, max_signal_size_multiplier=1.05)
+    market = _make_market()
+    market.raw["research_signals"] = [
+        ResearchSignal(
+            topic_id="event:event-1",
+            event_candidates=["event-1"],
+            summary="BTC momentum remains strong",
+            sources=["google_news_rss"],
+            confidence=0.90,
+            freshness_sec=60.0,
+            stance="bullish",
+        ).to_dict(),
+    ]
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="stat_buy_yes",
+        market_id=market.condition_id[:12],
+        description="Stat arb positive edge",
+        expected_edge=80.0,
+        confidence=0.60,
+        recommended_size_usdc=100.0,
+    )
+
+    assert orchestrator.submit_signal(signal, active_markets=[market]) is True
+    ready = orchestrator.process_signals()
+
+    assert ready[0].recommended_size_usdc == 105.0
+    assert ready[0].payload["risk_size_cap"]["max_signal_size_multiplier"] == 1.05
 
 
 def test_research_overlay_penalizes_but_does_not_veto_two_row_conflict():
@@ -148,9 +179,9 @@ def test_research_overlay_penalizes_but_does_not_veto_two_row_conflict():
     market.raw["research_signals"] = conflicting_rows
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id=market.condition_id[:12],
-        description="LLM sees positive edge",
+        description="Stat arb positive edge",
         expected_edge=70.0,
         confidence=0.65,
         recommended_size_usdc=100.0,
@@ -180,7 +211,7 @@ def test_tail_risk_discount_reduces_directional_high_tail_signal():
     market.question = "Will there be an Iran Israel ceasefire this week?"
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id=market.condition_id[:12],
         description="directional edge",
         expected_edge=90.0,
@@ -234,9 +265,9 @@ def test_research_overlay_vetoes_only_on_three_row_high_conflict():
     ]
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id=market.condition_id[:12],
-        description="LLM sees positive edge",
+        description="Stat arb positive edge",
         expected_edge=70.0,
         confidence=0.65,
         recommended_size_usdc=100.0,
@@ -277,9 +308,9 @@ def test_research_overlay_ignores_unrelated_global_signals():
     market = _make_market()
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id=market.condition_id[:12],
-        description="LLM sees positive edge",
+        description="Stat arb positive edge",
         expected_edge=80.0,
         confidence=0.60,
         recommended_size_usdc=100.0,
@@ -324,9 +355,9 @@ def test_research_overlay_does_not_apply_without_market_match():
     market = _make_market()
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id="unknown-market",
-        description="LLM sees positive edge",
+        description="Stat arb positive edge",
         expected_edge=80.0,
         confidence=0.60,
         recommended_size_usdc=100.0,
@@ -359,7 +390,7 @@ def test_process_signals_can_be_marked_processed_without_leaking_pending():
     orchestrator = StrategyOrchestrator(total_bankroll=1000)
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id="market-1",
         description="signal",
         expected_edge=80.0,

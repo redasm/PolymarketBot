@@ -130,7 +130,7 @@ def test_summarize_runtime_artifacts_groups_new_quant_strategy_signals(tmp_path:
     log_path.write_text("2026-04-15 [INFO] main_loop | 模式: DRY RUN (仅扫描)", encoding="utf-8")
     (telemetry_dir / "2026-04-14.strategy_signals.ndjson").write_text(
         (
-            '{"tier":"STATISTICAL_ARB","signal_type":"logical_constraint_buy_bound",'
+            '{"tier":"STATISTICAL_ARB","signal_type":"logical_constraint_directional_buy_bound",'
             '"submitted":true,"expected_edge":700,"confidence":0.82}\n'
             '{"tier":"STATISTICAL_ARB","signal_type":"event_calendar_buy_yes",'
             '"submitted":false,"expected_edge":350,"confidence":0.76}\n'

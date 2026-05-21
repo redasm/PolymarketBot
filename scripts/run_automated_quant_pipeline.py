@@ -36,8 +36,10 @@ def main() -> int:
     parser.add_argument("--telemetry-dir", default="data/telemetry")
     parser.add_argument("--scanner-interval-sec", type=float, default=120.0)
     parser.add_argument("--promoter-interval-sec", type=float, default=300.0)
+    parser.add_argument("--markout-interval-sec", type=float, default=300.0)
     parser.add_argument("--wallet-recent-limit", type=int, default=500)
     parser.add_argument("--wallet-trade-limit", type=int, default=100)
+    parser.add_argument("--wallet-markout-lag-sec", type=float, default=300.0)
     parser.add_argument("--min-wallet-trades", type=int, default=3)
     parser.add_argument("--min-wallet-notional", type=float, default=100.0)
     parser.add_argument("--max-wallets", type=int, default=25)
@@ -63,6 +65,7 @@ def build_process_specs(args: argparse.Namespace) -> list[ProcessSpec]:
     quant_dir.mkdir(parents=True, exist_ok=True)
 
     observations_file = quant_dir / "wallet_observations.json"
+    markouts_file = quant_dir / "wallet_markouts.json"
     profiles_file = quant_dir / "wallet_profiles.json"
     logical_file = quant_dir / "logical_constraints.json"
     baselines_file = quant_dir / "event_baselines.json"
@@ -106,15 +109,40 @@ def build_process_specs(args: argparse.Namespace) -> list[ProcessSpec]:
             critical=False,
         ),
         ProcessSpec(
+            "wallet-markout-scanner",
+            [
+                sys.executable,
+                "scripts/scan_quant_strategy_inputs.py",
+                "wallet-markouts-from-recent-trades",
+                "--recent-limit",
+                str(args.wallet_recent_limit),
+                "--wallet-trade-limit",
+                str(args.wallet_trade_limit),
+                "--min-trades",
+                str(args.min_wallet_trades),
+                "--min-notional",
+                str(args.min_wallet_notional),
+                "--max-wallets",
+                str(args.max_wallets),
+                "--lag-sec",
+                str(args.wallet_markout_lag_sec),
+                "--repeat-interval-sec",
+                str(args.markout_interval_sec),
+                "--repeat-count",
+                "0",
+                "--output",
+                str(markouts_file),
+            ],
+            critical=False,
+        ),
+        ProcessSpec(
             "wallet-promoter",
             [
                 sys.executable,
                 "scripts/scan_quant_strategy_inputs.py",
-                "auto-promote-wallet-profiles",
-                "--telemetry-dir",
-                str(telemetry_dir),
-                "--lookback-days",
-                str(args.lookback_days),
+                "promote-wallet-profiles",
+                "--input",
+                str(markouts_file),
                 "--min-trades",
                 str(args.promotion_min_trades),
                 "--min-lagged-roi",

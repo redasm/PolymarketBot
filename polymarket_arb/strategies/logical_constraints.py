@@ -64,7 +64,7 @@ class LogicalConstraintDetector:
             signals.append(
                 StrategySignal(
                     tier=self._tier,
-                    signal_type="logical_constraint_buy_bound",
+                    signal_type="logical_constraint_directional_buy_bound",
                     market_id=rule.bound_market_id,
                     description=description,
                     expected_edge=round(violation_bps, 6),
@@ -73,6 +73,7 @@ class LogicalConstraintDetector:
                     urgency=0.7,
                     payload={
                         "action": "BUY_YES",
+                        "long_only_directional": True,
                         "relation_type": rule.relation_type,
                         "subject_market_id": rule.subject_market_id,
                         "bound_market_id": rule.bound_market_id,
@@ -88,4 +89,4 @@ class LogicalConstraintDetector:
 
     @staticmethod
     def _confidence_from_violation(violation_bps: float) -> float:
-        return min(0.95, 0.60 + max(0.0, violation_bps - 200.0) / 2000.0)
+        return min(0.75, 0.55 + max(0.0, violation_bps - 200.0) / 3000.0)

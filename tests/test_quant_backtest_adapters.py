@@ -44,7 +44,7 @@ def test_logical_constraint_backtest_adapter_detects_violation_from_rows() -> No
 
     assert len(signals) == 1
     signal = signals[0]
-    assert signal.signal_type == "logical_constraint_buy_bound"
+    assert signal.signal_type == "logical_constraint_directional_buy_bound"
     assert signal.market_id == "party"
     assert signal.expected_edge == 800.0
     assert adapter.to_order_request(signal, {"yes_best_ask": 0.56, "yes_ask_size": 80}) == {

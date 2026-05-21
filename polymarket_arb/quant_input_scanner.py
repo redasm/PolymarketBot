@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -18,19 +20,18 @@ def generate_logical_constraint_candidates(
     *,
     min_liquidity: float = 0.0,
     min_volume_24h: float = 0.0,
+    max_markets_per_event: int = 40,
     max_pairs_per_event: int = 80,
 ) -> list[dict[str, Any]]:
     """Generate same-event binary-market pairs for human/LLM review."""
     candidates: list[dict[str, Any]] = []
     for event in events:
-        markets = [
-            market for market in event.markets
-            if _is_binary_market(market)
-            and market.active
-            and not market.closed
-            and market.liquidity >= min_liquidity
-            and market.volume_24h >= min_volume_24h
-        ]
+        markets = _ranked_unique_logical_markets(
+            event.markets,
+            min_liquidity=min_liquidity,
+            min_volume_24h=min_volume_24h,
+            max_markets=max_markets_per_event,
+        )
         emitted = 0
         for subject in markets:
             for bound in markets:
@@ -64,11 +65,24 @@ def select_logical_constraints_with_llm(
     min_violation_bps: float = 250.0,
     max_candidates: int = 40,
 ) -> list[dict[str, Any]]:
-    """Use an LLM provider to keep only deterministic implication relations."""
+    """Use an LLM provider to keep only deterministic implication relations.
+
+    This sync wrapper is for CLI/scheduler contexts. Async callers should use
+    `select_logical_constraints_with_llm_async`.
+    """
     if not candidates:
         return []
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError(
+            "select_logical_constraints_with_llm() cannot run inside an active event loop; "
+            "use select_logical_constraints_with_llm_async() instead"
+        )
     return asyncio.run(
-        _select_logical_constraints_with_llm_async(
+        select_logical_constraints_with_llm_async(
             provider,
             candidates[:max_candidates],
             min_violation_bps=min_violation_bps,
@@ -76,7 +90,7 @@ def select_logical_constraints_with_llm(
     )
 
 
-async def _select_logical_constraints_with_llm_async(
+async def select_logical_constraints_with_llm_async(
     provider: Any,
     candidates: list[dict[str, Any]],
     *,
@@ -183,8 +197,11 @@ def discover_wallets_from_trades(
         wallet = str(row.get("proxyWallet") or row.get("wallet_address") or row.get("user") or "").strip()
         if not wallet:
             continue
+        notional = _valid_trade_notional(row)
+        if notional is None:
+            continue
         stats[wallet]["trades"] += 1.0
-        stats[wallet]["notional"] += _float(row.get("price")) * _float(row.get("size"))
+        stats[wallet]["notional"] += notional
     ranked = [
         (wallet, values["trades"], values["notional"])
         for wallet, values in stats.items()
@@ -203,22 +220,90 @@ def build_wallet_observations_from_trades(rows: list[dict[str, Any]]) -> list[di
         side = str(row.get("side") or row.get("type") or "BUY").strip().upper()
         if not wallet or not market_id:
             continue
-        if side not in {"BUY", "SELL"}:
+        if side != "BUY":
+            continue
+        notional = _valid_trade_notional(row)
+        if notional is None:
             continue
         if outcome in {"no", "false"}:
-            action = "BUY_NO" if side == "BUY" else "BUY_YES"
+            action = "BUY_NO"
         else:
-            action = "BUY_YES" if side == "BUY" else "BUY_NO"
+            action = "BUY_YES"
         observations.append(
             {
                 "wallet_address": wallet,
                 "market_id": market_id,
                 "category": str(row.get("marketSlug") or row.get("category") or "").strip(),
                 "action": action,
-                "observed_size_usdc": round(_float(row.get("price")) * _float(row.get("size")), 8),
+                "observed_size_usdc": round(notional, 8),
             }
         )
     return observations
+
+
+def build_wallet_markouts_from_trade_rows(
+    wallet_trade_rows: list[dict[str, Any]],
+    price_tape_rows: list[dict[str, Any]],
+    *,
+    lag_sec: float = 300.0,
+) -> list[dict[str, Any]]:
+    """Build wallet follow markouts from public trade rows.
+
+    The entry comes from a wallet BUY. The markout price comes from the first
+    later public trade in the same market/outcome after `entry_ts + lag_sec`,
+    so the score is independent of the bot's own shadow fills.
+    """
+    tape_by_key: dict[tuple[str, str], list[tuple[float, float]]] = defaultdict(list)
+    for row in price_tape_rows:
+        market_id = _trade_market_id(row)
+        outcome = _trade_outcome(row)
+        ts = _trade_timestamp(row)
+        price = _first_present_float(row, ("price",))
+        if not market_id or not outcome or ts is None or price is None:
+            continue
+        if not (0.0 < price < 1.0):
+            continue
+        tape_by_key[(market_id, outcome)].append((ts, price))
+    for values in tape_by_key.values():
+        values.sort(key=lambda item: item[0])
+
+    markouts: list[dict[str, Any]] = []
+    for row in wallet_trade_rows:
+        wallet = str(row.get("proxyWallet") or row.get("wallet_address") or row.get("user") or "").strip()
+        market_id = _trade_market_id(row)
+        outcome = _trade_outcome(row)
+        side = str(row.get("side") or row.get("type") or "BUY").strip().upper()
+        entry_ts = _trade_timestamp(row)
+        entry_price = _first_present_float(row, ("price",))
+        size = _first_present_float(row, ("size",))
+        if not wallet or not market_id or not outcome or side != "BUY":
+            continue
+        if entry_ts is None or entry_price is None or size is None:
+            continue
+        if not (0.0 < entry_price < 1.0) or size <= 0.0:
+            continue
+        markout_price = _first_markout_price(
+            tape_by_key.get((market_id, outcome), []),
+            min_ts=entry_ts + max(0.0, float(lag_sec)),
+        )
+        if markout_price is None:
+            continue
+        notional = entry_price * size
+        markouts.append(
+            {
+                "wallet_address": wallet,
+                "market_id": market_id,
+                "category": str(row.get("marketSlug") or row.get("category") or "").strip(),
+                "outcome": outcome,
+                "entry_ts": round(entry_ts, 3),
+                "markout_lag_sec": float(lag_sec),
+                "entry_price": round(entry_price, 8),
+                "markout_price": round(markout_price, 8),
+                "notional_usdc": round(notional, 8),
+                "lagged_follow_pnl_usdc": round((markout_price - entry_price) * size, 8),
+            }
+        )
+    return markouts
 
 
 def build_wallet_profiles_from_markout_rows(
@@ -326,6 +411,17 @@ def build_wallet_markouts_from_shadow_rows(
         if notional <= 0:
             continue
         realized = _float(row.get("realized_pnl"))
+        lagged = _first_present_float(
+            row,
+            (
+                "lagged_follow_pnl_usdc",
+                "lagged_follow_pnl",
+                "markout_pnl_usdc",
+                "markout_pnl",
+            ),
+        )
+        if lagged is None:
+            continue
         markouts.append(
             {
                 "wallet_address": str(context.get("wallet_address") or ""),
@@ -333,7 +429,7 @@ def build_wallet_markouts_from_shadow_rows(
                 "category": str(context.get("category") or ""),
                 "notional_usdc": round(notional, 8),
                 "realized_pnl_usdc": round(realized, 8),
-                "lagged_follow_pnl_usdc": round(realized, 8),
+                "lagged_follow_pnl_usdc": round(lagged, 8),
             }
         )
     return markouts
@@ -373,6 +469,34 @@ def _is_binary_market(market: MarketInfo) -> bool:
     return {"yes", "no"}.issubset(outcomes) or len(market.tokens) == 2
 
 
+def _ranked_unique_logical_markets(
+    markets: list[MarketInfo],
+    *,
+    min_liquidity: float,
+    min_volume_24h: float,
+    max_markets: int,
+) -> list[MarketInfo]:
+    seen: set[str] = set()
+    eligible: list[MarketInfo] = []
+    for market in markets:
+        if (
+            not _is_binary_market(market)
+            or not market.active
+            or market.closed
+            or market.liquidity < min_liquidity
+            or market.volume_24h < min_volume_24h
+        ):
+            continue
+        key = market.condition_id or f"{market.slug}:{market.question}".lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        eligible.append(market)
+    eligible.sort(key=lambda market: (market.volume_24h, market.liquidity), reverse=True)
+    limit = max(0, int(max_markets))
+    return eligible[:limit] if limit else []
+
+
 def _float(value: Any) -> float:
     try:
         if value in (None, ""):
@@ -380,3 +504,72 @@ def _float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _first_present_float(row: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        if key not in row or row[key] in (None, ""):
+            continue
+        try:
+            value = float(row[key])
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def _valid_trade_notional(row: dict[str, Any]) -> float | None:
+    price = _first_present_float(row, ("price",))
+    size = _first_present_float(row, ("size",))
+    if price is None or size is None:
+        return None
+    if not (0.0 < price < 1.0) or size <= 0.0:
+        return None
+    notional = price * size
+    if not math.isfinite(notional):
+        return None
+    return notional
+
+
+def _trade_market_id(row: dict[str, Any]) -> str:
+    return str(row.get("conditionId") or row.get("condition_id") or row.get("market_id") or "").strip()
+
+
+def _trade_outcome(row: dict[str, Any]) -> str:
+    return str(row.get("outcome") or row.get("assetOutcome") or "").strip().lower()
+
+
+def _trade_timestamp(row: dict[str, Any]) -> float | None:
+    for key in ("timestamp", "createdAt", "created_at", "time", "ts"):
+        if key not in row or row[key] in (None, ""):
+            continue
+        value = row[key]
+        if isinstance(value, (int, float)):
+            ts = float(value)
+            if ts > 10_000_000_000:
+                ts /= 1000.0
+            return ts if math.isfinite(ts) else None
+        if isinstance(value, str):
+            text = value.strip()
+            try:
+                ts = float(text)
+            except ValueError:
+                try:
+                    dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            if ts > 10_000_000_000:
+                ts /= 1000.0
+            return ts if math.isfinite(ts) else None
+    return None
+
+
+def _first_markout_price(rows: list[tuple[float, float]], *, min_ts: float) -> float | None:
+    for ts, price in rows:
+        if ts >= min_ts:
+            return price
+    return None

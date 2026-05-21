@@ -266,17 +266,12 @@ class ArbConfig:
     ws_refresh_cycles: int
     ws_vol_feed_interval_sec: float
 
-    # AI 决策引擎
-    ai_enabled: bool
+    # LLM provider settings for offline/scanner tools.
     ai_provider: str
     ai_api_key: str
     ai_api_base: str
     ai_model: str
     ai_temperature: float
-    ai_eval_interval_sec: float
-    ai_max_cost_per_day: float
-    ai_override_risk: bool
-    ai_auto_recover_sec: float
 
     # Research Signal
     research_signal_enabled: bool
@@ -396,8 +391,8 @@ class ArbConfig:
             raise ValueError("RISK_MAX_OPEN_POSITIONS 必须大于 0")
         if self.max_exposure_per_market <= 0 or self.max_total_exposure <= 0:
             raise ValueError("风险敞口上限必须大于 0")
-        if self.max_daily_loss < 0 or self.ai_max_cost_per_day < 0:
-            raise ValueError("RISK_MAX_DAILY_LOSS 和 AI_MAX_COST_PER_DAY 不能为负数")
+        if self.max_daily_loss < 0:
+            raise ValueError("RISK_MAX_DAILY_LOSS 不能为负数")
         if self.risk_event_cooldown_sec < 0:
             raise ValueError("RISK_EVENT_COOLDOWN_SEC 不能为负数")
         if self.risk_pending_reservation_ttl_sec < 0:
@@ -731,16 +726,11 @@ class ArbConfig:
             ws_max_markets=_env_int("WS_MAX_MARKETS", 20),
             ws_refresh_cycles=_env_int("WS_REFRESH_CYCLES", 200),
             ws_vol_feed_interval_sec=_env_float("WS_VOL_FEED_INTERVAL_SEC", 60.0),
-            ai_enabled=_env_bool("AI_ENABLED", False),
             ai_provider=_env("AI_PROVIDER", "openai"),
             ai_api_key=_env("AI_API_KEY") or _env("OPENAI_API_KEY"),
             ai_api_base=_env("AI_API_BASE"),
             ai_model=_env("AI_MODEL", "gpt-4o"),
             ai_temperature=_env_float("AI_TEMPERATURE", 0.1),
-            ai_eval_interval_sec=_env_float("AI_EVAL_INTERVAL_SEC", 30.0),
-            ai_max_cost_per_day=_env_float("AI_MAX_COST_PER_DAY", 5.0),
-            ai_override_risk=_env_bool("AI_OVERRIDE_RISK", False),
-            ai_auto_recover_sec=_env_float("AI_AUTO_RECOVER_SEC", 1800.0),
             research_signal_enabled=_env_bool("RESEARCH_SIGNAL_ENABLED", False),
             research_signal_window_sec=_env_int("RESEARCH_SIGNAL_WINDOW_SEC", 86400),
             research_signal_max_items=_env_int("RESEARCH_SIGNAL_MAX_ITEMS", 5),

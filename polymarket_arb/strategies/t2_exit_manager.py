@@ -44,6 +44,7 @@ from polymarket_arb.strategies.optimal_stopping import (
     OptimalStoppingPolicy,
     solve_markov_optimal_stopping,
 )
+from polymarket_arb.strategies.strategy_orchestrator import StrategyTier
 
 LOG = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
     from polymarket_arb.notifier import NotificationManager
     from polymarket_arb.risk_manager import RiskManager
     from polymarket_arb.strategies.recent_exit_cooldown import RecentExitCooldownStore
+    from polymarket_arb.strategies.strategy_orchestrator import StrategyOrchestrator
 
 
 _MAX_EXIT_RETRIES = 3
@@ -147,6 +149,7 @@ class T2ExitManager:
         risk_manager: "RiskManager | None" = None,
         notifier: "NotificationManager | None" = None,
         cooldown_store: "RecentExitCooldownStore | None" = None,
+        orchestrator: "StrategyOrchestrator | None" = None,
     ):
         self._config = config
         self._executor = executor
@@ -154,6 +157,7 @@ class T2ExitManager:
         self._risk_manager = risk_manager
         self._notifier = notifier
         self._cooldown_store = cooldown_store
+        self._orchestrator = orchestrator
         self._positions: dict[str, T2OpenPosition] = {}
         self._policy_cache: dict[float, OptimalStoppingPolicy] = {}
         self._stop_loss_bps = float(config.t2_stop_loss_bps)
@@ -420,6 +424,7 @@ class T2ExitManager:
                 self._risk_manager.release_market_exposure(pos.condition_id, notional)
             except Exception as exc:  # pragma: no cover - defensive
                 LOG.warning("放弃 T2 仓位时释放 exposure 失败: %s", exc)
+            self._release_orchestrator_exposure(notional)
         LOG.error(
             "T2 仓位 ABANDON: token=%s 失败 %d 次后放弃在 in-memory 追踪并释放 exposure；"
             "链上仓位仍存在，等待 portfolio_sync 重新发现或人工处理。",
@@ -612,8 +617,18 @@ class T2ExitManager:
 
     def _release_exit_exposure(self, pos: T2OpenPosition, fill_price: float, fill_size: float) -> None:
         if self._risk_manager is None:
+            self._release_orchestrator_exposure(max(0.0, pos.entry_price * fill_size))
             return
         self._risk_manager.release_market_exposure(pos.condition_id, max(0.0, fill_price * fill_size))
+        self._release_orchestrator_exposure(max(0.0, pos.entry_price * fill_size))
+
+    def _release_orchestrator_exposure(self, amount: float) -> None:
+        if self._orchestrator is None or amount <= 0:
+            return
+        try:
+            self._orchestrator.record_settlement(StrategyTier.STATISTICAL_ARB, amount, 0.0)
+        except Exception as exc:  # pragma: no cover - defensive
+            LOG.warning("T2 退出释放 orchestrator exposure 失败: %s", exc)
 
     def _notify_exit_failure(self, pos: T2OpenPosition, details: str) -> None:
         if self._notifier is None:

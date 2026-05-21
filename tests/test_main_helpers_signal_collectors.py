@@ -8,6 +8,7 @@ silent regressions for the orchestrator + dashboard.
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -163,15 +164,46 @@ def test_collect_logical_constraints_uses_yes_mid_prices_from_books():
                 "min_violation_bps": 200,
             }
         ],
+        input_metadata={"source": "file", "sha256": "abc"},
     )
 
     assert len(out) == 1
-    assert out[0].signal_type == "logical_constraint_buy_bound"
+    assert out[0].signal_type == "logical_constraint_directional_buy_bound"
     assert out[0].market_id == "party"
     assert out[0].recommended_size_usdc == 11.0
+    assert out[0].payload["quant_input"]["name"] == "logical_constraints"
+    assert out[0].payload["quant_input"]["sha256"] == "abc"
 
 
-def test_collect_event_calendar_uses_market_raw_baseline_metadata():
+def test_collect_event_calendar_uses_explicit_baseline_metadata():
+    cfg = make_test_config(default_order_size_usdc=9.0)
+    market = _binary_market("event")
+    snapshots = {"event-yes": _balanced_snapshot("event-yes", mid=0.45)}
+
+    out = collect_event_calendar_strategy_signals(
+        config=cfg,
+        candidate_markets=[market],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        baselines={
+            "event": {
+                "event_baseline_probability": 0.55,
+                "event_confidence": 0.80,
+                "time_to_event_sec": 3600,
+                "generated_at": time.time(),
+            }
+        },
+        input_metadata={"source": "file", "sha256": "def"},
+    )
+
+    assert len(out) == 1
+    assert out[0].signal_type == "event_calendar_buy_yes"
+    assert out[0].market_id == "event"
+    assert out[0].recommended_size_usdc == 9.0
+    assert out[0].payload["quant_input"]["name"] == "event_baselines"
+    assert out[0].payload["quant_input"]["sha256"] == "def"
+
+
+def test_collect_event_calendar_ignores_market_raw_baseline_metadata():
     cfg = make_test_config(default_order_size_usdc=9.0)
     market = _binary_market("event")
     market.raw.update(
@@ -181,18 +213,14 @@ def test_collect_event_calendar_uses_market_raw_baseline_metadata():
             "time_to_event_sec": 3600,
         }
     )
-    snapshots = {"event-yes": _balanced_snapshot("event-yes", mid=0.45)}
 
     out = collect_event_calendar_strategy_signals(
         config=cfg,
         candidate_markets=[market],
-        ob_analyzer=_StubBookAnalyzer(snapshots),
+        ob_analyzer=_StubBookAnalyzer({"event-yes": _balanced_snapshot("event-yes", mid=0.45)}),
     )
 
-    assert len(out) == 1
-    assert out[0].signal_type == "event_calendar_buy_yes"
-    assert out[0].market_id == "event"
-    assert out[0].recommended_size_usdc == 9.0
+    assert out == []
 
 
 def test_collect_event_calendar_returns_empty_without_baseline_metadata():
@@ -235,13 +263,21 @@ def test_collect_wallet_alpha_converts_accepted_observation_to_signal():
         candidate_markets=[market],
         profiles=profiles,
         observations=observations,
+        input_metadata={
+            "profiles": {"source": "file", "sha256": "profiles"},
+            "observations": {"source": "file", "sha256": "observations"},
+        },
     )
 
     assert len(out) == 1
     assert out[0].signal_type == "wallet_alpha_buy_yes"
     assert out[0].market_id == "weather"
-    assert out[0].recommended_size_usdc == 7.0
+    assert out[0].recommended_size_usdc > 7.0
+    assert out[0].payload["wallet_size_multiplier"] > 1.0
     assert out[0].payload["wallet_address"] == "0xgood"
+    assert out[0].payload["quant_input"]["name"] == "wallet_alpha"
+    assert out[0].payload["quant_input"]["profiles"]["sha256"] == "profiles"
+    assert out[0].payload["quant_input"]["observations"]["sha256"] == "observations"
 
 
 def test_collect_wallet_alpha_rejects_unfollowable_wallet_profile():
