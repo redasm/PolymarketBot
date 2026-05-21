@@ -472,7 +472,13 @@ def execute_strategy_signal(
             ),
         )
         if trade.fill_size:
-            apply_maker_fill_to_inventory(maker_strategy, trade)
+            inventory_delta = apply_maker_fill_to_inventory(maker_strategy, trade)
+            if target_order_side == OrderSide.SELL and inventory_delta > 0:
+                orchestrator.record_settlement(
+                    StrategyTier.MARKET_MAKING,
+                    max(0.0, target_price * inventory_delta),
+                    0.0,
+                )
         dash_state.append_trade({
             "trade_id": trade.trade_id,
             "arb_id": trade.arb_id,

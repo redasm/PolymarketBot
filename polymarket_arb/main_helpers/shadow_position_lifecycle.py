@@ -223,6 +223,8 @@ class ShadowPositionLifecycle:
                     "remaining_size": lot.remaining_size,
                     "realized_pnl": round(realized, 6),
                     "lagged_follow_pnl_usdc": round(realized, 6),
+                    "lagged_follow_pnl_net_usdc": round(realized, 6),
+                    "markout_pnl_close_usdc": round(realized, 6),
                     "markout_pnl_usdc": round(realized, 6),
                     "fees": round(buy_fee_alloc + sell_fee_alloc, 6),
                     "hold_sec": round(max(0.0, now_ts - lot.open_ts), 4),

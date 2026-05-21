@@ -243,6 +243,8 @@ def test_lifecycle_close_uses_entry_signal_attribution(tmp_path: Path) -> None:
     assert close["decision_context"]["signal_source"] == "wallet_alpha"
     assert close["decision_context"]["signal_components"] == ["wallet_alpha"]
     assert close["lagged_follow_pnl_usdc"] == pytest.approx(1.5)
+    assert close["lagged_follow_pnl_net_usdc"] == pytest.approx(1.5)
+    assert close["markout_pnl_close_usdc"] == pytest.approx(1.5)
 
 
 def test_disabled_recorder_emits_nothing(tmp_path: Path) -> None:

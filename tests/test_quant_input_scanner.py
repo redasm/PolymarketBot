@@ -294,6 +294,31 @@ def test_build_wallet_profiles_from_markout_rows_scores_lagged_follow_performanc
     assert profiles["0xabc"]["category_edges"]["macro"] == 0.05
 
 
+def test_build_wallet_profiles_prefers_net_follow_pnl_after_fees() -> None:
+    profiles = build_wallet_profiles_from_markout_rows(
+        [
+            {
+                "wallet_address": "0xabc",
+                "category": "macro",
+                "notional_usdc": 100,
+                "lagged_follow_pnl_usdc": 12,
+                "lagged_follow_pnl_net_usdc": 3,
+            },
+            {
+                "wallet_address": "0xabc",
+                "category": "macro",
+                "notional_usdc": 100,
+                "lagged_follow_pnl_usdc": 12,
+                "lagged_follow_pnl_net_usdc": -1,
+            },
+        ],
+        min_trades=2,
+    )
+
+    assert profiles["0xabc"]["lagged_follow_roi"] == 0.01
+    assert profiles["0xabc"]["category_edges"]["macro"] == 0.01
+
+
 def test_promote_wallet_profiles_filters_only_validated_wallets() -> None:
     rows = []
     for _ in range(3):
@@ -387,6 +412,11 @@ def test_build_wallet_markouts_from_shadow_rows_joins_entry_context_to_closed_po
                 "close_ts": 1234,
                 "realized_pnl": 1.4,
                 "lagged_follow_pnl_usdc": 0.9,
+                "lagged_follow_pnl_net_usdc": 0.7,
+                "markout_pnl_5m_usdc": 0.8,
+                "markout_pnl_30m_usdc": 1.1,
+                "markout_pnl_4h_usdc": 1.6,
+                "settlement_pnl_usdc": 2.0,
             }
         ],
     )
@@ -399,6 +429,11 @@ def test_build_wallet_markouts_from_shadow_rows_joins_entry_context_to_closed_po
             "notional_usdc": 4.0,
             "realized_pnl_usdc": 1.4,
             "lagged_follow_pnl_usdc": 0.9,
+            "lagged_follow_pnl_net_usdc": 0.7,
+            "markout_pnl_5m_usdc": 0.8,
+            "markout_pnl_30m_usdc": 1.1,
+            "markout_pnl_4h_usdc": 1.6,
+            "settlement_pnl_usdc": 2.0,
             "close_ts": 1234.0,
         }
     ]

@@ -179,3 +179,55 @@ def test_summarize_runtime_artifacts_attributes_shadow_pnl_by_signal_source(tmp_
     assert attribution["wallet_alpha"]["win_rate"] == 1.0
     assert attribution["statistical_model"]["realized_pnl"] == -0.75
     assert summary["pnl_attribution"]["by_component"]["obi"]["realized_pnl"] == -0.75
+
+
+def test_summarize_runtime_artifacts_reports_strategy_performance_attribution(tmp_path: Path):
+    log_path = tmp_path / "arb_bot.log"
+    telemetry_dir = tmp_path / "telemetry"
+    ticks_dir = tmp_path / "ticks"
+    telemetry_dir.mkdir()
+    ticks_dir.mkdir()
+
+    log_path.write_text("2026-04-15 [INFO] main_loop | 模式: DRY RUN (仅扫描)", encoding="utf-8")
+    (telemetry_dir / "2026-04-14.strategy_signals.ndjson").write_text(
+        (
+            '{"tier":"STATISTICAL_ARB","signal_type":"wallet_alpha_buy_yes",'
+            '"payload":{"category":"crypto"}}\n'
+            '{"tier":"MARKET_MAKING","signal_type":"maker_quote",'
+            '"payload":{"category":"finance"}}\n'
+        ),
+        encoding="utf-8",
+    )
+    (telemetry_dir / "2026-04-14.strategy_executions.ndjson").write_text(
+        (
+            '{"tier":"STATISTICAL_ARB","signal_type":"wallet_alpha_buy_yes","status":"executed",'
+            '"category":"crypto","execution_check":{"net_edge_bps":120,"fee_estimate_bps":50},'
+            '"trades":[{"price":0.5,"fill_size":2,"economic_cost":0.5}]}\n'
+            '{"tier":"MARKET_MAKING","signal_type":"maker_quote","status":"submitted",'
+            '"category":"finance","submitted_notional":10,"expected_edge_usdc":0.4,'
+            '"our_role":"maker","filled_size":0}\n'
+        ),
+        encoding="utf-8",
+    )
+    (telemetry_dir / "2026-04-14.positions_lifecycle.ndjson").write_text(
+        (
+            '{"event":"position_closed","realized_pnl":0.12,"fees":0.03,'
+            '"decision_context":{"tier":"STATISTICAL_ARB","signal_type":"wallet_alpha_buy_yes",'
+            '"category":"crypto","signal_source":"wallet_alpha"}}\n'
+        ),
+        encoding="utf-8",
+    )
+
+    summary = summarize_runtime_artifacts(log_path=log_path, telemetry_dir=telemetry_dir, ticks_dir=ticks_dir)
+    perf = summary["strategy_performance"]
+
+    assert perf["by_tier"]["STATISTICAL_ARB"]["signals"] == 1
+    assert perf["by_tier"]["STATISTICAL_ARB"]["executions"] == 1
+    assert perf["by_tier"]["STATISTICAL_ARB"]["notional_usdc"] == 1.0
+    assert perf["by_tier"]["STATISTICAL_ARB"]["expected_edge_usdc"] == 0.012
+    assert perf["by_tier"]["STATISTICAL_ARB"]["realized_pnl"] == 0.12
+    assert perf["by_tier"]["STATISTICAL_ARB"]["fees"] == 0.03
+    assert perf["by_tier"]["STATISTICAL_ARB"]["fee_drag_bps"] == 300.0
+    assert perf["by_tier"]["MARKET_MAKING"]["expected_edge_usdc"] == 0.4
+    assert perf["by_category"]["crypto"]["realized_pnl"] == 0.12
+    assert perf["by_signal_type"]["wallet_alpha_buy_yes"]["executions"] == 1

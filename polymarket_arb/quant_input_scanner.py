@@ -327,7 +327,7 @@ def build_wallet_profiles_from_markout_rows(
         if total_notional <= 0:
             continue
         realized_pnl = sum(_float(row.get("realized_pnl_usdc") or row.get("realized_pnl")) for row in wallet_rows)
-        lagged_pnl = sum(_float(row.get("lagged_follow_pnl_usdc") or row.get("lagged_follow_pnl")) for row in wallet_rows)
+        lagged_pnl = sum(_lagged_follow_pnl(row) for row in wallet_rows)
         category_edges = _category_edges(wallet_rows)
         notionals = [_float(row.get("notional_usdc") or row.get("notional")) for row in wallet_rows]
         profiles[wallet] = {
@@ -385,7 +385,7 @@ def promote_wallet_profiles_from_markout_rows(
         decision = scorer.evaluate(profile)
         if decision.accepted:
             pnl_values = [
-                _float(item.get("lagged_follow_pnl_usdc") or item.get("lagged_follow_pnl"))
+                _lagged_follow_pnl(item)
                 for item in training_rows
                 if str(item.get("wallet_address") or item.get("proxyWallet") or "").strip() == wallet
             ]
@@ -459,6 +459,25 @@ def build_wallet_markouts_from_shadow_rows(
             "realized_pnl_usdc": round(realized, 8),
             "lagged_follow_pnl_usdc": round(lagged, 8),
         }
+        net_lagged = _first_present_float(
+            row,
+            (
+                "lagged_follow_pnl_net_usdc",
+                "lagged_follow_net_pnl_usdc",
+                "net_lagged_follow_pnl_usdc",
+            ),
+        )
+        out["lagged_follow_pnl_net_usdc"] = round(net_lagged if net_lagged is not None else lagged, 8)
+        for source_key, output_key in (
+            ("markout_pnl_5m_usdc", "markout_pnl_5m_usdc"),
+            ("markout_pnl_30m_usdc", "markout_pnl_30m_usdc"),
+            ("markout_pnl_4h_usdc", "markout_pnl_4h_usdc"),
+            ("markout_pnl_close_usdc", "markout_pnl_close_usdc"),
+            ("settlement_pnl_usdc", "settlement_pnl_usdc"),
+        ):
+            value = _first_present_float(row, (source_key,))
+            if value is not None:
+                out[output_key] = round(value, 8)
         close_ts = _first_present_float(row, ("close_ts", "timestamp", "ts"))
         if close_ts is not None:
             out["close_ts"] = round(close_ts, 3)
@@ -506,7 +525,7 @@ def _category_edges(rows: list[dict[str, Any]]) -> dict[str, float]:
         notional = sum(_float(row.get("notional_usdc") or row.get("notional")) for row in category_rows)
         if notional <= 0:
             continue
-        pnl = sum(_float(row.get("lagged_follow_pnl_usdc") or row.get("lagged_follow_pnl")) for row in category_rows)
+        pnl = sum(_lagged_follow_pnl(row) for row in category_rows)
         out[category] = round(pnl / notional, 8)
     return out
 
@@ -517,7 +536,7 @@ def _max_drawdown(rows: list[dict[str, Any]]) -> float:
     max_drawdown = 0.0
     total_notional = 0.0
     for row in rows:
-        equity += _float(row.get("lagged_follow_pnl_usdc") or row.get("lagged_follow_pnl"))
+        equity += _lagged_follow_pnl(row)
         total_notional += _float(row.get("notional_usdc") or row.get("notional"))
         peak = max(peak, equity)
         max_drawdown = max(max_drawdown, peak - equity)
@@ -577,6 +596,20 @@ def _first_present_float(row: dict[str, Any], keys: tuple[str, ...]) -> float | 
         if math.isfinite(value):
             return value
     return None
+
+
+def _lagged_follow_pnl(row: dict[str, Any]) -> float:
+    value = _first_present_float(
+        row,
+        (
+            "lagged_follow_pnl_net_usdc",
+            "lagged_follow_net_pnl_usdc",
+            "net_lagged_follow_pnl_usdc",
+            "lagged_follow_pnl_usdc",
+            "lagged_follow_pnl",
+        ),
+    )
+    return value if value is not None else 0.0
 
 
 def _valid_trade_notional(row: dict[str, Any]) -> float | None:

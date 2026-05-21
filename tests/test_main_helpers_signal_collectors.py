@@ -175,6 +175,38 @@ def test_collect_logical_constraints_uses_yes_mid_prices_from_books():
     assert out[0].payload["quant_input"]["sha256"] == "abc"
 
 
+def test_collect_logical_constraints_rejects_expired_rule_schema():
+    cfg = make_test_config(default_order_size_usdc=11.0)
+    snapshots = {
+        "candidate-yes": _balanced_snapshot("candidate-yes", mid=0.62),
+        "party-yes": _balanced_snapshot("party-yes", mid=0.55),
+    }
+
+    out = collect_logical_constraint_strategy_signals(
+        config=cfg,
+        candidate_markets=[
+            _binary_market("candidate", yes_price=0.62),
+            _binary_market("party", yes_price=0.55),
+        ],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        rules={
+            "schema_version": 1,
+            "generated_at": time.time() - 7200,
+            "expires_at": time.time() - 3600,
+            "rules": [
+                {
+                    "subject_market_id": "candidate",
+                    "bound_market_id": "party",
+                    "relation_type": "subject_lte_bound",
+                    "min_violation_bps": 200,
+                }
+            ],
+        },
+    )
+
+    assert out == []
+
+
 def test_collect_event_calendar_uses_explicit_baseline_metadata():
     cfg = make_test_config(default_order_size_usdc=9.0)
     market = _binary_market("event")

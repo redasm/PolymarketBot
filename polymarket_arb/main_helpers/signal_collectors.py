@@ -144,7 +144,7 @@ def collect_logical_constraint_strategy_signals(
     config: ArbConfig,
     candidate_markets: list[MarketInfo],
     ob_analyzer: OrderBookAnalyzer,
-    rules: list[dict[str, Any] | RelationRule] | str | None = None,
+    rules: list[dict[str, Any] | RelationRule] | dict[str, Any] | str | None = None,
     input_metadata: dict[str, Any] | None = None,
 ) -> list[StrategySignal]:
     """Emit relationship-violation signals from explicit market rules.
@@ -440,7 +440,7 @@ def _yes_token(market: MarketInfo):
     return next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
 
 
-def _parse_relation_rules(raw_rules: list[dict[str, Any] | RelationRule] | str | None) -> list[RelationRule]:
+def _parse_relation_rules(raw_rules: list[dict[str, Any] | RelationRule] | dict[str, Any] | str | None) -> list[RelationRule]:
     if not raw_rules:
         return []
     rows: Any = raw_rules
@@ -450,6 +450,11 @@ def _parse_relation_rules(raw_rules: list[dict[str, Any] | RelationRule] | str |
         except json.JSONDecodeError:
             LOG.warning("LOGICAL_CONSTRAINTS_JSON 解析失败，忽略逻辑约束策略")
             return []
+    if isinstance(rows, dict):
+        expires_at = _first_float(rows, ("expires_at",))
+        if expires_at is not None and expires_at < time.time():
+            return []
+        rows = rows.get("rules", [])
     parsed: list[RelationRule] = []
     for row in rows or []:
         if isinstance(row, RelationRule):

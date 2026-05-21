@@ -1411,12 +1411,14 @@ def main(dotenv_path: str | None = None) -> None:
                 maker_strategy=maker_strategy,
                 event_recorder=event_recorder,
                 notifier=notifier,
+                orchestrator=orchestrator,
             )
             _cancel_stale_maker_orders(
                 config=config,
                 executor=executor,
                 risk_mgr=risk_mgr,
                 event_recorder=event_recorder,
+                orchestrator=orchestrator,
             )
 
         if config.dry_run:

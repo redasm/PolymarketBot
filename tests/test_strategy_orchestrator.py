@@ -288,18 +288,17 @@ def test_research_overlay_vetoes_only_on_three_row_high_conflict():
 
 
 def test_strategy_status_exposes_tier_budgets_and_overlay_meta():
-    # Allocations were re-weighted toward T3 (maker) after Becker 2025
-    # documented the maker-side structural edge — see DEFAULT_ALLOCATIONS
-    # in strategy_orchestrator.py. The expected budgets below track the
-    # current 30 / 5 / 15 / 50 split on a $500 bankroll.
+    # Defaults stay conservative until maker queue position, adverse
+    # selection, and inventory attribution are validated out of sample.
+    # The expected budgets below track the current 35 / 10 / 35 / 20 split.
     orchestrator = StrategyOrchestrator(total_bankroll=500)
 
     status = orchestrator.get_status()
 
-    assert status["T0"]["budget"] == 150.0
-    assert status["T1"]["budget"] == 25.0
-    assert status["T2"]["budget"] == 75.0
-    assert status["T3"]["budget"] == 250.0
+    assert status["T0"]["budget"] == 175.0
+    assert status["T1"]["budget"] == 50.0
+    assert status["T2"]["budget"] == 175.0
+    assert status["T3"]["budget"] == 100.0
     assert status["meta"]["research_overlay"]["applied"] == 0
 
 

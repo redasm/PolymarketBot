@@ -256,7 +256,7 @@ cp .env.example .env
 | `ARB_SCAN_INTERVAL_SEC` | 定时扫描间隔 | 5s |
 | `ARB_MAX_ORDER_SIZE_USDC` | 单笔最大下单量 | 50 USDC |
 | `ORDERBOOK_SNAPSHOT_TTL_SEC` | REST 订单簿快照缓存 TTL | 0.5s |
-| `POLYMARKET_TAKER_FEE_RATE` | Polymarket taker 费率假设 | 2.0% |
+| `POLYMARKET_TAKER_FEE_RATE` | Polymarket taker 费率兜底假设；市场 fee metadata 存在时以 metadata 为准 | 5.0% |
 | `LIVE_MIN_NET_EDGE_BPS` | 实盘扣费后最低净 edge 安全垫 | 25 |
 | `LIVE_MIN_NET_EDGE_USD` | 实盘扣费后最低每股净 edge | 0.0025 |
 | `LIVE_MAX_ORDERBOOK_SNAPSHOT_AGE_SEC` | 实盘 WS 盘口最大年龄（按信号 token 单独判定） | 5s |

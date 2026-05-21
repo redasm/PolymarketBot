@@ -70,6 +70,7 @@ def main() -> int:
     p_rules.add_argument("--dotenv-path", default=None)
     p_rules.add_argument("--min-violation-bps", type=float, default=250.0)
     p_rules.add_argument("--max-candidates", type=int, default=40)
+    p_rules.add_argument("--rules-expires-sec", type=float, default=30 * 60.0)
 
     p_obs = sub.add_parser("wallet-observations", help="Fetch wallet trades and emit observation JSON")
     p_obs.add_argument("--output", default=None, help="Optional JSON output file; written atomically")
@@ -200,12 +201,19 @@ def _build_payload(args) -> Any:
     if args.kind == "logical-rules-llm":
         config = ArbConfig.from_env(args.dotenv_path, require_wallet=False)
         provider = create_provider(config)
-        return select_logical_constraints_with_llm(
+        rules = select_logical_constraints_with_llm(
             provider,
             _load_rows(Path(args.candidates)),
             min_violation_bps=args.min_violation_bps,
             max_candidates=args.max_candidates,
         )
+        generated_at = time.time()
+        return {
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "expires_at": generated_at + max(0.0, float(args.rules_expires_sec)),
+            "rules": rules,
+        }
     if args.kind == "wallet-observations":
         client = DataApiWalletTradeClient(args.data_api_host)
         trades: list[dict[str, Any]] = []
