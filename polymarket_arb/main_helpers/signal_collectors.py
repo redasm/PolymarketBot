@@ -194,7 +194,9 @@ def collect_event_calendar_strategy_signals(
         if token is None:
             continue
         snap = ob_analyzer.get_snapshot(token.token_id)
-        market_price = float(snap.mid) if snap is not None and snap.mid is not None else float(token.price)
+        if snap is None or snap.mid is None:
+            continue
+        market_price = float(snap.mid)
         if market_price <= 0:
             continue
 

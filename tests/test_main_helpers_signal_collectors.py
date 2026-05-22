@@ -235,6 +235,28 @@ def test_collect_event_calendar_uses_explicit_baseline_metadata():
     assert out[0].payload["quant_input"]["sha256"] == "def"
 
 
+def test_collect_event_calendar_requires_fresh_snapshot_even_when_token_price_exists():
+    cfg = make_test_config(default_order_size_usdc=9.0)
+    market = _binary_market("event")
+    market.tokens[0].price = 0.45
+
+    out = collect_event_calendar_strategy_signals(
+        config=cfg,
+        candidate_markets=[market],
+        ob_analyzer=_StubBookAnalyzer({}),
+        baselines={
+            "event": {
+                "baseline_probability": 0.55,
+                "confidence": 0.80,
+                "time_to_event_sec": 3600,
+                "generated_at": time.time(),
+            }
+        },
+    )
+
+    assert out == []
+
+
 def test_collect_event_calendar_ignores_market_raw_baseline_metadata():
     cfg = make_test_config(default_order_size_usdc=9.0)
     market = _binary_market("event")

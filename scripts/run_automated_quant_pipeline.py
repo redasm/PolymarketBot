@@ -1,4 +1,4 @@
-"""Run one bot plus non-blocking wallet-alpha data workers."""
+"""Run one bot plus non-blocking quant input data workers."""
 
 from __future__ import annotations
 
@@ -35,8 +35,14 @@ def main() -> int:
     parser.add_argument("--quant-input-dir", default="data/quant_inputs")
     parser.add_argument("--telemetry-dir", default="data/telemetry")
     parser.add_argument("--scanner-interval-sec", type=float, default=120.0)
+    parser.add_argument("--logical-interval-sec", type=float, default=1800.0)
+    parser.add_argument("--event-baseline-interval-sec", type=float, default=1800.0)
     parser.add_argument("--promoter-interval-sec", type=float, default=300.0)
     parser.add_argument("--markout-interval-sec", type=float, default=300.0)
+    parser.add_argument("--logical-event-limit", type=int, default=100)
+    parser.add_argument("--logical-max-candidates", type=int, default=40)
+    parser.add_argument("--event-baseline-event-limit", type=int, default=100)
+    parser.add_argument("--event-baseline-max-candidates", type=int, default=40)
     parser.add_argument("--wallet-recent-limit", type=int, default=500)
     parser.add_argument("--wallet-trade-limit", type=int, default=100)
     parser.add_argument("--wallet-markout-lag-sec", type=float, default=300.0)
@@ -67,8 +73,16 @@ def build_process_specs(args: argparse.Namespace) -> list[ProcessSpec]:
     observations_file = quant_dir / "wallet_observations.json"
     markouts_file = quant_dir / "wallet_markouts.json"
     profiles_file = quant_dir / "wallet_profiles.json"
+    logical_candidates_file = quant_dir / "logical_candidates.json"
     logical_file = quant_dir / "logical_constraints.json"
+    logical_status_file = quant_dir / "logical_rules_status.json"
+    event_baseline_candidates_file = quant_dir / "event_baseline_candidates.json"
     baselines_file = quant_dir / "event_baselines.json"
+    baselines_status_file = quant_dir / "event_baselines_status.json"
+    logical_rules_expires_sec = max(
+        float(args.logical_interval_sec) * 2.0,
+        float(args.logical_interval_sec) + 300.0,
+    )
     bot_env = _bot_env(
         dotenv_path=_resolve_path(args.dotenv_path),
         overrides={
@@ -83,6 +97,60 @@ def build_process_specs(args: argparse.Namespace) -> list[ProcessSpec]:
 
     return [
         _bot_spec("bot", env=bot_env),
+        ProcessSpec(
+            "logical-rules-auto",
+            [
+                sys.executable,
+                "scripts/scan_quant_strategy_inputs.py",
+                "logical-rules-auto",
+                "--dotenv-path",
+                str(_resolve_path(args.dotenv_path)),
+                "--fetch-gamma",
+                "--event-limit",
+                str(args.logical_event_limit),
+                "--max-candidates",
+                str(args.logical_max_candidates),
+                "--repeat-interval-sec",
+                str(args.logical_interval_sec),
+                "--rules-expires-sec",
+                str(logical_rules_expires_sec),
+                "--repeat-count",
+                "0",
+                "--candidates-output",
+                str(logical_candidates_file),
+                "--status-output",
+                str(logical_status_file),
+                "--output",
+                str(logical_file),
+            ],
+            critical=False,
+        ),
+        ProcessSpec(
+            "event-baselines-auto",
+            [
+                sys.executable,
+                "scripts/scan_quant_strategy_inputs.py",
+                "event-baselines-auto",
+                "--dotenv-path",
+                str(_resolve_path(args.dotenv_path)),
+                "--fetch-gamma",
+                "--event-limit",
+                str(args.event_baseline_event_limit),
+                "--max-candidates",
+                str(args.event_baseline_max_candidates),
+                "--repeat-interval-sec",
+                str(args.event_baseline_interval_sec),
+                "--repeat-count",
+                "0",
+                "--candidates-output",
+                str(event_baseline_candidates_file),
+                "--status-output",
+                str(baselines_status_file),
+                "--output",
+                str(baselines_file),
+            ],
+            critical=False,
+        ),
         ProcessSpec(
             "wallet-scanner",
             [

@@ -584,6 +584,189 @@ def test_scan_quant_strategy_inputs_logical_candidates_can_fetch_gamma(monkeypat
     assert payload[0]["event_id"] == "event"
 
 
+def test_scan_quant_strategy_inputs_logical_rules_auto_fetches_candidates_and_calls_llm(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from scripts import scan_quant_strategy_inputs
+
+    class _FakeScanner:
+        def __init__(self, config):
+            self.config = config
+
+        def fetch_active_events(self, *, limit=50):
+            return [
+                _event_with_markets("event", "Election"),
+            ]
+
+    class _FakeProvider:
+        async def chat(self, messages, *, temperature=0.1, json_mode=False, tools=None):
+            assert json_mode is True
+            assert temperature == 0.0
+            return type(
+                "Resp",
+                (),
+                {
+                    "content": json.dumps(
+                        {
+                            "rules": [
+                                {
+                                    "subject_market_id": "candidate",
+                                    "bound_market_id": "party",
+                                    "relation_type": "subject_lte_bound",
+                                }
+                            ]
+                        }
+                    )
+                },
+            )()
+
+    candidates_output = tmp_path / "logical_candidates.json"
+    rules_output = tmp_path / "logical_constraints.json"
+    status_output = tmp_path / "logical_rules_status.json"
+    monkeypatch.setattr(scan_quant_strategy_inputs, "MarketScanner", _FakeScanner)
+    monkeypatch.setattr(scan_quant_strategy_inputs, "create_provider", lambda _config: _FakeProvider())
+    monkeypatch.setattr(
+        scan_quant_strategy_inputs.ArbConfig,
+        "from_env",
+        lambda dotenv_path=None, require_wallet=False: type(
+            "Cfg",
+            (),
+            {
+                "gamma_host": "https://gamma-api.polymarket.com",
+                "ai_temperature": 0.0,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "scan_quant_strategy_inputs.py",
+            "logical-rules-auto",
+            "--fetch-gamma",
+            "--event-limit",
+            "5",
+            "--candidates-output",
+            str(candidates_output),
+            "--output",
+            str(rules_output),
+            "--status-output",
+            str(status_output),
+        ],
+    )
+
+    assert scan_quant_strategy_inputs.main() == 0
+
+    assert capsys.readouterr().out == ""
+    candidates = json.loads(candidates_output.read_text(encoding="utf-8"))
+    rules_payload = json.loads(rules_output.read_text(encoding="utf-8"))
+    status_payload = json.loads(status_output.read_text(encoding="utf-8"))
+    assert candidates[0]["event_id"] == "event"
+    assert status_payload["status"] == "ok"
+    assert status_payload["candidate_count"] == len(candidates)
+    assert status_payload["rule_count"] == 1
+    assert rules_payload["rules"] == [
+        {
+            "subject_market_id": "candidate",
+            "bound_market_id": "party",
+            "relation_type": "subject_lte_bound",
+            "min_violation_bps": 250.0,
+            "tags": ["llm_selected"],
+        }
+    ]
+
+
+def test_scan_quant_strategy_inputs_event_baselines_auto_fetches_candidates_and_calls_llm(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    from scripts import scan_quant_strategy_inputs
+
+    class _FakeScanner:
+        def __init__(self, config):
+            self.config = config
+
+        def fetch_active_events(self, *, limit=50):
+            event = _event_with_markets("event", "Election")
+            event.markets[0].end_date = "2099-01-01T00:00:00Z"
+            return [event]
+
+    class _FakeProvider:
+        async def chat(self, messages, *, temperature=0.1, json_mode=False, tools=None):
+            assert json_mode is True
+            assert temperature == 0.0
+            return type(
+                "Resp",
+                (),
+                {
+                    "content": json.dumps(
+                        {
+                            "baselines": [
+                                {
+                                    "condition_id": "candidate",
+                                    "baseline_probability": 0.58,
+                                    "confidence": 0.82,
+                                    "resolution_at": "2099-01-01T00:00:00Z",
+                                }
+                            ]
+                        }
+                    )
+                },
+            )()
+
+    candidates_output = tmp_path / "event_baseline_candidates.json"
+    baselines_output = tmp_path / "event_baselines.json"
+    status_output = tmp_path / "event_baselines_status.json"
+    monkeypatch.setattr(scan_quant_strategy_inputs, "MarketScanner", _FakeScanner)
+    monkeypatch.setattr(scan_quant_strategy_inputs, "create_provider", lambda _config: _FakeProvider())
+    monkeypatch.setattr(
+        scan_quant_strategy_inputs.ArbConfig,
+        "from_env",
+        lambda dotenv_path=None, require_wallet=False: type(
+            "Cfg",
+            (),
+            {
+                "gamma_host": "https://gamma-api.polymarket.com",
+                "ai_temperature": 0.0,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "scan_quant_strategy_inputs.py",
+            "event-baselines-auto",
+            "--fetch-gamma",
+            "--event-limit",
+            "5",
+            "--candidates-output",
+            str(candidates_output),
+            "--output",
+            str(baselines_output),
+            "--status-output",
+            str(status_output),
+        ],
+    )
+
+    assert scan_quant_strategy_inputs.main() == 0
+
+    assert capsys.readouterr().out == ""
+    candidates = json.loads(candidates_output.read_text(encoding="utf-8"))
+    baselines = json.loads(baselines_output.read_text(encoding="utf-8"))
+    status = json.loads(status_output.read_text(encoding="utf-8"))
+    assert candidates[0]["condition_id"] == "candidate"
+    assert status["status"] == "ok"
+    assert status["candidate_count"] == 1
+    assert status["baseline_count"] == 1
+    assert baselines["candidate"]["baseline_probability"] == 0.58
+    assert baselines["candidate"]["confidence"] == 0.82
+    assert baselines["candidate"]["resolution_at"] == "2099-01-01T00:00:00Z"
+
+
 def _event_with_markets(event_id: str, title: str):
     from polymarket_arb.models import EventInfo, MarketInfo, TokenInfo
 

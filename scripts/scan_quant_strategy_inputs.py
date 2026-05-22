@@ -26,8 +26,10 @@ from polymarket_arb.quant_input_scanner import (
     build_wallet_observations_from_trades,
     build_wallet_profiles_from_markout_rows,
     discover_wallets_from_trades,
+    generate_event_baseline_candidates,
     generate_logical_constraint_candidates,
     promote_wallet_profiles_from_markout_rows,
+    select_event_baselines_with_llm,
     select_logical_constraints_with_llm,
 )
 
@@ -71,6 +73,45 @@ def main() -> int:
     p_rules.add_argument("--min-violation-bps", type=float, default=250.0)
     p_rules.add_argument("--max-candidates", type=int, default=40)
     p_rules.add_argument("--rules-expires-sec", type=float, default=30 * 60.0)
+
+    p_auto_rules = sub.add_parser(
+        "logical-rules-auto",
+        help="Fetch relation candidates then use configured LLM to select deterministic rules",
+    )
+    p_auto_rules.add_argument("--output", default=None, help="Optional JSON output file; written atomically")
+    p_auto_rules.add_argument(
+        "--candidates-output",
+        default=None,
+        help="Optional JSON file for the fetched candidate rows",
+    )
+    p_auto_rules.add_argument("--status-output", default=None, help="Optional JSON worker status file")
+    p_auto_rules.add_argument("--events-json", default=None, help="Gamma /events JSON export")
+    p_auto_rules.add_argument("--fetch-gamma", action="store_true", help="Fetch active events from Gamma directly")
+    p_auto_rules.add_argument("--dotenv-path", default=None)
+    p_auto_rules.add_argument("--event-limit", type=int, default=100)
+    p_auto_rules.add_argument("--min-liquidity", type=float, default=0.0)
+    p_auto_rules.add_argument("--min-volume-24h", type=float, default=0.0)
+    p_auto_rules.add_argument("--max-markets-per-event", type=int, default=40)
+    p_auto_rules.add_argument("--max-pairs-per-event", type=int, default=80)
+    p_auto_rules.add_argument("--min-violation-bps", type=float, default=250.0)
+    p_auto_rules.add_argument("--max-candidates", type=int, default=40)
+    p_auto_rules.add_argument("--rules-expires-sec", type=float, default=30 * 60.0)
+
+    p_auto_baselines = sub.add_parser(
+        "event-baselines-auto",
+        help="Fetch timed event markets then use configured LLM to estimate baselines",
+    )
+    p_auto_baselines.add_argument("--output", default=None, help="Optional JSON output file; written atomically")
+    p_auto_baselines.add_argument("--candidates-output", default=None, help="Optional JSON candidate file")
+    p_auto_baselines.add_argument("--status-output", default=None, help="Optional JSON worker status file")
+    p_auto_baselines.add_argument("--events-json", default=None, help="Gamma /events JSON export")
+    p_auto_baselines.add_argument("--fetch-gamma", action="store_true", help="Fetch active events from Gamma directly")
+    p_auto_baselines.add_argument("--dotenv-path", default=None)
+    p_auto_baselines.add_argument("--event-limit", type=int, default=100)
+    p_auto_baselines.add_argument("--min-liquidity", type=float, default=0.0)
+    p_auto_baselines.add_argument("--min-volume-24h", type=float, default=0.0)
+    p_auto_baselines.add_argument("--max-candidates", type=int, default=40)
+    p_auto_baselines.add_argument("--min-confidence", type=float, default=0.70)
 
     p_obs = sub.add_parser("wallet-observations", help="Fetch wallet trades and emit observation JSON")
     p_obs.add_argument("--output", default=None, help="Optional JSON output file; written atomically")
@@ -158,7 +199,9 @@ def main() -> int:
         try:
             payload = _build_payload(args)
             last_payload = payload
+            _write_status(args, status="ok", payload=payload)
         except Exception as exc:
+            _write_status(args, status="error", error=str(exc))
             if repeat_interval <= 0:
                 raise
             print(f"scan_quant_strategy_inputs iteration failed: {exc}", file=sys.stderr)
@@ -215,6 +258,72 @@ def _build_payload(args) -> Any:
             "expires_at": generated_at + max(0.0, float(args.rules_expires_sec)),
             "rules": rules,
         }
+    if args.kind == "logical-rules-auto":
+        config = ArbConfig.from_env(args.dotenv_path, require_wallet=False)
+        if args.fetch_gamma:
+            events = MarketScanner(config).fetch_active_events(limit=args.event_limit)
+        elif args.events_json:
+            events = _load_events(Path(args.events_json))
+        else:
+            raise SystemExit("logical-rules-auto requires --events-json or --fetch-gamma")
+        candidates = generate_logical_constraint_candidates(
+            events,
+            min_liquidity=args.min_liquidity,
+            min_volume_24h=args.min_volume_24h,
+            max_markets_per_event=args.max_markets_per_event,
+            max_pairs_per_event=args.max_pairs_per_event,
+        )
+        args._last_candidate_count = len(candidates)
+        if args.candidates_output:
+            _write_json_atomically(
+                Path(args.candidates_output),
+                json.dumps(candidates, ensure_ascii=False, separators=(",", ":")),
+            )
+        provider = create_provider(config)
+        rules = select_logical_constraints_with_llm(
+            provider,
+            candidates,
+            min_violation_bps=args.min_violation_bps,
+            max_candidates=args.max_candidates,
+            temperature=config.ai_temperature,
+        )
+        generated_at = time.time()
+        return {
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "expires_at": generated_at + max(0.0, float(args.rules_expires_sec)),
+            "rules": rules,
+        }
+    if args.kind == "event-baselines-auto":
+        config = ArbConfig.from_env(args.dotenv_path, require_wallet=False)
+        if args.fetch_gamma:
+            events = MarketScanner(config).fetch_active_events(limit=args.event_limit)
+        elif args.events_json:
+            events = _load_events(Path(args.events_json))
+        else:
+            raise SystemExit("event-baselines-auto requires --events-json or --fetch-gamma")
+        candidates = generate_event_baseline_candidates(
+            events,
+            min_liquidity=args.min_liquidity,
+            min_volume_24h=args.min_volume_24h,
+            max_markets=args.max_candidates,
+        )
+        args._last_candidate_count = len(candidates)
+        if args.candidates_output:
+            _write_json_atomically(
+                Path(args.candidates_output),
+                json.dumps(candidates, ensure_ascii=False, separators=(",", ":")),
+            )
+        provider = create_provider(config)
+        baselines = select_event_baselines_with_llm(
+            provider,
+            candidates,
+            max_candidates=args.max_candidates,
+            temperature=config.ai_temperature,
+            min_confidence=args.min_confidence,
+        )
+        args._last_baseline_count = len(baselines)
+        return baselines
     if args.kind == "wallet-observations":
         client = DataApiWalletTradeClient(args.data_api_host)
         trades: list[dict[str, Any]] = []
@@ -299,6 +408,37 @@ def _write_json_atomically(path: Path, text: str) -> None:
     tmp_path = path.with_name(f".{path.name}.tmp")
     tmp_path.write_text(text, encoding="utf-8")
     tmp_path.replace(path)
+
+
+def _write_status(
+    args,
+    *,
+    status: str,
+    payload: Any | None = None,
+    error: str = "",
+) -> None:
+    path_text = getattr(args, "status_output", None)
+    if not path_text:
+        return
+    rules = []
+    if isinstance(payload, dict) and isinstance(payload.get("rules"), list):
+        rules = payload["rules"]
+    baseline_count = int(getattr(args, "_last_baseline_count", 0) or 0)
+    if baseline_count == 0 and getattr(args, "kind", "") == "event-baselines-auto" and isinstance(payload, dict):
+        baseline_count = len(payload)
+    status_payload = {
+        "status": status,
+        "kind": getattr(args, "kind", ""),
+        "updated_at": time.time(),
+        "candidate_count": int(getattr(args, "_last_candidate_count", 0) or 0),
+        "rule_count": len(rules),
+        "baseline_count": baseline_count,
+        "error": error,
+    }
+    _write_json_atomically(
+        Path(path_text),
+        json.dumps(status_payload, ensure_ascii=False, separators=(",", ":")),
+    )
 
 
 def _today_utc() -> str:

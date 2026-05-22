@@ -59,6 +59,131 @@ def generate_logical_constraint_candidates(
     return candidates
 
 
+def generate_event_baseline_candidates(
+    events: list[EventInfo],
+    *,
+    min_liquidity: float = 0.0,
+    min_volume_24h: float = 0.0,
+    max_markets: int = 80,
+) -> list[dict[str, Any]]:
+    """Generate markets with explicit timing metadata for LLM baseline review."""
+    candidates: list[dict[str, Any]] = []
+    for event in events:
+        for market in event.markets:
+            if len(candidates) >= max_markets:
+                return candidates
+            if (
+                not _is_binary_market(market)
+                or not market.active
+                or market.closed
+                or market.liquidity < min_liquidity
+                or market.volume_24h < min_volume_24h
+            ):
+                continue
+            resolution_at = _market_resolution_at(market)
+            if not resolution_at:
+                continue
+            candidates.append(
+                {
+                    "event_id": event.event_id,
+                    "event_title": event.title,
+                    "condition_id": market.condition_id,
+                    "question": market.question,
+                    "slug": market.slug,
+                    "resolution_at": resolution_at,
+                    "liquidity": market.liquidity,
+                    "volume_24h": market.volume_24h,
+                }
+            )
+    return candidates
+
+
+def select_event_baselines_with_llm(
+    provider: Any,
+    candidates: list[dict[str, Any]],
+    *,
+    max_candidates: int = 40,
+    temperature: float,
+    min_confidence: float = 0.70,
+) -> dict[str, dict[str, Any]]:
+    """Use an LLM provider to estimate independent event baselines."""
+    if not candidates:
+        return {}
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError(
+            "select_event_baselines_with_llm() cannot run inside an active event loop; "
+            "use select_event_baselines_with_llm_async() instead"
+        )
+    return asyncio.run(
+        select_event_baselines_with_llm_async(
+            provider,
+            candidates[:max_candidates],
+            temperature=temperature,
+            min_confidence=min_confidence,
+        )
+    )
+
+
+async def select_event_baselines_with_llm_async(
+    provider: Any,
+    candidates: list[dict[str, Any]],
+    *,
+    temperature: float,
+    min_confidence: float,
+) -> dict[str, dict[str, Any]]:
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Return JSON only. Estimate independent baseline probabilities for near-term event markets. "
+                "Use only information implied by the provided market metadata. "
+                "Return baselines only when the market has a clear resolution time and your confidence is high. "
+                "Output shape: {\"baselines\":[{\"condition_id\":\"...\",\"baseline_probability\":0.55,"
+                "\"confidence\":0.8,\"resolution_at\":\"ISO-8601 time\"}]}."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps({"candidates": candidates}, ensure_ascii=False),
+        },
+    ]
+    resp = await provider.chat(messages, temperature=temperature, json_mode=True)
+    try:
+        payload = json.loads(resp.content)
+    except json.JSONDecodeError:
+        return {}
+    rows = payload.get("baselines", []) if isinstance(payload, dict) else []
+    candidate_by_id = {str(row.get("condition_id") or ""): row for row in candidates}
+    baselines: dict[str, dict[str, Any]] = {}
+    generated_at = time.time()
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        condition_id = str(row.get("condition_id") or "").strip()
+        candidate = candidate_by_id.get(condition_id)
+        if candidate is None:
+            continue
+        probability = _bounded_probability(row.get("baseline_probability"))
+        confidence = _bounded_probability(row.get("confidence"))
+        if probability is None or confidence is None or confidence < min_confidence:
+            continue
+        resolution_at = str(row.get("resolution_at") or candidate.get("resolution_at") or "").strip()
+        if not resolution_at:
+            continue
+        baselines[condition_id] = {
+            "baseline_probability": probability,
+            "confidence": confidence,
+            "resolution_at": resolution_at,
+            "generated_at": generated_at,
+            "source": "llm_event_baseline",
+        }
+    return baselines
+
+
 def select_logical_constraints_with_llm(
     provider: Any,
     candidates: list[dict[str, Any]],
@@ -549,6 +674,28 @@ def _max_drawdown(rows: list[dict[str, Any]]) -> float:
 def _is_binary_market(market: MarketInfo) -> bool:
     outcomes = {(token.outcome or "").strip().lower() for token in market.tokens}
     return {"yes", "no"}.issubset(outcomes) or len(market.tokens) == 2
+
+
+def _market_resolution_at(market: MarketInfo) -> str:
+    for value in (
+        market.end_date,
+        market.raw.get("resolution_at") if isinstance(market.raw, dict) else "",
+        market.raw.get("endDate") if isinstance(market.raw, dict) else "",
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _bounded_probability(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return max(0.0, min(1.0, parsed))
 
 
 def _ranked_unique_logical_markets(
