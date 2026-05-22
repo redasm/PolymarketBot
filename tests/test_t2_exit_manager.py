@@ -528,6 +528,344 @@ def test_partial_exit_reduces_size_but_keeps_position_open() -> None:
     assert mgr.open_positions["t-yes"].size_remaining == pytest.approx(1.0)
 
 
+def test_model_prob_provider_overrides_entry_prob_for_optimal_stopping():
+    """The Bellman policy should use the latest provider estimate, not entry prob.
+
+    Setup: entry prob = 0.95 (so the entry-frozen policy says HOLD
+    forever at any price < ~0.95). The provider returns 0.05 (model
+    now thinks the position is nearly worthless). With rolling p_t the
+    Bellman threshold collapses to ~0.05 and any market price triggers
+    STOP. The horizon is short (~1h) so the value function is close to
+    the terminal payoff and the test isn't sensitive to option-value
+    accretion at higher τ.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    executor = _StubExecutor()
+    config = make_test_config(
+        t2_stop_loss_bps=99999.0,
+        t2_take_profit_capture_pct=10.0,
+        t2_max_hold_sec=99999.0,
+        t2_optimal_stopping_enabled=True,
+        t2_exit_eval_interval_sec=0.0,
+        t2_scale_out_tranches=1,
+    )
+    ob = _StubOB({"t-yes": _snap("t-yes", best_bid=0.50)})
+
+    def provider(market: MarketInfo, token_id: str) -> float:
+        return 0.05  # Catastrophic update vs entry's 0.95
+
+    mgr = T2ExitManager(
+        config=config,
+        executor=executor,
+        ob_analyzer=ob,
+        model_prob_provider=provider,
+    )
+    deadline = (datetime.now(timezone.utc) + timedelta(hours=1, minutes=2)).isoformat()
+    market = _market(end_date=deadline)
+    mgr.register_fills(
+        signal_payload={"action": "BUY_YES", "model_prob": 0.95, "deviation": 0.05},
+        market=market,
+        trades=[_fill("t-yes", price=0.50, size=2.0)],
+    )
+    # Sanity check: without the provider, entry-frozen policy holds at p=0.95
+    assert mgr.open_positions["t-yes"].model_prob_at_entry == pytest.approx(0.95)
+
+    result = mgr.evaluate(active_markets=[market])
+
+    assert result.triggered == 1
+    assert result.decisions[0]["reason"] == "optimal_stopping"
+    assert result.decisions[0]["model_prob_entry"] == 0.95
+    assert result.decisions[0]["model_prob_current"] == 0.05
+
+
+def test_model_prob_provider_falls_back_when_returns_none():
+    """Provider returning None must not corrupt position state."""
+    executor = _StubExecutor()
+    config = make_test_config(
+        t2_stop_loss_bps=99999.0,
+        t2_take_profit_capture_pct=10.0,
+        t2_max_hold_sec=99999.0,
+        t2_optimal_stopping_enabled=False,  # focus on prob storage, not policy
+        t2_exit_eval_interval_sec=0.0,
+        t2_scale_out_tranches=1,
+    )
+    ob = _StubOB({"t-yes": _snap("t-yes", best_bid=0.50)})
+
+    calls: list[tuple[str, str]] = []
+
+    def provider(market: MarketInfo, token_id: str) -> float | None:
+        calls.append((market.condition_id, token_id))
+        return None
+
+    mgr = T2ExitManager(
+        config=config,
+        executor=executor,
+        ob_analyzer=ob,
+        model_prob_provider=provider,
+    )
+    market = _market()
+    mgr.register_fills(
+        signal_payload={"action": "BUY_YES", "model_prob": 0.55, "deviation": 0.05},
+        market=market,
+        trades=[_fill("t-yes", price=0.50, size=2.0)],
+    )
+
+    mgr.evaluate(active_markets=[market])
+
+    assert calls == [("c1", "t-yes")]
+    pos = mgr.open_positions["t-yes"]
+    assert pos.current_model_prob is None
+    assert pos.model_prob_at_entry == pytest.approx(0.55)
+
+
+def test_dynamic_stop_warms_up_then_widens_with_volatility():
+    """Verify dynamic stop falls back to static while warming, then expands."""
+    # Use static stop = 50 bps (tight), dynamic k=2.0, warmup=5, min=20, max=1000
+    config = make_test_config(
+        t2_stop_loss_bps=50.0,
+        t2_take_profit_capture_pct=10.0,
+        t2_max_hold_sec=99999.0,
+        t2_optimal_stopping_enabled=False,
+        t2_exit_eval_interval_sec=0.0,
+        t2_scale_out_tranches=1,
+        t2_stop_loss_dynamic_enabled=True,
+        t2_stop_loss_dynamic_k=2.0,
+        t2_stop_loss_min_bps=20.0,
+        t2_stop_loss_max_bps=1000.0,
+        t2_stop_loss_dynamic_warmup=5,
+    )
+
+    # Mutable snapshot — we'll feed the price history one tick at a time.
+    snapshots: dict[str, OrderBookSnapshot] = {
+        "t-yes": _snap("t-yes", best_bid=0.50, best_ask=0.52)
+    }
+    ob = _StubOB(snapshots)
+    executor = _StubExecutor()
+    mgr = T2ExitManager(config=config, executor=executor, ob_analyzer=ob)
+    market = _market()
+    mgr.register_fills(
+        signal_payload={"action": "BUY_YES", "model_prob": 0.55, "deviation": 0.05},
+        market=market,
+        trades=[_fill("t-yes", price=0.51, size=2.0)],
+    )
+    pos = mgr.open_positions["t-yes"]
+
+    # Feed 3 ticks (below warmup=5). Price oscillates within static-stop
+    # range so stop_loss must NOT fire — uses the fallback static 50bps.
+    # Entry 0.51, bid 0.508 → 39 bps adverse, under 50 → HOLD.
+    for px in [0.510, 0.509, 0.508]:
+        snapshots["t-yes"] = _snap("t-yes", best_bid=px, best_ask=px + 0.02)
+        result = mgr.evaluate(active_markets=[market])
+        assert result.triggered == 0
+    # During warmup the effective stop should be the static 50.
+    assert pos.last_effective_stop_bps == 50.0
+
+    # Feed enough additional ticks with realised vol to wake the
+    # dynamic estimator. Modest oscillations (~25 bps per tick).
+    for px in [0.515, 0.508, 0.516, 0.507]:
+        snapshots["t-yes"] = _snap("t-yes", best_bid=px, best_ask=px + 0.02)
+        mgr.evaluate(active_markets=[market])
+
+    # Dynamic estimator now active. Effective stop should be != 50
+    # (almost surely larger, because realised vol of the 7-tick window
+    # × k=2.0 should exceed 50 bps).
+    assert pos.last_effective_stop_bps is not None
+    assert pos.last_effective_stop_bps >= 20.0  # min floor
+    assert pos.last_effective_stop_bps <= 1000.0  # max ceiling
+
+
+def test_dynamic_stop_disabled_uses_static_threshold():
+    """With T2_STOP_LOSS_DYNAMIC_ENABLED=false, effective_stop_bps == static."""
+    config = make_test_config(
+        t2_stop_loss_bps=300.0,
+        t2_take_profit_capture_pct=10.0,
+        t2_max_hold_sec=99999.0,
+        t2_optimal_stopping_enabled=False,
+        t2_exit_eval_interval_sec=0.0,
+        t2_scale_out_tranches=1,
+        t2_stop_loss_dynamic_enabled=False,
+    )
+    ob = _StubOB({"t-yes": _snap("t-yes", best_bid=0.495, best_ask=0.505)})
+    mgr = T2ExitManager(config=config, executor=_StubExecutor(), ob_analyzer=ob)
+    market = _market()
+    mgr.register_fills(
+        signal_payload={"action": "BUY_YES", "model_prob": 0.55, "deviation": 0.05},
+        market=market,
+        trades=[_fill("t-yes", price=0.50, size=2.0)],
+    )
+    mgr.evaluate(active_markets=[market])
+    assert mgr.open_positions["t-yes"].last_effective_stop_bps == 300.0
+
+
+def test_model_prob_provider_exception_is_swallowed():
+    """A throwing provider must not break the evaluate() pass."""
+    executor = _StubExecutor()
+    config = make_test_config(
+        t2_stop_loss_bps=300.0,
+        t2_take_profit_capture_pct=10.0,
+        t2_max_hold_sec=99999.0,
+        t2_optimal_stopping_enabled=True,
+        t2_exit_eval_interval_sec=0.0,
+        t2_scale_out_tranches=1,
+    )
+    # entry 0.50, bid 0.45 → stop_loss fires regardless of provider
+    ob = _StubOB({"t-yes": _snap("t-yes", best_bid=0.45)})
+
+    def provider(_market: MarketInfo, _token_id: str) -> float:
+        raise RuntimeError("simulated detector failure")
+
+    mgr = T2ExitManager(
+        config=config,
+        executor=executor,
+        ob_analyzer=ob,
+        model_prob_provider=provider,
+    )
+    market = _market()
+    mgr.register_fills(
+        signal_payload={"action": "BUY_YES", "model_prob": 0.55, "deviation": 0.05},
+        market=market,
+        trades=[_fill("t-yes", price=0.50, size=2.0)],
+    )
+
+    # Should not raise; stop_loss still fires.
+    result = mgr.evaluate(active_markets=[market])
+    assert result.triggered == 1
+    assert result.decisions[0]["reason"] == "stop_loss"
+
+
+class _SizeTrackingExecutor:
+    """Records the per-call size and fills exactly the requested size."""
+
+    def __init__(self):
+        self.calls: list[float] = []
+        self.order_type_names: list[str | None] = []
+
+    def execute_arbitrage(self, opp: ArbOpportunity, size: float, *, order_type_name: str | None = None) -> list[TradeRecord]:
+        self.calls.append(float(size))
+        self.order_type_names.append(order_type_name)
+        leg = opp.legs[0]
+        return [
+            TradeRecord(
+                trade_id=f"exit-{len(self.calls)}",
+                arb_id="exit",
+                token_id=leg.token_id,
+                condition_id=leg.condition_id,
+                side=leg.side,
+                price=leg.price,
+                size=size,
+                status=TradeStatus.FILLED,
+                fill_price=leg.price,
+                fill_size=size,
+            )
+        ]
+
+
+def test_scale_out_take_profit_sells_one_third_per_trigger():
+    """With tranches=3, take_profit should sell ~1/3 per trigger over 3 cycles."""
+    executor = _SizeTrackingExecutor()
+    config = make_test_config(
+        t2_stop_loss_bps=99999.0,
+        t2_take_profit_capture_pct=0.5,
+        t2_max_hold_sec=99999.0,
+        t2_optimal_stopping_enabled=False,
+        t2_exit_eval_interval_sec=0.0,
+        t2_scale_out_tranches=3,
+    )
+    # Bought at 0.50 with dev=0.04 → TP target 0.52; market at 0.525 keeps firing
+    ob = _StubOB({"t-yes": _snap("t-yes", best_bid=0.525)})
+    mgr = T2ExitManager(config=config, executor=executor, ob_analyzer=ob)
+    market = _market()
+    mgr.register_fills(
+        signal_payload={"action": "BUY_YES", "model_prob": 0.54, "deviation": 0.04},
+        market=market,
+        trades=[_fill("t-yes", price=0.50, size=9.0)],
+    )
+
+    # Cycle 1: 1/3 of 9.0 = 3.0
+    r1 = mgr.evaluate(active_markets=[market])
+    assert r1.tranche_exits == 1
+    assert r1.triggered == 0
+    assert executor.calls[-1] == pytest.approx(3.0)
+    assert mgr.open_positions["t-yes"].size_remaining == pytest.approx(6.0)
+    assert mgr.open_positions["t-yes"].tranches_executed == 1
+
+    # Cycle 2: 1/2 of 6.0 = 3.0
+    r2 = mgr.evaluate(active_markets=[market])
+    assert r2.tranche_exits == 1
+    assert executor.calls[-1] == pytest.approx(3.0)
+    assert mgr.open_positions["t-yes"].size_remaining == pytest.approx(3.0)
+    assert mgr.open_positions["t-yes"].tranches_executed == 2
+
+    # Cycle 3: final tranche zeroes size_remaining → status "exited"
+    # (and not "tranche_exited", since the position is fully closed).
+    r3 = mgr.evaluate(active_markets=[market])
+    assert r3.triggered == 1
+    assert r3.tranche_exits == 0
+    assert executor.calls[-1] == pytest.approx(3.0)
+    assert "t-yes" not in mgr.open_positions
+
+
+def test_scale_out_stop_loss_still_full_exit():
+    """stop_loss must bypass scale-out and dump the full remaining position."""
+    executor = _SizeTrackingExecutor()
+    config = make_test_config(
+        t2_stop_loss_bps=300.0,
+        t2_take_profit_capture_pct=10.0,
+        t2_max_hold_sec=99999.0,
+        t2_optimal_stopping_enabled=False,
+        t2_exit_eval_interval_sec=0.0,
+        t2_scale_out_tranches=3,  # tranches set, but stop_loss should override
+    )
+    # entry 0.50, mid 0.45 → -1000 bps adverse
+    ob = _StubOB({"t-yes": _snap("t-yes", best_bid=0.45)})
+    mgr = T2ExitManager(config=config, executor=executor, ob_analyzer=ob)
+    market = _market()
+    mgr.register_fills(
+        signal_payload={"action": "BUY_YES", "model_prob": 0.55, "deviation": 0.05},
+        market=market,
+        trades=[_fill("t-yes", price=0.50, size=9.0)],
+    )
+
+    result = mgr.evaluate(active_markets=[market])
+
+    assert result.triggered == 1
+    assert result.tranche_exits == 0
+    assert executor.calls == [pytest.approx(9.0)]
+    assert result.decisions[0]["reason"] == "stop_loss"
+    assert result.decisions[0]["fraction"] == 1.0
+
+
+def test_scale_out_partial_fill_does_not_advance_counter():
+    """A partial fill at a tranche slice should retry next cycle, not skip."""
+    executor = _PartialExitExecutor()  # fills 50% of requested
+    config = make_test_config(
+        t2_stop_loss_bps=99999.0,
+        t2_take_profit_capture_pct=0.5,
+        t2_max_hold_sec=99999.0,
+        t2_optimal_stopping_enabled=False,
+        t2_exit_eval_interval_sec=0.0,
+        t2_scale_out_tranches=3,
+    )
+    ob = _StubOB({"t-yes": _snap("t-yes", best_bid=0.525)})
+    mgr = T2ExitManager(config=config, executor=executor, ob_analyzer=ob)
+    market = _market()
+    mgr.register_fills(
+        signal_payload={"action": "BUY_YES", "model_prob": 0.54, "deviation": 0.04},
+        market=market,
+        trades=[_fill("t-yes", price=0.50, size=9.0)],
+    )
+
+    result = mgr.evaluate(active_markets=[market])
+
+    # Asked for 3.0, only got 1.5. Counter did NOT advance — next cycle
+    # will retry the same tranche on the now-7.5 remaining position.
+    assert result.partial == 1
+    assert result.tranche_exits == 0
+    assert mgr.open_positions["t-yes"].tranches_executed == 0
+    assert mgr.open_positions["t-yes"].size_remaining == pytest.approx(7.5)
+
+
 def test_cancelled_exit_with_fill_size_still_reduces_position() -> None:
     executor = _CancelledFilledExitExecutor()
     config = make_test_config(

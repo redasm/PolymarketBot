@@ -173,6 +173,31 @@ class ArbConfig:
     t2_max_hold_sec: float
     t2_exit_eval_interval_sec: float
     t2_optimal_stopping_enabled: bool
+    # Number of equal tranches to scale out a T2 position over for the
+    # "happy-path" exit triggers (take_profit / optimal_stopping). Each
+    # trigger sells `size_remaining / remaining_tranches`, so over N
+    # triggers the position is fully closed. stop_loss / time_stop /
+    # floor_dump always exit the full remaining size regardless of this
+    # setting. 1 = legacy single-stop behaviour. Kobylanski 2009: d-stop
+    # strictly dominates 1-stop when the model is uncertain, because each
+    # tranche locks in different price realisations of the same exit
+    # decision rule.
+    t2_scale_out_tranches: int
+    # Dynamic (ATR-equivalent) stop-loss. When enabled, the exit
+    # manager tracks a rolling per-position volatility (stdev of log
+    # returns of recent mid prices) and sets `stop_bps = clamp(k *
+    # vol_bps, min, max)`. Disabled by default — the static
+    # T2_STOP_LOSS_BPS is the safe baseline. Direction comes from
+    # HyperLiquid backtest article but the multiplier needs
+    # calibration on Polymarket binary-contract dynamics, which differ
+    # from perpetual futures. Until warm (fewer than
+    # T2_STOP_LOSS_DYNAMIC_WARMUP price observations), the static stop
+    # is used as a safe fallback.
+    t2_stop_loss_dynamic_enabled: bool
+    t2_stop_loss_dynamic_k: float
+    t2_stop_loss_min_bps: float
+    t2_stop_loss_max_bps: float
+    t2_stop_loss_dynamic_warmup: int
     # T2 long-horizon guard: directional bets on markets resolving more than
     # `t2_long_horizon_days` away (or with no end_date at all) require a
     # higher net edge to enter. Long-horizon binary contracts are priced
@@ -192,6 +217,31 @@ class ArbConfig:
     # statistical edge. We demand a much higher net_edge there (default
     # 300 bps, vs 25 bps for the rest).
     t2_near_efficient_min_net_edge_bps: float
+    # Near-certainty rule (Article 4, Taleb / @stacyonchain). Markets
+    # priced 92-98¢ may systematically underprice tail risk. Empirical
+    # verification was blocked on free-tier data availability — see
+    # `scripts/verify_near_certainty_trap.py`. Shipped in SHADOW MODE
+    # by default: the rule computes what it would do on each signal
+    # but does not modify production behaviour. Operators flip
+    # `T2_NEAR_CERTAINTY_SHADOW_MODE=false` once enough live samples
+    # have accumulated for an offline evaluation.
+    t2_near_certainty_shadow_mode: bool
+    t2_near_certainty_high_threshold: float  # default 0.92
+    t2_near_certainty_low_threshold: float   # default 0.08
+    t2_near_certainty_size_multiplier: float  # default 0.60
+    t2_near_certainty_confidence_delta: float  # default -0.08
+    # Barbell pool (Taleb / Article 4). Treat T2 capital as two
+    # sub-buckets: data-driven (default ~80%) and tail (default ~15%,
+    # with the rest as reserve). When enabled, the orchestrator
+    # tracks per-class exposure and *relaxes* the tail_risk_high size
+    # discount (e.g. 0.5 → 0.85) while the tail bucket has room. Once
+    # the bucket is full, the discount snaps back to the harsh rule
+    # default so we don't pile into correlated tail bets. Disabled by
+    # default — operators flip on after observing the `barbell` block
+    # under orchestrator.meta over a few days.
+    t2_barbell_enabled: bool
+    t2_barbell_tail_budget_pct: float       # of T2 allocation; default 0.15
+    t2_barbell_tail_relaxed_multiplier: float  # default 0.85
     # T2 post-exit cooldown (cross-restart). After a successful exit or
     # abandoned-position release, the same market is locked out for
     # this many seconds so the bot does not immediately re-enter the
@@ -290,6 +340,13 @@ class ArbConfig:
     research_signal_knowledge_enabled: bool
     research_signal_knowledge_dir: str
     research_signal_knowledge_max_matches: int
+    # Crypto macro-sentiment collector (Fear & Greed). Free, no auth.
+    # Contributes a single sentiment row per crypto-keyword topic to
+    # the research_overlay aggregator. Shadow-equivalent: it just
+    # feeds the same pipeline as RSS / Surf / knowledge-base rows;
+    # the orchestrator decides what to do with it via its resonance
+    # scoring. Default on (no cost, low risk).
+    research_signal_crypto_macro_enabled: bool
 
     # Backtest
     backtest_enabled: bool
@@ -480,6 +537,16 @@ class ArbConfig:
             raise ValueError("T2_MAX_HOLD_SEC 不能为负数")
         if self.t2_exit_eval_interval_sec < 0:
             raise ValueError("T2_EXIT_EVAL_INTERVAL_SEC 不能为负数")
+        if self.t2_scale_out_tranches < 1:
+            raise ValueError("T2_SCALE_OUT_TRANCHES 必须 >= 1")
+        if self.t2_stop_loss_dynamic_k < 0:
+            raise ValueError("T2_STOP_LOSS_DYNAMIC_K 不能为负数")
+        if self.t2_stop_loss_min_bps < 0:
+            raise ValueError("T2_STOP_LOSS_MIN_BPS 不能为负数")
+        if self.t2_stop_loss_max_bps < self.t2_stop_loss_min_bps:
+            raise ValueError("T2_STOP_LOSS_MAX_BPS 必须 >= T2_STOP_LOSS_MIN_BPS")
+        if self.t2_stop_loss_dynamic_warmup < 2:
+            raise ValueError("T2_STOP_LOSS_DYNAMIC_WARMUP 必须 >= 2")
         if self.t2_long_horizon_days < 0:
             raise ValueError("T2_LONG_HORIZON_DAYS 不能为负数")
         if self.t2_long_horizon_min_net_edge_bps < 0:
@@ -490,6 +557,16 @@ class ArbConfig:
             raise ValueError("T2_REJECT_PRICE_ABOVE 必须在 [0.5, 1.0]")
         if self.t2_near_efficient_min_net_edge_bps < 0:
             raise ValueError("T2_NEAR_EFFICIENT_MIN_NET_EDGE_BPS 不能为负数")
+        if not (0.5 < self.t2_near_certainty_high_threshold <= 1.0):
+            raise ValueError("T2_NEAR_CERTAINTY_HIGH_THRESHOLD 必须在 (0.5, 1.0]")
+        if not (0.0 <= self.t2_near_certainty_low_threshold < 0.5):
+            raise ValueError("T2_NEAR_CERTAINTY_LOW_THRESHOLD 必须在 [0, 0.5)")
+        if not (0.0 < self.t2_near_certainty_size_multiplier <= 1.0):
+            raise ValueError("T2_NEAR_CERTAINTY_SIZE_MULTIPLIER 必须在 (0, 1]")
+        if not (0.0 <= self.t2_barbell_tail_budget_pct <= 1.0):
+            raise ValueError("T2_BARBELL_TAIL_BUDGET_PCT 必须在 [0, 1]")
+        if not (0.0 < self.t2_barbell_tail_relaxed_multiplier <= 1.0):
+            raise ValueError("T2_BARBELL_TAIL_RELAXED_MULTIPLIER 必须在 (0, 1]")
         if self.t2_post_exit_cooldown_sec < 0:
             raise ValueError("T2_POST_EXIT_COOLDOWN_SEC 不能为负数")
         if self.t3_flow_bias_window_sec <= 0:
@@ -670,12 +747,38 @@ class ArbConfig:
             t2_max_hold_sec=_env_float("T2_MAX_HOLD_SEC", 6 * 3600.0),
             t2_exit_eval_interval_sec=_env_float("T2_EXIT_EVAL_INTERVAL_SEC", 30.0),
             t2_optimal_stopping_enabled=_env_bool("T2_OPTIMAL_STOPPING_ENABLED", True),
+            t2_scale_out_tranches=_env_int("T2_SCALE_OUT_TRANCHES", 3),
+            t2_stop_loss_dynamic_enabled=_env_bool("T2_STOP_LOSS_DYNAMIC_ENABLED", False),
+            t2_stop_loss_dynamic_k=_env_float("T2_STOP_LOSS_DYNAMIC_K", 2.0),
+            t2_stop_loss_min_bps=_env_float("T2_STOP_LOSS_MIN_BPS", 100.0),
+            t2_stop_loss_max_bps=_env_float("T2_STOP_LOSS_MAX_BPS", 1000.0),
+            t2_stop_loss_dynamic_warmup=_env_int("T2_STOP_LOSS_DYNAMIC_WARMUP", 5),
             t2_long_horizon_days=_env_float("T2_LONG_HORIZON_DAYS", 30.0),
             t2_long_horizon_min_net_edge_bps=_env_float("T2_LONG_HORIZON_MIN_NET_EDGE_BPS", 200.0),
             t2_reject_price_below=_env_float("T2_REJECT_PRICE_BELOW", 0.10),
             t2_reject_price_above=_env_float("T2_REJECT_PRICE_ABOVE", 0.90),
             t2_near_efficient_min_net_edge_bps=_env_float(
                 "T2_NEAR_EFFICIENT_MIN_NET_EDGE_BPS", 300.0
+            ),
+            t2_near_certainty_shadow_mode=_env_bool(
+                "T2_NEAR_CERTAINTY_SHADOW_MODE", True
+            ),
+            t2_near_certainty_high_threshold=_env_float(
+                "T2_NEAR_CERTAINTY_HIGH_THRESHOLD", 0.92
+            ),
+            t2_near_certainty_low_threshold=_env_float(
+                "T2_NEAR_CERTAINTY_LOW_THRESHOLD", 0.08
+            ),
+            t2_near_certainty_size_multiplier=_env_float(
+                "T2_NEAR_CERTAINTY_SIZE_MULTIPLIER", 0.60
+            ),
+            t2_near_certainty_confidence_delta=_env_float(
+                "T2_NEAR_CERTAINTY_CONFIDENCE_DELTA", -0.08
+            ),
+            t2_barbell_enabled=_env_bool("T2_BARBELL_ENABLED", False),
+            t2_barbell_tail_budget_pct=_env_float("T2_BARBELL_TAIL_BUDGET_PCT", 0.15),
+            t2_barbell_tail_relaxed_multiplier=_env_float(
+                "T2_BARBELL_TAIL_RELAXED_MULTIPLIER", 0.85
             ),
             t2_post_exit_cooldown_sec=_env_float("T2_POST_EXIT_COOLDOWN_SEC", 24 * 3600.0),
             t2_recent_exits_state_file=_env(
@@ -745,6 +848,9 @@ class ArbConfig:
             research_signal_surf_timeout_sec=_env_float("RESEARCH_SIGNAL_SURF_TIMEOUT_SEC", 8.0),
             research_signal_surf_cache_ttl_sec=_env_float("RESEARCH_SIGNAL_SURF_CACHE_TTL_SEC", 1800.0),
             research_signal_knowledge_enabled=_env_bool("RESEARCH_SIGNAL_KNOWLEDGE_ENABLED", False),
+            research_signal_crypto_macro_enabled=_env_bool(
+                "RESEARCH_SIGNAL_CRYPTO_MACRO_ENABLED", False
+            ),
             research_signal_knowledge_dir=_env("RESEARCH_SIGNAL_KNOWLEDGE_DIR", "data/research_signal/knowledge"),
             research_signal_knowledge_max_matches=_env_int("RESEARCH_SIGNAL_KNOWLEDGE_MAX_MATCHES", 3),
             backtest_enabled=_env_bool("BACKTEST_ENABLED", False),

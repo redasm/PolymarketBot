@@ -19,6 +19,7 @@ from research_signal.collectors.base import (
     SurfSignalCollector,
     WebSearchCollector,
 )
+from research_signal.collectors.crypto_macro import CryptoMacroCollector
 from research_signal.normalizers.topic import group_by_topic, normalize_topic, topic_overlap_score
 from research_signal.scorers.source_profile import resolve_source_profile
 from research_signal.summaries.builder import build_signal
@@ -43,6 +44,7 @@ class ResearchSignalService:
         knowledge_base_dir: str | None = None,
         knowledge_base_enabled: bool = False,
         knowledge_max_matches: int = 3,
+        crypto_macro_enabled: bool = False,
     ):
         self._max_items = max_items
         self._cache_ttl_sec = cache_ttl_sec
@@ -70,6 +72,12 @@ class ResearchSignalService:
             if knowledge_base_enabled and knowledge_base_dir
             else None
         )
+        self._crypto_macro_collector = CryptoMacroCollector(enabled=crypto_macro_enabled)
+        if crypto_macro_enabled:
+            LOG.info(
+                "Crypto macro collector (Fear & Greed) enabled for research signals; "
+                "contributes a sentiment row per crypto-keyword topic"
+            )
         self._cache: dict[tuple[tuple[str, ...], int], tuple[float, ResearchSignalReport]] = {}
 
     def get_signals(self, markets: list[MarketInfo], window_sec: int) -> list[ResearchSignal]:
@@ -102,6 +110,7 @@ class ResearchSignalService:
         collected_rows.extend(self._surf_collector.collect(topics))
         if self._knowledge_base_collector is not None:
             collected_rows.extend(self._knowledge_base_collector.collect(topics))
+        collected_rows.extend(self._crypto_macro_collector.collect(topics))
 
         prepared_rows, dropped_rows = self._prepare_rows(collected_rows, window_sec=window_sec, now=now)
         grouped = group_by_topic(prepared_rows)

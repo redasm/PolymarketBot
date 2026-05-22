@@ -55,6 +55,7 @@ def test_run_research_outputs_json(monkeypatch, capsys):
                 "research_signal_knowledge_enabled": False,
                 "research_signal_knowledge_dir": "data/research_signal/knowledge",
                 "research_signal_knowledge_max_matches": 3,
+                "research_signal_crypto_macro_enabled": False,
                 "research_signal_window_sec": 86400,
             },
         )(),

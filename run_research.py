@@ -107,6 +107,7 @@ def main() -> int:
         knowledge_base_dir=config.research_signal_knowledge_dir,
         knowledge_base_enabled=config.research_signal_knowledge_enabled,
         knowledge_max_matches=config.research_signal_knowledge_max_matches,
+        crypto_macro_enabled=config.research_signal_crypto_macro_enabled,
     )
     report = service.collect_report(
         markets,

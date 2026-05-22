@@ -181,6 +181,7 @@ For observation mode (before going live), broaden scanning with `ARB_MARKET_FOCU
 - `LIVE_TRADING_BASELINE.md` — baseline parameters for going live with small capital
 - `SERVER_OBSERVABILITY.md` — log/telemetry watch recommendations for unattended servers
 - `EXTERNAL_REFERENCES.md` — external research / data source references
+- `PENDING_VALIDATIONS.md` — checklist for graduating shadow-mode features (NearCertaintyRule, dynamic stop, barbell pool, on-chain signals) to live; lists data sources needed and the env flags to flip on each validation
 
 ## Testing
 

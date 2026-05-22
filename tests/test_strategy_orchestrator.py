@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from polymarket_arb.models import MarketInfo, ResearchSignal, ResearchSignalReport, TokenInfo
+from polymarket_arb.strategies.signal_policies import NearCertaintyClassifier
 from polymarket_arb.strategies.strategy_orchestrator import (
     StrategyOrchestrator,
     StrategySignal,
@@ -566,3 +567,156 @@ def test_record_processed_prunes_executed_signal_history():
     status = orchestrator.get_status()
 
     assert status["meta"]["executed_signals"] == 2000
+
+
+def test_near_certainty_shadow_mode_logs_but_does_not_modify_signal():
+    """Shadow mode: rule records would_apply_* but signal is unchanged."""
+    orchestrator = StrategyOrchestrator(
+        total_bankroll=1000,
+        near_certainty_classifier=NearCertaintyClassifier(
+            high_threshold=0.92, shadow_mode=True
+        ),
+    )
+    market = _make_market()
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id=market.condition_id,
+        description="directional buy yes at near-certainty",
+        expected_edge=80.0,
+        confidence=0.70,
+        recommended_size_usdc=100.0,
+        payload={"market_prob": 0.95},  # high-certainty zone
+    )
+
+    assert orchestrator.submit_signal(signal, active_markets=[market]) is True
+    ready = orchestrator.process_signals()
+    status = orchestrator.get_status()
+
+    near = ready[0].payload["near_certainty"]
+    assert near["applied"] is True
+    assert near["shadow_mode"] is True
+    assert near["risk_zone"] == "high_certainty"
+    # Shadow → signal NOT modified
+    assert ready[0].recommended_size_usdc == 100.0
+    assert ready[0].confidence == 0.70
+    # Telemetry: would_apply_high incremented, applied_high stayed 0
+    nc_stats = status["meta"]["near_certainty"]
+    assert nc_stats["would_apply_high"] == 1
+    assert nc_stats["applied_high"] == 0
+    assert nc_stats["shadow_mode"] is True
+
+
+def test_near_certainty_live_mode_applies_size_discount():
+    """Non-shadow mode: signal size/confidence ARE modified."""
+    orchestrator = StrategyOrchestrator(
+        total_bankroll=1000,
+        near_certainty_classifier=NearCertaintyClassifier(
+            high_threshold=0.92,
+            size_multiplier=0.60,
+            confidence_delta=-0.08,
+            shadow_mode=False,
+        ),
+    )
+    market = _make_market()
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id=market.condition_id,
+        description="buy yes at 0.95",
+        expected_edge=80.0,
+        confidence=0.70,
+        recommended_size_usdc=100.0,
+        payload={"market_prob": 0.95},
+    )
+
+    orchestrator.submit_signal(signal, active_markets=[market])
+    ready = orchestrator.process_signals()
+    status = orchestrator.get_status()
+
+    near = ready[0].payload["near_certainty"]
+    assert near["applied"] is True
+    assert near["shadow_mode"] is False
+    assert ready[0].recommended_size_usdc == 60.0   # 100 * 0.60
+    assert ready[0].confidence == 0.62              # 0.70 - 0.08
+    assert status["meta"]["near_certainty"]["applied_high"] == 1
+
+
+def test_near_certainty_buy_no_uses_inverted_price():
+    """BUY_NO at market_prob=0.05 (YES) means buying NO at 0.95 → high tail."""
+    orchestrator = StrategyOrchestrator(
+        total_bankroll=1000,
+        near_certainty_classifier=NearCertaintyClassifier(
+            high_threshold=0.92, shadow_mode=True
+        ),
+    )
+    market = _make_market()
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_no",
+        market_id=market.condition_id,
+        description="buy no when yes is near zero",
+        expected_edge=80.0,
+        confidence=0.70,
+        recommended_size_usdc=100.0,
+        payload={"market_prob": 0.05},  # YES at 0.05 → NO at 0.95
+    )
+
+    orchestrator.submit_signal(signal, active_markets=[market])
+    ready = orchestrator.process_signals()
+
+    near = ready[0].payload["near_certainty"]
+    assert near["applied"] is True
+    assert near["risk_zone"] == "high_certainty"  # NO side at 0.95
+
+
+def test_near_certainty_normal_zone_does_not_fire():
+    orchestrator = StrategyOrchestrator(total_bankroll=1000)
+    market = _make_market()
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id=market.condition_id,
+        description="buy yes in normal zone",
+        expected_edge=80.0,
+        confidence=0.70,
+        recommended_size_usdc=100.0,
+        payload={"market_prob": 0.55},
+    )
+
+    orchestrator.submit_signal(signal, active_markets=[market])
+    ready = orchestrator.process_signals()
+
+    near = ready[0].payload["near_certainty"]
+    assert near["applied"] is False
+    assert near["risk_zone"] == "normal"
+    assert ready[0].recommended_size_usdc == 100.0
+
+
+def test_near_certainty_skipped_for_market_making():
+    """Rule does NOT fire on T3 maker signals — they benefit from extremes via spread."""
+    orchestrator = StrategyOrchestrator(
+        total_bankroll=1000,
+        near_certainty_classifier=NearCertaintyClassifier(
+            high_threshold=0.92, shadow_mode=False
+        ),
+    )
+    market = _make_market()
+    signal = StrategySignal(
+        tier=StrategyTier.MARKET_MAKING,
+        signal_type="maker_quote",
+        market_id=market.condition_id,
+        description="maker at extreme",
+        expected_edge=80.0,
+        confidence=0.70,
+        recommended_size_usdc=100.0,
+        payload={"market_prob": 0.95},
+    )
+
+    orchestrator.submit_signal(signal, active_markets=[market])
+    ready = orchestrator.process_signals()
+
+    near = ready[0].payload["near_certainty"]
+    assert near["applied"] is False
+    assert near["risk_zone"] == "not_applicable"
+    assert ready[0].recommended_size_usdc == 100.0

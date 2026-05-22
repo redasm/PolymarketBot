@@ -45,7 +45,25 @@
       "PowerShell($out = python -c \"print\\('hello'\\)\" 2>&1; Write-Output \"EXIT=$LASTEXITCODE\"; Write-Output $out)",
       "PowerShell(Get-Command *)",
       "PowerShell(py *)",
-      "Bash(findstr *)"
+      "Bash(findstr *)",
+      "Bash(git diff *)",
+      "Read(//tmp/**)",
+      "Bash(python -m json.tool)",
+      "Bash(python -m pytest tests/test_run_automated_quant_pipeline.py tests/test_main_helpers_signal_collectors.py tests/test_scan_quant_strategy_inputs.py -x -q)",
+      "Bash(python -c \"import json; print\\(repr\\(json.loads\\('null'\\)\\)\\)\")",
+      "Bash(python -m pytest tests/test_market_scanner.py -x -q)",
+      "Bash(python -m pytest tests/test_market_scanner.py tests/test_main_helpers_signal_collectors.py tests/test_run_automated_quant_pipeline.py tests/test_scan_quant_strategy_inputs.py -q)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "PowerShell(Get-Process *)",
+      "PowerShell(Get-CimInstance *)",
+      "Bash(.venv\\\\Scripts\\\\python.exe -m pytest tests/test_t2_exit_manager.py tests/test_t2_exit_escalation.py tests/test_optimal_stopping.py -x -q)",
+      "PowerShell(.venv\\\\Scripts\\\\python.exe -m pytest tests/test_t2_exit_manager.py tests/test_t2_exit_escalation.py tests/test_optimal_stopping.py -x -q 2>&1 | Select-Object -Last 40)",
+      "PowerShell(.venv\\\\Scripts\\\\pip.exe install tzdata 2>&1 | Select-Object -Last 5)",
+      "PowerShell(& .\\\\.venv\\\\Scripts\\\\pip.exe install tzdata 2>&1 | Select-Object -Last 5)",
+      "PowerShell(& 'C:\\\\AppProject\\\\PolymarketBot\\\\.venv\\\\Scripts\\\\python.exe' -m pip install tzdata 2>&1 | Select-Object -Last 5)",
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(git stash *)"
     ]
   }
 }

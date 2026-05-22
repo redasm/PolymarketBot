@@ -177,6 +177,7 @@ def create_research_signal_service(config: ArbConfig) -> Optional["ResearchSigna
             knowledge_base_dir=config.research_signal_knowledge_dir,
             knowledge_base_enabled=config.research_signal_knowledge_enabled,
             knowledge_max_matches=config.research_signal_knowledge_max_matches,
+            crypto_macro_enabled=config.research_signal_crypto_macro_enabled,
         )
     except Exception as e:
         LOG.error("Research Signal 功能已禁用: 初始化失败: %s", e, exc_info=True)

@@ -154,6 +154,11 @@ from polymarket_arb.risk_manager import RiskManager
 from polymarket_arb.strategies.maker_strategy import DynamicSpreadCalculator, MakerStrategy
 from polymarket_arb.strategies.recent_exit_cooldown import make_recent_exit_cooldown_store
 from polymarket_arb.strategies.t2_exit_manager import T2ExitManager, t2_exit_telemetry
+from polymarket_arb.main_helpers.t2_model_prob import build_t2_model_prob_provider
+from polymarket_arb.strategies.signal_policies import (
+    BarbellPolicy,
+    NearCertaintyClassifier,
+)
 from polymarket_arb.strategies.statistical_model import StatisticalMispricingDetector
 from polymarket_arb.strategies.sniper_gate import SniperGate, SniperGateConfig
 from polymarket_arb.strategies.strategy_orchestrator import (
@@ -485,15 +490,55 @@ def main(dotenv_path: str | None = None) -> None:
         if config.sniper_gate_enabled
         else None
     )
+    near_certainty_classifier = NearCertaintyClassifier(
+        high_threshold=config.t2_near_certainty_high_threshold,
+        low_threshold=config.t2_near_certainty_low_threshold,
+        size_multiplier=config.t2_near_certainty_size_multiplier,
+        confidence_delta=config.t2_near_certainty_confidence_delta,
+        shadow_mode=config.t2_near_certainty_shadow_mode,
+    )
+    # Barbell pool budget: tail bucket cap is a slice of the
+    # STATISTICAL_ARB allocation. Default 15% of T2's bankroll allocation.
+    t2_allocation_pct = StrategyOrchestrator.DEFAULT_ALLOCATIONS.get(
+        StrategyTier.STATISTICAL_ARB, 0.35
+    )
+    barbell_tail_budget = (
+        float(config.max_total_exposure)
+        * t2_allocation_pct
+        * float(config.t2_barbell_tail_budget_pct)
+    )
+    barbell_policy = BarbellPolicy(
+        enabled=config.t2_barbell_enabled,
+        tail_budget_usdc=barbell_tail_budget,
+        tail_relaxed_multiplier=config.t2_barbell_tail_relaxed_multiplier,
+    )
     orchestrator = StrategyOrchestrator(
         total_bankroll=config.max_total_exposure,
         max_signals_per_market_per_hour=config.t2_max_signals_per_market_per_hour,
+        near_certainty_classifier=near_certainty_classifier,
+        barbell_policy=barbell_policy,
         sniper_gate=sniper_gate,
     )
     shadow_orchestrator = (
         StrategyOrchestrator(
             total_bankroll=shadow_config.max_total_exposure,
             max_signals_per_market_per_hour=shadow_config.t2_max_signals_per_market_per_hour,
+            near_certainty_classifier=NearCertaintyClassifier(
+                high_threshold=shadow_config.t2_near_certainty_high_threshold,
+                low_threshold=shadow_config.t2_near_certainty_low_threshold,
+                size_multiplier=shadow_config.t2_near_certainty_size_multiplier,
+                confidence_delta=shadow_config.t2_near_certainty_confidence_delta,
+                shadow_mode=shadow_config.t2_near_certainty_shadow_mode,
+            ),
+            barbell_policy=BarbellPolicy(
+                enabled=shadow_config.t2_barbell_enabled,
+                tail_budget_usdc=(
+                    float(shadow_config.max_total_exposure)
+                    * t2_allocation_pct
+                    * float(shadow_config.t2_barbell_tail_budget_pct)
+                ),
+                tail_relaxed_multiplier=shadow_config.t2_barbell_tail_relaxed_multiplier,
+            ),
         )
         if shadow_validation_enabled
         else None
@@ -524,6 +569,10 @@ def main(dotenv_path: str | None = None) -> None:
             cooldown_store.cooldown_sec,
             len(cooldown_store.snapshot()),
         )
+    t2_model_prob_provider = build_t2_model_prob_provider(
+        statistical_detector=statistical_detector,
+        ob_analyzer=ob_analyzer,
+    )
     t2_exit_manager = T2ExitManager(
         config=config,
         executor=executor,
@@ -532,6 +581,7 @@ def main(dotenv_path: str | None = None) -> None:
         notifier=notifier,
         cooldown_store=cooldown_store,
         orchestrator=orchestrator,
+        model_prob_provider=t2_model_prob_provider,
     )
     shadow_t2_exit_manager = (
         T2ExitManager(
@@ -540,6 +590,7 @@ def main(dotenv_path: str | None = None) -> None:
             ob_analyzer=ob_analyzer,
             risk_manager=shadow_risk_mgr,
             orchestrator=shadow_orchestrator,
+            model_prob_provider=t2_model_prob_provider,
         )
         if shadow_validation_enabled and shadow_executor is not None and shadow_risk_mgr is not None
         else None
