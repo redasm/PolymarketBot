@@ -98,6 +98,13 @@ def main() -> int:
     p_auto_rules.add_argument("--min-violation-bps", type=float, default=250.0)
     p_auto_rules.add_argument("--max-candidates", type=int, default=40)
     p_auto_rules.add_argument("--rules-expires-sec", type=float, default=30 * 60.0)
+    p_auto_rules.add_argument(
+        "--repeat-interval-sec",
+        type=float,
+        default=0.0,
+        help="Repeat the scan with this delay; 0 means run once",
+    )
+    p_auto_rules.add_argument("--repeat-count", type=int, default=1, help="Use 0 to repeat forever")
 
     p_auto_baselines = sub.add_parser(
         "event-baselines-auto",
@@ -114,6 +121,13 @@ def main() -> int:
     p_auto_baselines.add_argument("--min-volume-24h", type=float, default=0.0)
     p_auto_baselines.add_argument("--max-candidates", type=int, default=40)
     p_auto_baselines.add_argument("--min-confidence", type=float, default=0.70)
+    p_auto_baselines.add_argument(
+        "--repeat-interval-sec",
+        type=float,
+        default=0.0,
+        help="Repeat the scan with this delay; 0 means run once",
+    )
+    p_auto_baselines.add_argument("--repeat-count", type=int, default=1, help="Use 0 to repeat forever")
 
     p_research_feeds = sub.add_parser(
         "research-feeds-auto",

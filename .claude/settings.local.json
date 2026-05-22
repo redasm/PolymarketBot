@@ -80,7 +80,17 @@
       "Bash(grep *)",
       "Bash(echo \"exit=$?\")",
       "Bash(\"D:/Program Files/Python311/python.exe\" -m pytest tests/test_quant_input_scanner.py -x)",
-      "Bash(\"D:/Program Files/Python311/python.exe\" -m pytest --tb=short)"
+      "Bash(\"D:/Program Files/Python311/python.exe\" -m pytest --tb=short)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(python scripts/scan_quant_strategy_inputs.py logical-rules-auto --repeat-interval-sec 0.0 --repeat-count 1 --events-json /nonexistent.json > /tmp/out.txt 2>&1; echo \"EXIT=$?\"; cat /tmp/out.txt)",
+      "Bash(where python.exe)",
+      "Bash(\"D:/Program Files/Python311/python.exe\" scripts/scan_quant_strategy_inputs.py logical-rules-auto --events-json /nonexistent.json --repeat-interval-sec 0 --repeat-count 1)",
+      "Bash(\"D:/Program Files/Python311/python.exe\" scripts/scan_quant_strategy_inputs.py event-baselines-auto --events-json /nonexistent.json --repeat-interval-sec 0 --repeat-count 1)",
+      "Bash(\"D:/Program Files/Python311/python.exe\" -m pytest tests/test_run_bot_with_llm_inputs.py tests/test_scan_quant_strategy_inputs.py -q)",
+      "Bash(git status *)"
+    ],
+    "additionalDirectories": [
+      "\\tmp"
     ]
   }
 }
