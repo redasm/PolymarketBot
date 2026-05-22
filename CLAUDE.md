@@ -104,7 +104,7 @@ T3 market making: $200 (20%)
 ### Data & Telemetry
 
 - Tick recording: `TICK_RECORD_ENABLED=true` → `data/ticks/YYYY-MM-DD.ndjson` (rolls at 200MB)
-- Strategy signals: `data/telemetry/*.strategy_signals.ndjson` — T1/T2/T3 signals written here even when no T0 arb fires. **Seeing "0 arbs" in T0 does not mean the other tiers have no signals; check this file too.** The cycle metric `arbs_found_total` only counts T0 structural opportunities.
+- Strategy signals: `data/telemetry/*.strategy_signals.ndjson` — T1/T2/T3 signals written here even when no T0 arb fires. **Seeing "0 arbs" in T0 does not mean the other tiers have no signals; check this file too.** The cycle metric `arbs_found_total` is the orchestrator's directional-signal count (T0 + T1 + T2 + new logical/event/wallet tiers, not T3 maker quotes); the dedicated `t0_opportunities_total` field on the same row is what isolates T0 structural arbs.
 - Cycle metrics: `data/telemetry/*.cycle_metrics.ndjson` — one row per scan cycle with `book_stats` (ws_hit / cache_hit / rest_fallback breakdown), `timing_stats`, exposure, position count.
 - Strategy executions: `data/telemetry/*.strategy_executions.ndjson` — entries, exits, and orchestrator-skipped aggregates (`skip_reasons` includes `per_market_rate_cap`, `tier_budget_below_min_order`).
 - Risk events: `data/telemetry/*.risk_events.ndjson` — currently also captures `cycle_summary` and `portfolio_sync` rows (i.e., it's a superset, not just trip events).

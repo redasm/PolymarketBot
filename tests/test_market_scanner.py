@@ -1,8 +1,17 @@
 """MarketScanner parsing tests."""
 
+import logging
+
 import requests
 
-from polymarket_arb.market_scanner import MarketScanner, _normalize_text, _parse_event, _parse_market
+from polymarket_arb.market_scanner import (
+    MarketScanner,
+    _PARSE_FAILURE_LOGGED,
+    _normalize_text,
+    _parse_event,
+    _parse_market,
+    _safe_parse_market,
+)
 from tests.conftest import make_test_config
 
 
@@ -64,6 +73,51 @@ def test_parse_market_inherits_primary_event_metadata():
     assert market.event_slug == "bitcoin-halving-2026"
     assert market.event_title == "Bitcoin halving event"
     assert market.event_ticker == "BTC-HALVING-2026"
+
+
+def test_parse_market_tolerates_json_null_outcomes_and_prices():
+    """Gamma sometimes ships outcomes / outcomePrices as the JSON string 'null'.
+
+    Before the fix this hit `for x in None` and tripped APIResponseValidationError
+    at the call site. The market is unusable (no tokens) so we expect None back,
+    not an exception.
+    """
+    market = _parse_market(
+        {
+            "conditionId": "c-null",
+            "question": "Will Foo happen?",
+            "outcomes": "null",
+            "outcomePrices": "null",
+            "clobTokenIds": "null",
+        }
+    )
+
+    assert market is not None
+    assert market.tokens == []
+    assert market.outcomes == []
+
+
+def test_safe_parse_market_dedups_repeat_failures(caplog):
+    _PARSE_FAILURE_LOGGED.clear()
+
+    class _BoomDict(dict):
+        # Real dict so _safe_parse_market's isinstance(dict) check passes,
+        # but get() blows up the way real Gamma rows with type-coerced fields do.
+        def get(self, key, default=None):
+            if key in ("condition_id", "conditionId"):
+                return "c-repeat"
+            raise RuntimeError("synthetic parse failure")
+
+    bad = _BoomDict()
+    with caplog.at_level(logging.DEBUG, logger="polymarket_arb.market_scanner"):
+        _safe_parse_market(bad, context="ctx")
+        _safe_parse_market(bad, context="ctx")
+        _safe_parse_market(bad, context="ctx")
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "c-repeat" in r.getMessage()]
+    debugs = [r for r in caplog.records if r.levelno == logging.DEBUG and "c-repeat" in r.getMessage()]
+    assert len(warnings) == 1
+    assert len(debugs) == 2
 
 
 def test_normalize_text_repairs_common_mojibake_and_whitespace():
