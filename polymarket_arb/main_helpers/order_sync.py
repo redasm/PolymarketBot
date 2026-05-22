@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Callable
 
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.event_recorder import EventRecorder
 from polymarket_arb.execution_engine import ExecutionEngine
 from polymarket_arb.main_helpers.maker_fill_notifications import handle_observed_maker_fills
 from polymarket_arb.main_helpers.signal_helpers import apply_maker_fill_to_inventory
+from polymarket_arb.models import TradeRecord
 from polymarket_arb.notifier import NotificationManager
 from polymarket_arb.risk_manager import RiskManager
 from polymarket_arb.strategies.maker_strategy import MakerStrategy
@@ -42,6 +44,7 @@ def sync_live_order_statuses(
     event_recorder: EventRecorder,
     notifier: NotificationManager | None = None,
     orchestrator: StrategyOrchestrator | None = None,
+    on_observed_maker_fill: Callable[[TradeRecord, float], None] | None = None,
 ) -> None:
     """Poll the venue for pending order statuses and apply fills.
 
@@ -80,6 +83,7 @@ def sync_live_order_statuses(
                 event_name="live_maker_fill_observed",
                 apply_inventory=False,
                 inventory_deltas=inventory_deltas,
+                on_observed=on_observed_maker_fill,
             )
         if event_recorder.is_enabled and order_sync.changed:
             for trade in order_sync.changed:

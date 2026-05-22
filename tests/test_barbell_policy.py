@@ -64,6 +64,8 @@ def test_policy_non_tail_signal_uses_data_driven_bucket():
 
 
 def test_orchestrator_disabled_barbell_does_not_relax_high_tail_discount():
+    """high_tail is now vetoed regardless of barbell — covers regression
+    where geopolitical maker quotes blew the per-market exposure cap."""
     orchestrator = StrategyOrchestrator(
         total_bankroll=1000,
         barbell_policy=BarbellPolicy(enabled=False, tail_budget_usdc=100.0),
@@ -77,16 +79,14 @@ def test_orchestrator_disabled_barbell_does_not_relax_high_tail_discount():
         confidence=0.70,
         recommended_size_usdc=100.0,
     )
-    orchestrator.submit_signal(signal, active_markets=[_market()])
-    ready = orchestrator.process_signals()
-    # Without barbell relaxation, the tail_risk rule discounts to 50.
-    assert ready[0].recommended_size_usdc == 50.0
-    barbell = ready[0].payload["barbell"]
-    assert barbell["enabled"] is False
-    assert barbell["applied"] is False
+    accepted = orchestrator.submit_signal(signal, active_markets=[_market()])
+    assert accepted is False
+    assert orchestrator.process_signals() == []
 
 
-def test_orchestrator_enabled_barbell_relaxes_high_tail_discount_when_bucket_empty():
+def test_orchestrator_enabled_barbell_does_not_override_high_tail_veto():
+    """Veto preempts barbell — the relaxation pool can no longer rescue
+    a geopolitical / war headline signal."""
     orchestrator = StrategyOrchestrator(
         total_bankroll=1000,
         barbell_policy=BarbellPolicy(
@@ -102,17 +102,16 @@ def test_orchestrator_enabled_barbell_relaxes_high_tail_discount_when_bucket_emp
         confidence=0.70,
         recommended_size_usdc=100.0,
     )
-    orchestrator.submit_signal(signal, active_markets=[_market()])
-    ready = orchestrator.process_signals()
-    # Barbell relaxes to 0.85 against ORIGINAL size: 100 * 0.85 = 85
-    assert ready[0].recommended_size_usdc == 85.0
-    barbell = ready[0].payload["barbell"]
-    assert barbell["applied"] is True
-    assert barbell["bucket"] == "tail"
-    assert barbell["multiplier_override"] == 0.85
+    accepted = orchestrator.submit_signal(signal, active_markets=[_market()])
+    assert accepted is False
+    assert orchestrator.process_signals() == []
+    status = orchestrator.get_status()
+    assert status["meta"]["tail_risk"]["vetoed"] == 1
 
 
-def test_orchestrator_tail_bucket_fills_and_subsequent_signals_use_harsh_discount():
+def test_orchestrator_tail_bucket_no_longer_books_vetoed_signals():
+    """After veto, the tail bucket should not accumulate exposure for
+    high_tail signals — they never reach the booking step."""
     orchestrator = StrategyOrchestrator(
         total_bankroll=1000,
         barbell_policy=BarbellPolicy(
@@ -133,28 +132,18 @@ def test_orchestrator_tail_bucket_fills_and_subsequent_signals_use_harsh_discoun
 
     cid_a = "cond-aaaaaaaaaaaaaaaa"
     cid_b = "cond-bbbbbbbbbbbbbbbb"
-    # First signal — tail bucket empty → relaxed (×0.85 → 85)
-    s1 = make_signal(cid_a)
-    orchestrator.submit_signal(s1, active_markets=[_market(cid_a)])
-    # Booked 85 against tail bucket. Next signal of size 100 → projected
-    # 185 > budget 100 → no relaxation → harsh rule discount 0.5 applies.
-    s2 = make_signal(cid_b)
-    orchestrator.submit_signal(s2, active_markets=[_market(cid_b)])
-    ready = orchestrator.process_signals()
-
-    sizes = {sig.market_id: sig.recommended_size_usdc for sig in ready}
-    assert sizes[cid_a] == 85.0
-    assert sizes[cid_b] == 50.0  # fell back to TailRiskRule's 0.5
+    assert orchestrator.submit_signal(make_signal(cid_a), active_markets=[_market(cid_a)]) is False
+    assert orchestrator.submit_signal(make_signal(cid_b), active_markets=[_market(cid_b)]) is False
+    assert orchestrator.process_signals() == []
 
     status = orchestrator.get_status()
     barbell_meta = status["meta"]["barbell"]
-    assert barbell_meta["enabled"] is True
-    assert barbell_meta["tail_budget_usdc"] == 100.0
-    # Tail bucket should be loaded with at least the first signal's 85.
-    assert barbell_meta["exposure_usdc"]["tail"] >= 85.0
+    assert barbell_meta["exposure_usdc"]["tail"] == 0.0
 
 
-def test_orchestrator_barbell_skipped_for_non_t2_tier():
+def test_orchestrator_barbell_irrelevant_after_t3_maker_veto():
+    """T3 maker on geopolitical text is vetoed by tail_risk — barbell
+    never sees the signal."""
     orchestrator = StrategyOrchestrator(
         total_bankroll=1000,
         barbell_policy=BarbellPolicy(enabled=True, tail_budget_usdc=100.0),
@@ -168,8 +157,6 @@ def test_orchestrator_barbell_skipped_for_non_t2_tier():
         confidence=0.70,
         recommended_size_usdc=100.0,
     )
-    orchestrator.submit_signal(signal, active_markets=[_market()])
-    ready = orchestrator.process_signals()
-    barbell = ready[0].payload["barbell"]
-    assert barbell["applied"] is False
-    assert barbell["bucket"] == "not_applicable"
+    accepted = orchestrator.submit_signal(signal, active_markets=[_market()])
+    assert accepted is False
+    assert orchestrator.process_signals() == []

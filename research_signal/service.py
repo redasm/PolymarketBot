@@ -14,9 +14,7 @@ from polymarket_arb.models import MarketInfo, ResearchSignal, ResearchSignalRepo
 from research_signal.collectors.base import (
     GenericHTTPJSONCollector,
     GenericRSSCollector,
-    LocalKnowledgeBaseCollector,
     PolymarketEventCollector,
-    SurfSignalCollector,
     WebSearchCollector,
 )
 from research_signal.collectors.crypto_macro import CryptoMacroCollector
@@ -33,17 +31,8 @@ class ResearchSignalService:
         max_items: int = 5,
         cache_ttl_sec: int = 300,
         cache_dir: str = "data/research_signal",
-        extra_rss_feeds: list[tuple[str, str]] | None = None,
+        feeds_file: str | None = None,
         http_json_sources: list[dict] | None = None,
-        surf_enabled: bool = False,
-        surf_api_key: str = "",
-        surf_api_base: str = "https://api.asksurf.ai/surf-ai",
-        surf_model: str = "surf-1.5-instant",
-        surf_timeout_sec: float = 8.0,
-        surf_cache_ttl_sec: float = 1800.0,
-        knowledge_base_dir: str | None = None,
-        knowledge_base_enabled: bool = False,
-        knowledge_max_matches: int = 3,
         crypto_macro_enabled: bool = False,
     ):
         self._max_items = max_items
@@ -51,27 +40,10 @@ class ResearchSignalService:
         self._cache_dir = Path(cache_dir)
         self._event_collector = PolymarketEventCollector()
         self._web_collector = WebSearchCollector()
-        self._generic_rss_collector = GenericRSSCollector(extra_rss_feeds or [])
+        self._feeds_file = Path(feeds_file).resolve() if feeds_file else None
+        self._feeds_mtime: float = 0.0
+        self._generic_rss_collector = GenericRSSCollector(self._load_feeds_from_file())
         self._http_json_collector = GenericHTTPJSONCollector(http_json_sources or [])
-        self._surf_collector = SurfSignalCollector(
-            enabled=surf_enabled,
-            api_key=surf_api_key,
-            api_base=surf_api_base,
-            model=surf_model,
-            timeout_sec=surf_timeout_sec,
-            cache_ttl_sec=surf_cache_ttl_sec,
-        )
-        if surf_enabled:
-            LOG.info(
-                "Surf collector enabled for research signals: model=%s ttl=%.0fs; first cache miss may add latency to report collection",
-                surf_model,
-                surf_cache_ttl_sec,
-            )
-        self._knowledge_base_collector = (
-            LocalKnowledgeBaseCollector(knowledge_base_dir or "", max_matches_per_topic=knowledge_max_matches)
-            if knowledge_base_enabled and knowledge_base_dir
-            else None
-        )
         self._crypto_macro_collector = CryptoMacroCollector(enabled=crypto_macro_enabled)
         if crypto_macro_enabled:
             LOG.info(
@@ -103,13 +75,11 @@ class ResearchSignalService:
             return self._clone_report(disk_cached, cache_hit=True)
 
         topics = [market.question for market in markets[: self._max_items]]
+        self._maybe_reload_feeds()
         collected_rows = self._event_collector.collect(markets)
         collected_rows.extend(self._web_collector.collect(topics))
         collected_rows.extend(self._generic_rss_collector.collect(topics))
         collected_rows.extend(self._http_json_collector.collect(topics))
-        collected_rows.extend(self._surf_collector.collect(topics))
-        if self._knowledge_base_collector is not None:
-            collected_rows.extend(self._knowledge_base_collector.collect(topics))
         collected_rows.extend(self._crypto_macro_collector.collect(topics))
 
         prepared_rows, dropped_rows = self._prepare_rows(collected_rows, window_sec=window_sec, now=now)
@@ -140,6 +110,42 @@ class ResearchSignalService:
             ]
             market.raw["research_signals"] = matched[:3]
         return markets
+
+    def _load_feeds_from_file(self) -> list[tuple[str, str]]:
+        if self._feeds_file is None or not self._feeds_file.exists():
+            self._feeds_mtime = 0.0
+            return []
+        try:
+            mtime = self._feeds_file.stat().st_mtime
+            payload = json.loads(self._feeds_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            LOG.warning("research feeds file 解析失败 path=%s err=%s", self._feeds_file, e)
+            return []
+        self._feeds_mtime = mtime
+        rows = payload.get("feeds", []) if isinstance(payload, dict) else []
+        feeds: list[tuple[str, str]] = []
+        for idx, row in enumerate(rows if isinstance(rows, list) else [], start=1):
+            if not isinstance(row, dict):
+                continue
+            template = str(row.get("url_template") or row.get("url") or "").strip()
+            if not template or "{query}" not in template:
+                continue
+            name = str(row.get("name") or "").strip() or f"llm_feed_{idx}"
+            feeds.append((name, template))
+        return feeds
+
+    def _maybe_reload_feeds(self) -> None:
+        if self._feeds_file is None:
+            return
+        try:
+            mtime = self._feeds_file.stat().st_mtime if self._feeds_file.exists() else 0.0
+        except OSError:
+            return
+        if mtime == self._feeds_mtime:
+            return
+        feeds = self._load_feeds_from_file()
+        self._generic_rss_collector = GenericRSSCollector(feeds)
+        LOG.info("research feeds reloaded: count=%d path=%s", len(feeds), self._feeds_file)
 
     def _cache_path(self, cache_key: tuple[tuple[str, ...], int]) -> Path:
         topics, window_sec = cache_key

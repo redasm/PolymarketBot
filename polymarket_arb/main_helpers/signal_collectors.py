@@ -359,13 +359,23 @@ def collect_statistical_strategy_signals(
     skip_reasons: dict[str, int] = {}
     skip_by_market: dict[str, dict[str, Any]] = {}
     related_market_context = build_t2_related_market_context(candidate_markets, ob_analyzer)
+    # Pre-fix: hard-coded 90d cap dropped 105/200 markets per cycle on the
+    # 2026-05-22 shadow run (long-dated geopolitical / election markets).
+    # Made configurable so operators can relax during shadow data
+    # collection without sacrificing the live-mode guard.
+    horizon_max_days = max(0.0, float(getattr(config, "t2_max_horizon_days", 90.0)))
+    # Cap signals per cycle so we don't generate 100+ T2 signals just to
+    # have 80+ skipped by `tier_budget_below_min_order` in the orchestrator.
+    # Top-K by expected_edge keeps the strongest while preserving the
+    # rate-cap and dedup behaviour for the rest. 0 = no cap.
+    max_signals_per_cycle = max(0, int(getattr(config, "t2_max_signals_per_cycle", 30)))
     for market in candidate_markets:
         if len(market.tokens) != 2 or market.closed or not market.active:
             _record_skip(skip_reasons, skip_by_market, market.condition_id, "non_binary_or_inactive")
             continue
         horizon_days = _market_horizon_days(market)
-        if horizon_days is not None and horizon_days > 90.0:
-            _record_skip(skip_reasons, skip_by_market, market.condition_id, "horizon_gt_90d", horizon_days=horizon_days)
+        if horizon_max_days > 0 and horizon_days is not None and horizon_days > horizon_max_days:
+            _record_skip(skip_reasons, skip_by_market, market.condition_id, "horizon_gt_max", horizon_days=horizon_days)
             continue
 
         yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
@@ -424,6 +434,11 @@ def collect_statistical_strategy_signals(
                 },
             )
         )
+    if max_signals_per_cycle > 0 and len(signals) > max_signals_per_cycle:
+        signals.sort(key=lambda s: float(s.expected_edge), reverse=True)
+        dropped = len(signals) - max_signals_per_cycle
+        skip_reasons["per_cycle_signal_cap"] = skip_reasons.get("per_cycle_signal_cap", 0) + dropped
+        signals = signals[:max_signals_per_cycle]
     collect_statistical_strategy_signals.last_skip_summary = {
         "total": sum(skip_reasons.values()),
         "reasons": dict(skip_reasons),

@@ -88,38 +88,14 @@ def log_startup_summary(config: ArbConfig, run_id: str) -> None:
         config.portfolio_sync_interval_sec,
     )
     LOG.info(
-        "策略: maker=%s | 研究: research=%s knowledge=%s | LLM配置: provider=%s model=%s",
+        "策略: maker=%s | 研究: research=%s feeds_file=%s | LLM配置: provider=%s model=%s",
         config.maker_strategy_enabled,
         config.research_signal_enabled,
-        config.research_signal_knowledge_enabled,
+        config.research_signal_feeds_file,
         config.ai_provider,
         config.ai_model,
     )
     LOG.info("=" * 60)
-
-
-def parse_extra_rss_feeds(raw: str) -> list[tuple[str, str]]:
-    """Parse `RESEARCH_SIGNAL_EXTRA_RSS_FEEDS` into `(name, template)` pairs.
-
-    Supports two encodings within a comma-separated list:
-    - `name=https://example.com/rss` (explicit name)
-    - `https://example.com/rss`      (auto-name `rss_feed_<idx>`)
-    """
-    feeds: list[tuple[str, str]] = []
-    for idx, item in enumerate(raw.split(","), start=1):
-        item = item.strip()
-        if not item:
-            continue
-        if "=" in item:
-            name, template = item.split("=", 1)
-            name = name.strip() or f"rss_feed_{idx}"
-        else:
-            name, template = f"rss_feed_{idx}", item
-        template = template.strip()
-        if not template:
-            continue
-        feeds.append((name, template))
-    return feeds
 
 
 def parse_http_json_sources(raw: str) -> list[dict]:
@@ -166,17 +142,8 @@ def create_research_signal_service(config: ArbConfig) -> Optional["ResearchSigna
             max_items=config.research_signal_max_items,
             cache_ttl_sec=config.research_signal_cache_ttl_sec,
             cache_dir=config.research_signal_cache_dir,
-            extra_rss_feeds=parse_extra_rss_feeds(config.research_signal_extra_rss_feeds),
+            feeds_file=config.research_signal_feeds_file,
             http_json_sources=parse_http_json_sources(config.research_signal_http_json_sources),
-            surf_enabled=config.research_signal_surf_enabled,
-            surf_api_key=config.research_signal_surf_api_key,
-            surf_api_base=config.research_signal_surf_api_base,
-            surf_model=config.research_signal_surf_model,
-            surf_timeout_sec=config.research_signal_surf_timeout_sec,
-            surf_cache_ttl_sec=config.research_signal_surf_cache_ttl_sec,
-            knowledge_base_dir=config.research_signal_knowledge_dir,
-            knowledge_base_enabled=config.research_signal_knowledge_enabled,
-            knowledge_max_matches=config.research_signal_knowledge_max_matches,
             crypto_macro_enabled=config.research_signal_crypto_macro_enabled,
         )
     except Exception as e:

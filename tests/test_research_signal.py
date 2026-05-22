@@ -1,5 +1,6 @@
 """Research signal subsystem tests."""
 
+import json
 from pathlib import Path
 
 import requests
@@ -10,8 +11,6 @@ from research_signal.service import ResearchSignalService
 from research_signal.collectors.base import (
     GenericHTTPJSONCollector,
     GenericRSSCollector,
-    LocalKnowledgeBaseCollector,
-    SurfSignalCollector,
     WebSearchCollector,
 )
 from research_signal.scorers.scoring import compute_confidence
@@ -151,90 +150,94 @@ def test_generic_http_json_collector_parses_custom_api(monkeypatch):
     assert rows[0]["published_ts"] is not None
 
 
-def test_surf_signal_collector_parses_chat_completion(monkeypatch):
-    class _Resp:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": "BTC sentiment remains constructive as flows and derivatives positioning stay supportive."
-                        }
-                    }
-                ]
+def test_research_signal_service_reloads_feeds_when_file_changes(tmp_path: Path, monkeypatch):
+    feeds_file = tmp_path / "feeds.json"
+    feeds_file.write_text(
+        json.dumps(
+            {
+                "generated_at": 1.0,
+                "feeds": [{"name": "alpha", "url_template": "https://alpha.example/rss?q={query}"}],
             }
-
-    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: _Resp())
-    collector = SurfSignalCollector(
-        enabled=True,
-        api_key="surf-key",
-        api_base="https://api.asksurf.ai/surf-ai",
-        model="surf-1.5-instant",
-        timeout_sec=5.0,
-    )
-
-    rows = collector.collect(["Will BTC go up this week?"])
-
-    assert len(rows) == 1
-    assert rows[0]["source"] == "surf_ai"
-    assert "BTC" in rows[0]["summary"]
-
-
-def test_surf_signal_collector_uses_cache(monkeypatch):
-    call_count = {"n": 0}
-
-    class _Resp:
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            call_count["n"] += 1
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": "BTC intelligence summary"
-                        }
-                    }
-                ]
-            }
-
-    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: _Resp())
-    collector = SurfSignalCollector(
-        enabled=True,
-        api_key="surf-key",
-        cache_ttl_sec=1800,
-    )
-
-    first = collector.collect(["Will BTC go up this week?"])
-    second = collector.collect(["Will BTC go up this week?"])
-
-    assert len(first) == 1
-    assert len(second) == 1
-    assert call_count["n"] == 1
-
-
-def test_local_knowledge_base_collector_matches_topic(tmp_path: Path):
-    knowledge_dir = tmp_path / "knowledge"
-    knowledge_dir.mkdir()
-    (knowledge_dir / "btc.jsonl").write_text(
-        (
-            '{"topic":"BTC ETF approval odds","summary":"ETF approval usually boosts BTC sentiment",'
-            '"tags":["btc","etf","approval"],"event_id":"e1","source":"local_note","published_ts":1710000000}\n'
-            '{"topic":"Election odds","summary":"Unrelated politics note","tags":["election"]}\n'
         ),
         encoding="utf-8",
     )
 
-    collector = LocalKnowledgeBaseCollector(str(knowledge_dir), max_matches_per_topic=2)
-    rows = collector.collect(["Will BTC ETF approval happen this month?"])
+    captured: dict[str, list[tuple[str, str]]] = {"feeds": []}
 
-    assert len(rows) == 1
-    assert rows[0]["source"] == "local_note"
-    assert rows[0]["event_id"] == "e1"
+    class _StubCollector:
+        def __init__(self, feeds):
+            captured["feeds"] = list(feeds)
+
+        def collect(self, topics):
+            return []
+
+    monkeypatch.setattr("research_signal.service.GenericRSSCollector", _StubCollector)
+
+    service = ResearchSignalService(
+        max_items=2,
+        cache_ttl_sec=300,
+        cache_dir=str(tmp_path / "cache"),
+        feeds_file=str(feeds_file),
+    )
+
+    assert captured["feeds"] == [("alpha", "https://alpha.example/rss?q={query}")]
+
+    feeds_file.write_text(
+        json.dumps(
+            {
+                "generated_at": 2.0,
+                "feeds": [
+                    {"name": "alpha", "url_template": "https://alpha.example/rss?q={query}"},
+                    {"name": "beta", "url_template": "https://beta.example/rss?q={query}"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    import os
+    new_ts = service._feeds_mtime + 5.0
+    os.utime(feeds_file, (new_ts, new_ts))
+
+    service._maybe_reload_feeds()
+
+    assert captured["feeds"] == [
+        ("alpha", "https://alpha.example/rss?q={query}"),
+        ("beta", "https://beta.example/rss?q={query}"),
+    ]
+
+
+def test_research_signal_service_skips_feeds_missing_query_placeholder(tmp_path: Path, monkeypatch):
+    feeds_file = tmp_path / "feeds.json"
+    feeds_file.write_text(
+        json.dumps(
+            {
+                "feeds": [
+                    {"name": "good", "url_template": "https://good.example/rss?q={query}"},
+                    {"name": "bad", "url_template": "https://bad.example/static-rss"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured: dict[str, list[tuple[str, str]]] = {"feeds": []}
+
+    class _StubCollector:
+        def __init__(self, feeds):
+            captured["feeds"] = list(feeds)
+
+        def collect(self, topics):
+            return []
+
+    monkeypatch.setattr("research_signal.service.GenericRSSCollector", _StubCollector)
+
+    ResearchSignalService(
+        max_items=2,
+        cache_ttl_sec=300,
+        cache_dir=str(tmp_path / "cache"),
+        feeds_file=str(feeds_file),
+    )
+
+    assert captured["feeds"] == [("good", "https://good.example/rss?q={query}")]
 
 
 def test_research_signal_service_uses_cache(tmp_path: Path, monkeypatch):
@@ -415,37 +418,6 @@ def test_attach_to_markets_matches_on_topic_overlap():
     enriched = service.attach_to_markets(markets, signals)
 
     assert enriched[0].raw["research_signals"]
-
-
-def test_research_signal_service_includes_local_knowledge_base(tmp_path: Path):
-    knowledge_dir = tmp_path / "knowledge"
-    knowledge_dir.mkdir()
-    (knowledge_dir / "btc.jsonl").write_text(
-        '{"topic":"BTC 100k outlook","summary":"BTC sentiment remains positive","tags":["btc","100k"],"source":"local_knowledge_base"}\n',
-        encoding="utf-8",
-    )
-    markets = [
-        MarketInfo(
-            condition_id="c1",
-            question="Will BTC hit 100k before June?",
-            slug="btc-100k",
-            tokens=[TokenInfo(token_id="t1", outcome="Yes")],
-            event_id="e1",
-        )
-    ]
-
-    service = ResearchSignalService(
-        max_items=5,
-        cache_ttl_sec=300,
-        cache_dir=str(tmp_path / "cache"),
-        knowledge_base_enabled=True,
-        knowledge_base_dir=str(knowledge_dir),
-    )
-    service._web_collector.collect = lambda topics: []
-    report = service.collect_report(markets, 86400)
-
-    assert report.signals
-    assert "local_knowledge_base" in report.source_counts
 
 
 def test_research_signal_signal_metadata_includes_source_profiles(tmp_path: Path):

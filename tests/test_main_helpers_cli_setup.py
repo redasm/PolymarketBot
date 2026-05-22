@@ -21,7 +21,6 @@ from polymarket_arb.main_helpers.cli_setup import (
     create_research_signal_service,
     load_last_backtest_report,
     log_startup_summary,
-    parse_extra_rss_feeds,
     parse_http_json_sources,
     round_timing,
 )
@@ -46,22 +45,6 @@ def test_round_timing_clamps_negative_and_rounds():
     assert round_timing(0.123456789) == 0.1235
     assert round_timing(None) == 0.0  # type: ignore[arg-type]
     assert round_timing(0.0) == 0.0
-
-
-def test_parse_extra_rss_feeds_handles_named_and_unnamed_entries():
-    raw = "feed_a=https://a.example/rss, https://b.example/rss ,=https://c.example/rss"
-    out = parse_extra_rss_feeds(raw)
-    assert out == [
-        ("feed_a", "https://a.example/rss"),
-        ("rss_feed_2", "https://b.example/rss"),
-        ("rss_feed_3", "https://c.example/rss"),  # blank name -> auto-name
-    ]
-
-
-def test_parse_extra_rss_feeds_drops_blank_templates_and_empty_items():
-    raw = " , name_only=  , real=https://x.example/rss"
-    out = parse_extra_rss_feeds(raw)
-    assert out == [("real", "https://x.example/rss")]
 
 
 def test_parse_http_json_sources_returns_dict_list():

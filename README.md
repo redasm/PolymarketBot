@@ -369,11 +369,20 @@ cp .env.example .env
 python scripts/run_automated_quant_pipeline.py --dotenv-path .env
 ```
 
-这个编排入口不会复制 `.env`，只启动一份 bot 主循环，再启动两个旁路数据进程：
+这个编排入口不会复制 `.env`，只启动一份 bot 主循环，再启动多条旁路数据进程。LLM 不在主循环内同步调用；主循环只热加载旁路原子写入的 JSON，这样不会让外部模型延迟阻塞盘口扫描。
 
 - `bot`: 只读根目录 `.env`；如果是 live 模式，内部 shadow-only lane 会验证未晋级钱包
+- `logical-rules-auto`: 持续从 Gamma 拉同事件候选关系，并用 LLM 严格筛选确定性包含/上界关系，刷新 `logical_constraints.json`
+- `event-baselines-auto`: 持续从 Gamma 拉带时间信息的事件，并用 LLM 估计独立 baseline，刷新 `event_baselines.json`
 - `wallet-scanner`: 持续从 Polymarket Data API 自动发现活跃钱包，刷新 `wallet_observations.json`
+- `wallet-markout-scanner`: 持续从 shadow telemetry 生成钱包 markout 样本
 - `wallet-promoter`: 持续读取 shadow telemetry，只有通过 `min_trades / ROI / 集中度 / 回撤` 的钱包才写入 `wallet_profiles.json`
+
+如果只想启动 bot + 两条 LLM 量化输入旁路，不跑钱包扫描/晋级，可用轻量入口：
+
+```bash
+python run_bot_with_llm_inputs.py --dotenv-path .env
+```
 
 bot 进程读取同一组热加载文件：
 
@@ -547,41 +556,16 @@ python -m research_signal.refresh --limit 10
 - 输出 research signal 聚合报告、来源分布、cache hit 状态
 - 用 `--json` 导出结构化结果，方便后续离线分析
 
-Research layer 也支持两种可选扩展源：
-
-- 额外 RSS feeds：设置 `RESEARCH_SIGNAL_EXTRA_RSS_FEEDS`，格式如 `custom=https://example.com/rss?q={query}`
-- 本地知识库：设置 `RESEARCH_SIGNAL_KNOWLEDGE_ENABLED=true`，并把 `*.jsonl` 放到 `RESEARCH_SIGNAL_KNOWLEDGE_DIR`
-
-本地知识库 JSONL 每行可包含这些字段：
-
-```json
-{
-  "topic": "BTC ETF approval odds",
-  "summary": "ETF approval usually boosts BTC sentiment",
-  "tags": ["btc", "etf", "approval"],
-  "event_id": "1234",
-  "condition_id": "0xabc",
-  "source": "local_knowledge_base",
-  "link": "https://example.com/note",
-  "published_ts": 1710000000
-}
-```
-
-仓库里也放了一个最小示例文件：
-
-- [example_signals.jsonl](e:/AppProject/PolymarketBot/data/research_signal/knowledge/example_signals.jsonl)
-
-把 `RESEARCH_SIGNAL_KNOWLEDGE_ENABLED=true` 打开后，`run_research.py` 和主循环都会自动读取它。
+Research layer 的 RSS feeds 列表由 `research-feeds-auto` worker 全自动维护：worker 周期性扫当前热门 markets，让 LLM 提议相关的 RSS 源（带 `{query}` 占位符），逐个 GET 验证可用后写到 `RESEARCH_SIGNAL_FEEDS_FILE`（默认 `data/quant_inputs/research_feeds.json`）。`run_bot_with_llm_inputs.py` 会把这个 worker 和主循环一起拉起；主循环通过 mtime 热加载该文件，无需重启。
 
 ## Dry-Run 验证清单
 
-建议第一次接通 research 扩展源时，按下面顺序验证：
+建议第一次接通 research 自动化流水线时，按下面顺序验证：
 
 1. 准备 `.env`
    设置 `ARB_DRY_RUN=true`
    设置 `RESEARCH_SIGNAL_ENABLED=true`
-   设置 `RESEARCH_SIGNAL_KNOWLEDGE_ENABLED=true`
-   设置 `RESEARCH_SIGNAL_KNOWLEDGE_DIR=data/research_signal/knowledge`
+   设置 `AI_API_KEY=<provider key>`
 
 2. 单独验证 research 层
 
@@ -593,20 +577,20 @@ python run_research.py --query btc --json
 预期检查点：
 
 - 输出里能看到 `source_counts`
-- `signals` 里出现 `local_knowledge_base`
 - `cache_hit` 在第二次运行时变为 `true`
 
-3. 启动 dry-run 主循环
+3. 一键启动机器人 + LLM workers
 
 ```bash
-python run_arb_bot.py
+python run_bot_with_llm_inputs.py
 ```
 
 预期检查点：
 
 - Dashboard 的 `Research Signals` 卡片里能看到信号数量和摘要
 - `strategy_status.meta.research_overlay` 会开始累计 `applied / boosted / penalized / vetoed`
-- `strategy_status.meta.research_overlay` 会显示 overlay 的聚合效果
+- `data/quant_inputs/research_feeds.json` 在首轮 worker 跑完后被填充
+- `data/quant_inputs/research_feeds_status.json` 显示 `status=ok`
 
 4. 如需验证离线回放
 

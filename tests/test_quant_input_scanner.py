@@ -13,6 +13,7 @@ from polymarket_arb.quant_input_scanner import (
     generate_logical_constraint_candidates,
     promote_wallet_profiles_from_markout_rows,
     select_logical_constraints_with_llm,
+    select_research_feeds_with_llm,
 )
 
 
@@ -444,3 +445,150 @@ def test_build_wallet_markouts_from_shadow_rows_joins_entry_context_to_closed_po
             "close_ts": 1234.0,
         }
     ]
+
+
+class _FakeFeedLLM:
+    def __init__(self, feeds):
+        self._feeds = feeds
+        self.calls = []
+        self.messages = []
+
+    async def chat(self, messages, *, temperature=0.1, json_mode=False, tools=None):
+        self.calls.append({"temperature": temperature, "json_mode": json_mode})
+        self.messages.append(messages)
+        return type("Resp", (), {"content": json.dumps({"feeds": self._feeds})})()
+
+
+class _FakeRSSResp:
+    def __init__(self, body):
+        self.text = body
+
+    def raise_for_status(self):
+        return None
+
+
+class _FakeRSSSession:
+    def __init__(self, body_by_host=None, body_by_query=None):
+        self._body_by_host = body_by_host or {}
+        self._body_by_query = body_by_query or {}
+        self.calls = []
+
+    def get(self, url, timeout=None):
+        self.calls.append((url, timeout))
+        for (host, query), body in self._body_by_query.items():
+            if host in url and query in url:
+                return _FakeRSSResp(body)
+        for host, body in self._body_by_host.items():
+            if host in url:
+                return _FakeRSSResp(body)
+        return _FakeRSSResp("<html><body>not rss</body></html>")
+
+
+def test_select_research_feeds_with_llm_keeps_only_validated_templates():
+    valid_rss = (
+        "<?xml version='1.0'?><rss version='2.0'><channel>"
+        "<item><title>x</title></item></channel></rss>"
+    )
+    session = _FakeRSSSession({"good.example": valid_rss})
+    llm = _FakeFeedLLM(
+        [
+            {"name": "good", "url_template": "https://good.example/rss?q={query}"},
+            {"name": "bad_no_placeholder", "url_template": "https://bad.example/rss"},
+            {"name": "bad_html", "url_template": "https://bad.example/rss?q={query}"},
+        ]
+    )
+
+    feeds = select_research_feeds_with_llm(
+        llm,
+        focus_keywords=["bitcoin"],
+        temperature=0.2,
+        max_feeds=5,
+        http_timeout_sec=1.0,
+        http_session=session,
+    )
+
+    assert feeds == [{"name": "good", "url_template": "https://good.example/rss?q={query}"}]
+    assert llm.calls == [{"temperature": 0.2, "json_mode": True}]
+    assert any("bitcoin" in url for url, _ in session.calls)
+
+
+def test_select_research_feeds_with_llm_caps_at_max_feeds():
+    valid_rss = "<rss><channel><item><title>x</title></item></channel></rss>"
+    session = _FakeRSSSession({"example": valid_rss})
+    llm = _FakeFeedLLM(
+        [
+            {"name": f"feed_{idx}", "url_template": f"https://example.com/{idx}?q={{query}}"}
+            for idx in range(5)
+        ]
+    )
+
+    feeds = select_research_feeds_with_llm(
+        llm,
+        focus_keywords=[],
+        temperature=0.0,
+        max_feeds=2,
+        http_timeout_sec=1.0,
+        http_session=session,
+    )
+
+    assert len(feeds) == 2
+
+
+def test_select_research_feeds_with_llm_accepts_feed_via_non_first_keyword():
+    """A feed that 404s on bitcoin but returns RSS for 'election' must still pass."""
+    valid_rss = "<rss><channel><item><title>x</title></item></channel></rss>"
+    session = _FakeRSSSession(
+        body_by_query={
+            ("politics.example", "election"): valid_rss,
+        }
+    )
+    llm = _FakeFeedLLM(
+        [{"name": "politics_feed", "url_template": "https://politics.example/rss?q={query}"}]
+    )
+
+    feeds = select_research_feeds_with_llm(
+        llm,
+        focus_keywords=["bitcoin", "election", "nfl"],
+        temperature=0.1,
+        max_feeds=5,
+        http_timeout_sec=1.0,
+        http_session=session,
+    )
+
+    assert feeds == [{"name": "politics_feed", "url_template": "https://politics.example/rss?q={query}"}]
+    probed_queries = [url for url, _ in session.calls]
+    assert any("bitcoin" in url for url in probed_queries)
+    assert any("election" in url for url in probed_queries)
+
+
+def test_select_research_feeds_with_llm_passes_keyword_domains_to_prompt():
+    """LLM system prompt must list the actual focus keywords grouped by domain."""
+    valid_rss = "<rss><channel><item><title>x</title></item></channel></rss>"
+    session = _FakeRSSSession({"example.com": valid_rss})
+    llm = _FakeFeedLLM(
+        [{"name": "ok", "url_template": "https://example.com/rss?q={query}"}]
+    )
+
+    select_research_feeds_with_llm(
+        llm,
+        focus_keywords=["bitcoin", "fed", "nfl"],
+        temperature=0.1,
+        max_feeds=3,
+        http_timeout_sec=1.0,
+        http_session=session,
+    )
+
+    assert llm.messages, "LLM should have been called"
+    system_msg = llm.messages[0][0]
+    assert system_msg["role"] == "system"
+    system_text = system_msg["content"]
+    assert "crypto" in system_text and "bitcoin" in system_text
+    assert "macro" in system_text and "fed" in system_text
+    assert "sports" in system_text and "nfl" in system_text
+
+    user_msg = llm.messages[0][1]
+    user_payload = json.loads(user_msg["content"])
+    assert user_payload["focus_keywords"] == ["bitcoin", "fed", "nfl"]
+    assert user_payload["focus_keyword_domains"]["crypto"] == ["bitcoin"]
+    assert user_payload["focus_keyword_domains"]["macro"] == ["fed"]
+    assert user_payload["focus_keyword_domains"]["sports"] == ["nfl"]

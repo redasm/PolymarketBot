@@ -205,6 +205,16 @@ class ArbConfig:
     # default `live_min_net_edge_bps=25` is way too generous for them.
     t2_long_horizon_days: float
     t2_long_horizon_min_net_edge_bps: float
+    # Hard horizon cap for T2 collector. Pre-fix this was a hard-coded
+    # 90d in `collect_statistical_strategy_signals`, which dropped
+    # ~50% of the universe on long-dated election / geopolitical
+    # markets. 0 disables the cap.
+    t2_max_horizon_days: float
+    # Top-K per-cycle cap on T2 signals before the orchestrator's tier
+    # budget step. Without it the collector emits one signal per
+    # candidate market and the orchestrator skips 80+/cycle with
+    # `tier_budget_below_min_order`. 0 = no cap.
+    t2_max_signals_per_cycle: int
     # T2 extreme-price gate: reject directional entries at the tails of
     # [0, 1]. Empirical Polymarket data (Becker 2025, 72M trades) shows
     # BUY YES at price < 0.10 averaged -41% EV (longshot tax); the
@@ -268,6 +278,21 @@ class ArbConfig:
     t3_flow_bias_inventory_weight: float
     t3_flow_state_file: str
 
+    # T3 maker exit policy. Pre-fix, maker fills had NO exit path —
+    # a maker_crossed buy_yes at $0.23 on the Iran market just sat
+    # there bleeding mark-to-market until resolution in 2027. These
+    # mirror the T2 exit triggers but are simpler: no scale-out, no
+    # optimal-stopping, no escalation ladder.
+    #   maker_max_hold_sec: TTL stop (default 6h)
+    #   maker_stop_loss_bps: adverse move vs entry VWAP (default 300)
+    #   maker_take_profit_bps: favorable move captured (default 200)
+    #   maker_exit_eval_interval_sec: per-position cooldown between
+    #     evaluation passes, mirrors T2 (default 30)
+    maker_max_hold_sec: float
+    maker_stop_loss_bps: float
+    maker_take_profit_bps: float
+    maker_exit_eval_interval_sec: float
+
     # Shadow Mode (roadmap §三-阶段 1). Live trading is disabled while
     # `dry_run=True`; the engine instead simulates fills against the
     # cached orderbook and writes `virtual_fills.ndjson` so operators
@@ -329,17 +354,8 @@ class ArbConfig:
     research_signal_max_items: int
     research_signal_cache_ttl_sec: int
     research_signal_cache_dir: str
-    research_signal_extra_rss_feeds: str
     research_signal_http_json_sources: str
-    research_signal_surf_enabled: bool
-    research_signal_surf_api_key: str
-    research_signal_surf_api_base: str
-    research_signal_surf_model: str
-    research_signal_surf_timeout_sec: float
-    research_signal_surf_cache_ttl_sec: float
-    research_signal_knowledge_enabled: bool
-    research_signal_knowledge_dir: str
-    research_signal_knowledge_max_matches: int
+    research_signal_feeds_file: str
     # Crypto macro-sentiment collector (Fear & Greed). Free, no auth.
     # Contributes a single sentiment row per crypto-keyword topic to
     # the research_overlay aggregator. Shadow-equivalent: it just
@@ -537,6 +553,14 @@ class ArbConfig:
             raise ValueError("T2_MAX_HOLD_SEC 不能为负数")
         if self.t2_exit_eval_interval_sec < 0:
             raise ValueError("T2_EXIT_EVAL_INTERVAL_SEC 不能为负数")
+        if self.maker_max_hold_sec < 0:
+            raise ValueError("MAKER_MAX_HOLD_SEC 不能为负数")
+        if self.maker_stop_loss_bps < 0:
+            raise ValueError("MAKER_STOP_LOSS_BPS 不能为负数")
+        if self.maker_take_profit_bps < 0:
+            raise ValueError("MAKER_TAKE_PROFIT_BPS 不能为负数")
+        if self.maker_exit_eval_interval_sec < 0:
+            raise ValueError("MAKER_EXIT_EVAL_INTERVAL_SEC 不能为负数")
         if self.t2_scale_out_tranches < 1:
             raise ValueError("T2_SCALE_OUT_TRANCHES 必须 >= 1")
         if self.t2_stop_loss_dynamic_k < 0:
@@ -551,6 +575,10 @@ class ArbConfig:
             raise ValueError("T2_LONG_HORIZON_DAYS 不能为负数")
         if self.t2_long_horizon_min_net_edge_bps < 0:
             raise ValueError("T2_LONG_HORIZON_MIN_NET_EDGE_BPS 不能为负数")
+        if self.t2_max_horizon_days < 0:
+            raise ValueError("T2_MAX_HORIZON_DAYS 不能为负数")
+        if self.t2_max_signals_per_cycle < 0:
+            raise ValueError("T2_MAX_SIGNALS_PER_CYCLE 不能为负数")
         if not (0.0 <= self.t2_reject_price_below <= 0.5):
             raise ValueError("T2_REJECT_PRICE_BELOW 必须在 [0, 0.5]")
         if not (0.5 <= self.t2_reject_price_above <= 1.0):
@@ -755,6 +783,8 @@ class ArbConfig:
             t2_stop_loss_dynamic_warmup=_env_int("T2_STOP_LOSS_DYNAMIC_WARMUP", 5),
             t2_long_horizon_days=_env_float("T2_LONG_HORIZON_DAYS", 30.0),
             t2_long_horizon_min_net_edge_bps=_env_float("T2_LONG_HORIZON_MIN_NET_EDGE_BPS", 200.0),
+            t2_max_horizon_days=_env_float("T2_MAX_HORIZON_DAYS", 90.0),
+            t2_max_signals_per_cycle=_env_int("T2_MAX_SIGNALS_PER_CYCLE", 30),
             t2_reject_price_below=_env_float("T2_REJECT_PRICE_BELOW", 0.10),
             t2_reject_price_above=_env_float("T2_REJECT_PRICE_ABOVE", 0.90),
             t2_near_efficient_min_net_edge_bps=_env_float(
@@ -801,6 +831,12 @@ class ArbConfig:
                 "T3_FLOW_STATE_FILE",
                 "data/telemetry/flow_state.json",
             ),
+            maker_max_hold_sec=_env_float("MAKER_MAX_HOLD_SEC", 6 * 3600.0),
+            maker_stop_loss_bps=_env_float("MAKER_STOP_LOSS_BPS", 300.0),
+            maker_take_profit_bps=_env_float("MAKER_TAKE_PROFIT_BPS", 200.0),
+            maker_exit_eval_interval_sec=_env_float(
+                "MAKER_EXIT_EVAL_INTERVAL_SEC", 30.0
+            ),
             tick_record_enabled=_env_bool("TICK_RECORD_ENABLED", False),
             tick_record_dir=_env("TICK_RECORD_DIR", "data/ticks"),
             telemetry_record_enabled=_env_bool("TELEMETRY_RECORD_ENABLED", False),
@@ -839,20 +875,11 @@ class ArbConfig:
             research_signal_max_items=_env_int("RESEARCH_SIGNAL_MAX_ITEMS", 5),
             research_signal_cache_ttl_sec=_env_int("RESEARCH_SIGNAL_CACHE_TTL_SEC", 300),
             research_signal_cache_dir=_env("RESEARCH_SIGNAL_CACHE_DIR", "data/research_signal"),
-            research_signal_extra_rss_feeds=_env("RESEARCH_SIGNAL_EXTRA_RSS_FEEDS", ""),
             research_signal_http_json_sources=_env("RESEARCH_SIGNAL_HTTP_JSON_SOURCES", ""),
-            research_signal_surf_enabled=_env_bool("RESEARCH_SIGNAL_SURF_ENABLED", False),
-            research_signal_surf_api_key=_env("RESEARCH_SIGNAL_SURF_API_KEY", ""),
-            research_signal_surf_api_base=_env("RESEARCH_SIGNAL_SURF_API_BASE", "https://api.asksurf.ai/surf-ai"),
-            research_signal_surf_model=_env("RESEARCH_SIGNAL_SURF_MODEL", "surf-1.5-instant"),
-            research_signal_surf_timeout_sec=_env_float("RESEARCH_SIGNAL_SURF_TIMEOUT_SEC", 8.0),
-            research_signal_surf_cache_ttl_sec=_env_float("RESEARCH_SIGNAL_SURF_CACHE_TTL_SEC", 1800.0),
-            research_signal_knowledge_enabled=_env_bool("RESEARCH_SIGNAL_KNOWLEDGE_ENABLED", False),
+            research_signal_feeds_file=_env("RESEARCH_SIGNAL_FEEDS_FILE", "data/quant_inputs/research_feeds.json"),
             research_signal_crypto_macro_enabled=_env_bool(
                 "RESEARCH_SIGNAL_CRYPTO_MACRO_ENABLED", False
             ),
-            research_signal_knowledge_dir=_env("RESEARCH_SIGNAL_KNOWLEDGE_DIR", "data/research_signal/knowledge"),
-            research_signal_knowledge_max_matches=_env_int("RESEARCH_SIGNAL_KNOWLEDGE_MAX_MATCHES", 3),
             backtest_enabled=_env_bool("BACKTEST_ENABLED", False),
             backtest_data_dir=_env("BACKTEST_DATA_DIR", "data/backtest"),
             backtest_default_dataset=_env("BACKTEST_DEFAULT_DATASET", "default"),

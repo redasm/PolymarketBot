@@ -30,6 +30,7 @@ class TailRiskRule:
     size_multiplier: float = 1.0
     confidence_delta: float = 0.0
     reasons: tuple[str, ...] = ()
+    veto: bool = False
 
 
 # Order matters: the first rule whose keywords hit wins. High-tail must come
@@ -39,13 +40,14 @@ DEFAULT_TAIL_RISK_RULES: tuple[TailRiskRule, ...] = (
     TailRiskRule(
         risk_class="high_tail",
         keywords=(
-            "war", "ceasefire", "missile", "invasion", "iran", "israel", "russia", "ukraine",
+            "war", "ceasefire", "missile", "invasion", "invade", "iran", "israel", "russia", "ukraine",
             "china", "taiwan", "geopolit", "hostage", "terror", "coup", "nuclear", "assassination",
             "supreme court", "resign", "death", "fired", "will trump", "will biden",
         ),
-        size_multiplier=0.50,
-        confidence_delta=-0.10,
-        reasons=("tail_risk_high", "kelly_fraction_discount"),
+        size_multiplier=0.0,
+        confidence_delta=-1.0,
+        reasons=("tail_risk_high", "veto_geopolitical_extremistan"),
+        veto=True,
     ),
     TailRiskRule(
         risk_class="medium_tail",
@@ -294,6 +296,7 @@ class TailRiskClassification:
     size_multiplier: float
     confidence_delta: float
     reasons: list[str] = field(default_factory=list)
+    veto: bool = False
 
 
 class TailRiskClassifier:
@@ -316,10 +319,12 @@ class TailRiskClassifier:
                     size_multiplier=rule.size_multiplier,
                     confidence_delta=rule.confidence_delta,
                     reasons=list(rule.reasons),
+                    veto=rule.veto,
                 )
         return TailRiskClassification(
             risk_class=UNKNOWN_TAIL_RISK.risk_class,
             size_multiplier=UNKNOWN_TAIL_RISK.size_multiplier,
             confidence_delta=UNKNOWN_TAIL_RISK.confidence_delta,
             reasons=list(UNKNOWN_TAIL_RISK.reasons),
+            veto=UNKNOWN_TAIL_RISK.veto,
         )

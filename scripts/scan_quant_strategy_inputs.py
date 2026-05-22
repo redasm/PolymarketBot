@@ -32,6 +32,7 @@ from polymarket_arb.quant_input_scanner import (
     promote_wallet_profiles_from_markout_rows,
     select_event_baselines_with_llm,
     select_logical_constraints_with_llm,
+    select_research_feeds_with_llm,
 )
 
 
@@ -113,6 +114,28 @@ def main() -> int:
     p_auto_baselines.add_argument("--min-volume-24h", type=float, default=0.0)
     p_auto_baselines.add_argument("--max-candidates", type=int, default=40)
     p_auto_baselines.add_argument("--min-confidence", type=float, default=0.70)
+
+    p_research_feeds = sub.add_parser(
+        "research-feeds-auto",
+        help="Use configured LLM to propose RSS feed templates and validate them",
+    )
+    p_research_feeds.add_argument("--output", default=None, help="Optional JSON output file; written atomically")
+    p_research_feeds.add_argument("--status-output", default=None, help="Optional JSON worker status file")
+    p_research_feeds.add_argument("--dotenv-path", default=None)
+    p_research_feeds.add_argument("--max-feeds", type=int, default=12)
+    p_research_feeds.add_argument(
+        "--http-timeout-sec",
+        type=float,
+        default=8.0,
+        help="Per-template HTTP probe timeout for validation",
+    )
+    p_research_feeds.add_argument(
+        "--repeat-interval-sec",
+        type=float,
+        default=0.0,
+        help="Repeat the scan with this delay; 0 means run once",
+    )
+    p_research_feeds.add_argument("--repeat-count", type=int, default=1, help="Use 0 to repeat forever")
 
     p_llm_healthcheck = sub.add_parser("llm-healthcheck", help="Send one tiny request to the configured LLM")
     p_llm_healthcheck.add_argument("--dotenv-path", default=None)
@@ -336,6 +359,30 @@ def _build_payload(args) -> Any:
         )
         args._last_baseline_count = len(baselines)
         return baselines
+    if args.kind == "research-feeds-auto":
+        config = ArbConfig.from_env(args.dotenv_path, require_wallet=False)
+        focus_keywords = [
+            keyword.strip()
+            for keyword in str(config.market_focus_keywords or "").split(",")
+            if keyword.strip()
+        ]
+        provider = create_provider(config)
+        args._last_llm_called = True
+        args._last_llm_skip_reason = ""
+        feeds = select_research_feeds_with_llm(
+            provider,
+            focus_keywords=focus_keywords,
+            temperature=config.ai_temperature,
+            max_feeds=args.max_feeds,
+            http_timeout_sec=args.http_timeout_sec,
+        )
+        args._last_feed_count = len(feeds)
+        generated_at = time.time()
+        return {
+            "schema_version": 1,
+            "generated_at": generated_at,
+            "feeds": feeds,
+        }
     if args.kind == "wallet-observations":
         client = DataApiWalletTradeClient(args.data_api_host)
         trades: list[dict[str, Any]] = []
@@ -497,6 +544,9 @@ def _write_status(
     baseline_count = int(getattr(args, "_last_baseline_count", 0) or 0)
     if baseline_count == 0 and getattr(args, "kind", "") == "event-baselines-auto" and isinstance(payload, dict):
         baseline_count = len(payload)
+    feed_count = int(getattr(args, "_last_feed_count", 0) or 0)
+    if feed_count == 0 and getattr(args, "kind", "") == "research-feeds-auto" and isinstance(payload, dict):
+        feed_count = len(payload.get("feeds", []) or [])
     status_payload = {
         "status": status,
         "kind": getattr(args, "kind", ""),
@@ -506,6 +556,7 @@ def _write_status(
         "llm_skip_reason": str(getattr(args, "_last_llm_skip_reason", "") or ""),
         "rule_count": len(rules),
         "baseline_count": baseline_count,
+        "feed_count": feed_count,
         "error": error,
     }
     _write_json_atomically(

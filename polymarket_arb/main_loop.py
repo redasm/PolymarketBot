@@ -68,7 +68,6 @@ from polymarket_arb.main_helpers.cli_setup import (
     create_research_signal_service as _create_research_signal_service,
     load_last_backtest_report as _load_last_backtest_report,
     log_startup_summary as _log_startup_summary,
-    parse_extra_rss_feeds as _parse_extra_rss_feeds,
     parse_http_json_sources as _parse_http_json_sources,
     round_timing as _round_timing,
 )
@@ -154,6 +153,7 @@ from polymarket_arb.risk_manager import RiskManager
 from polymarket_arb.strategies.maker_strategy import DynamicSpreadCalculator, MakerStrategy
 from polymarket_arb.strategies.recent_exit_cooldown import make_recent_exit_cooldown_store
 from polymarket_arb.strategies.t2_exit_manager import T2ExitManager, t2_exit_telemetry
+from polymarket_arb.strategies.t3_maker_exit_manager import T3MakerExitManager
 from polymarket_arb.main_helpers.t2_model_prob import build_t2_model_prob_provider
 from polymarket_arb.strategies.signal_policies import (
     BarbellPolicy,
@@ -315,7 +315,7 @@ def _signal_dedupe_key(signal: StrategySignal) -> tuple[Any, ...]:
 
 
 # Startup / parsing / boot helpers (build_run_instance_id, log_startup_summary,
-# parse_extra_rss_feeds, parse_http_json_sources, create_research_signal_service,
+# parse_http_json_sources, create_research_signal_service,
 # create_cross_platform_scanner, round_timing,
 # load_last_backtest_report) were extracted to
 # `polymarket_arb.main_helpers.cli_setup` and re-imported above under their
@@ -448,7 +448,6 @@ def main(dotenv_path: str | None = None) -> None:
         research_cache_dir=config.research_signal_cache_dir,
         research_cache_retention_days=config.data_research_cache_retention_days,
         research_cache_max_gb=config.data_research_cache_max_gb,
-        research_knowledge_dir=config.research_signal_knowledge_dir,
         backtest_data_dir=config.backtest_data_dir,
         backtest_retention_days=config.data_backtest_retention_days,
         backtest_max_gb=config.data_backtest_max_gb,
@@ -602,6 +601,21 @@ def main(dotenv_path: str | None = None) -> None:
         config.t2_max_hold_sec,
         config.t2_exit_eval_interval_sec,
         config.t2_optimal_stopping_enabled,
+    )
+    t3_maker_exit_manager = T3MakerExitManager(
+        config=config,
+        executor=executor,
+        ob_analyzer=ob_analyzer,
+        risk_manager=risk_mgr,
+        notifier=notifier,
+        orchestrator=orchestrator,
+    )
+    LOG.info(
+        "T3 maker 退出策略: stop_loss=%.0fbps take_profit=%.0fbps max_hold=%.0fs eval=%.0fs",
+        config.maker_stop_loss_bps,
+        config.maker_take_profit_bps,
+        config.maker_max_hold_sec,
+        config.maker_exit_eval_interval_sec,
     )
     research_signal_service: Optional["ResearchSignalService"] = _create_research_signal_service(config)
     research_signal_enabled = bool(config.research_signal_enabled and research_signal_service is not None)
@@ -936,6 +950,19 @@ def main(dotenv_path: str | None = None) -> None:
                 time.sleep(60)
             else:
                 time.sleep(config.scan_interval_sec)
+            wallet_usdc = executor.get_available_collateral_balance(use_cache=True)
+            LOG.info(
+                "钱包余额观测: %s",
+                f"{wallet_usdc:.6f} USDC" if wallet_usdc is not None else "N/A",
+            )
+            notifier.observe_cycle(
+                daily_pnl=risk_mgr.state.daily_pnl,
+                open_positions=risk_mgr.state.open_positions,
+                total_exposure=risk_mgr.state.total_exposure,
+                is_halted=risk_mgr.state.is_halted,
+                halt_reason=risk_mgr.state.halt_reason,
+                wallet_usdc=wallet_usdc,
+            )
             continue
 
         # --- VolEstimator 喂入 mid price ---
@@ -1435,6 +1462,38 @@ def main(dotenv_path: str | None = None) -> None:
         except Exception as exc:
             LOG.warning("T2 退出评估异常: %s", exc)
 
+        # T3 maker exit evaluation: TTL / stop-loss / take-profit.
+        # Pre-fix, maker fills (including maker_crossed taker fills)
+        # had no exit path and rode the position to settlement.
+        try:
+            t3_exit_result = t3_maker_exit_manager.evaluate(active_markets=execution_markets)
+            if t3_exit_result.attempted > 0 and event_recorder.is_enabled:
+                if t3_exit_result.failed and not t3_exit_result.triggered and not t3_exit_result.partial:
+                    t3_exit_status = "exit_failed"
+                elif t3_exit_result.partial and not t3_exit_result.triggered:
+                    t3_exit_status = "partial_exit"
+                elif t3_exit_result.triggered and (t3_exit_result.failed or t3_exit_result.partial):
+                    t3_exit_status = "mixed"
+                else:
+                    t3_exit_status = "exited"
+                event_recorder.write_event(
+                    "strategy_executions",
+                    {
+                        "tier": StrategyTier.MARKET_MAKING.name,
+                        "signal_type": "t3_maker_exit",
+                        "market_id": "",
+                        "status": t3_exit_status,
+                        "trade_count": t3_exit_result.triggered,
+                        "attempted_count": t3_exit_result.attempted,
+                        "partial_count": t3_exit_result.partial,
+                        "failed_count": t3_exit_result.failed,
+                        "open_positions": len(t3_maker_exit_manager.open_positions),
+                        "exit_decisions": t3_exit_result.decisions,
+                    },
+                )
+        except Exception as exc:
+            LOG.warning("T3 maker 退出评估异常: %s", exc)
+
         if shadow_t2_exit_manager is not None:
             try:
                 shadow_exit_result = shadow_t2_exit_manager.evaluate(active_markets=execution_markets)
@@ -1457,6 +1516,14 @@ def main(dotenv_path: str | None = None) -> None:
                 LOG.warning("wallet alpha shadow 退出评估异常: %s", exc)
 
         if not config.dry_run:
+            live_markets_by_cid = {m.condition_id: m for m in execution_markets}
+
+            def _register_live_maker_fill(trade: TradeRecord, _fill_delta: float) -> None:
+                t3_maker_exit_manager.register_fill(
+                    trade=trade,
+                    market=live_markets_by_cid.get(trade.condition_id),
+                )
+
             _sync_live_order_statuses(
                 executor=executor,
                 risk_mgr=risk_mgr,
@@ -1464,6 +1531,7 @@ def main(dotenv_path: str | None = None) -> None:
                 event_recorder=event_recorder,
                 notifier=notifier,
                 orchestrator=orchestrator,
+                on_observed_maker_fill=_register_live_maker_fill,
             )
             _cancel_stale_maker_orders(
                 config=config,
@@ -1482,13 +1550,37 @@ def main(dotenv_path: str | None = None) -> None:
             # token usually had a snapshot fetched earlier in the cycle
             # by scan/signal collection.
             shadow_fill_slots_used = 0
+            # Per-market exposure already booked from prior cycles, used
+            # to enforce RISK_MAX_EXPOSURE_PER_MARKET on shadow fills.
+            # Pre-fix, the guard only checked total position count, so
+            # five $20 fills on the same Iran market booked $100 against
+            # a $25 cap (2026-05-22 run).
+            shadow_market_exposure_base: dict[str, float] = (
+                shadow_lifecycle.exposure_by_market_usdc()
+                if shadow_lifecycle is not None
+                else {}
+            )
+            shadow_market_exposure_cycle: dict[str, float] = {}
 
-            def _shadow_maker_fill_guard(trade: TradeRecord, _fill_size: float, _cross_price: float):
+            def _shadow_maker_fill_guard(trade: TradeRecord, fill_size: float, cross_price: float):
                 nonlocal shadow_fill_slots_used
                 if str(getattr(trade.side, "value", trade.side)).upper() != "BUY":
                     return True, ""
                 if risk_mgr.state.open_positions + shadow_fill_slots_used >= config.max_open_positions:
                     return False, "shadow_open_position_cap"
+                cid = str(getattr(trade, "condition_id", "") or "")
+                notional = float(fill_size) * float(cross_price)
+                if cid:
+                    projected = (
+                        shadow_market_exposure_base.get(cid, 0.0)
+                        + shadow_market_exposure_cycle.get(cid, 0.0)
+                        + notional
+                    )
+                    if projected > config.max_exposure_per_market:
+                        return False, "shadow_per_market_exposure_cap"
+                    shadow_market_exposure_cycle[cid] = (
+                        shadow_market_exposure_cycle.get(cid, 0.0) + notional
+                    )
                 shadow_fill_slots_used += 1
                 return True, ""
 
@@ -1499,6 +1591,14 @@ def main(dotenv_path: str | None = None) -> None:
                 fill_latency_sec=config.shadow_maker_fill_latency_sec,
                 fill_guard=_shadow_maker_fill_guard,
             )
+            shadow_markets_by_cid = {m.condition_id: m for m in execution_markets}
+
+            def _register_shadow_maker_fill(trade: TradeRecord, _fill_delta: float) -> None:
+                t3_maker_exit_manager.register_fill(
+                    trade=trade,
+                    market=shadow_markets_by_cid.get(trade.condition_id),
+                )
+
             observed_maker_fills = _handle_observed_maker_fills(
                 trades=swept_maker_fills,
                 maker_strategy=maker_strategy,
@@ -1506,6 +1606,7 @@ def main(dotenv_path: str | None = None) -> None:
                 event_recorder=event_recorder,
                 simulated=True,
                 event_name="shadow_maker_fill_observed",
+                on_observed=_register_shadow_maker_fill,
             )
             total_simulated_successes += observed_maker_fills
 
@@ -1614,6 +1715,10 @@ def main(dotenv_path: str | None = None) -> None:
             last_telemetry_heartbeat_ts = now_ts
 
         wallet_usdc = executor.get_available_collateral_balance(use_cache=True)
+        LOG.info(
+            "钱包余额观测: %s",
+            f"{wallet_usdc:.6f} USDC" if wallet_usdc is not None else "N/A",
+        )
         notifier.observe_cycle(
             daily_pnl=telemetry_risk_state.daily_pnl,
             open_positions=telemetry_risk_state.open_positions,

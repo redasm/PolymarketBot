@@ -191,6 +191,7 @@ class StrategyOrchestrator:
             "applied": 0,
             "penalized": 0,
             "high_risk": 0,
+            "vetoed": 0,
         }
         # Near-certainty telemetry. `would_apply_*` counts shadow-mode
         # hits where the rule would have fired but did not modify the
@@ -284,6 +285,16 @@ class StrategyOrchestrator:
         )
         signal_copy.payload["tail_risk"] = tail_risk
         self._record_tail_risk(tail_risk)
+        if tail_risk.get("veto"):
+            LOG.info(
+                "策略信号被 tail_risk veto: tier=%s market=%s risk_class=%s reasons=%s",
+                signal_copy.tier,
+                signal_copy.market_id[:12] if signal_copy.market_id else "?",
+                tail_risk.get("risk_class"),
+                tail_risk.get("reasons", []),
+            )
+            self._record_process_skip(signal_copy, "tail_risk_veto")
+            return False
         barbell = self._apply_barbell_adjustment(signal_copy, tail_risk, original_size)
         signal_copy.payload["barbell"] = barbell
         near_certainty = self._apply_near_certainty_adjustment(
@@ -737,14 +748,31 @@ class StrategyOrchestrator:
         active_markets: list[Any],
     ) -> dict[str, Any]:
         action = self._resolve_signal_action(signal)
-        if signal.tier not in {StrategyTier.STATISTICAL_ARB, StrategyTier.CROSS_PLATFORM}:
-            return {"applied": False, "risk_class": "not_applicable", "size_multiplier": 1.0, "reasons": []}
-        if action not in {"BUY_YES", "BUY_NO"}:
-            return {"applied": False, "risk_class": "not_directional", "size_multiplier": 1.0, "reasons": []}
+        # T0 STRUCTURAL_ARB is price-locked (Σask<1-fee). Multi-leg arb's
+        # PnL doesn't depend on which way the underlying resolves, so the
+        # tail-risk overlay is a no-op there.
+        # T3 MARKET_MAKING is INCLUDED here even though it has no
+        # BUY_YES/BUY_NO action — a maker quote on a "Will US invade Iran"
+        # market is exactly the kind of directional, no-fair-value tail
+        # exposure the overlay exists to block. The veto branch (below)
+        # is what stops those quotes from being placed at all.
+        if signal.tier not in {
+            StrategyTier.STATISTICAL_ARB,
+            StrategyTier.CROSS_PLATFORM,
+            StrategyTier.MARKET_MAKING,
+        }:
+            return {"applied": False, "risk_class": "not_applicable", "size_multiplier": 1.0, "reasons": [], "veto": False}
+        # Directional gate applies to T2/T1 only — T3 maker quotes don't
+        # carry an action and we still want to classify them.
+        if signal.tier != StrategyTier.MARKET_MAKING and action not in {"BUY_YES", "BUY_NO"}:
+            return {"applied": False, "risk_class": "not_directional", "size_multiplier": 1.0, "reasons": [], "veto": False}
 
         market = self._find_market(signal.market_id, active_markets)
         text = self._tail_risk_text(signal, market)
         classification = self._tail_risk_classifier.classify(text)
+        # Apply size/confidence haircut even when veto=True so that, if
+        # the caller chose to ignore the veto, the signal would still be
+        # heavily discounted. The caller checks `veto` first.
         signal.recommended_size_usdc = max(0.0, signal.recommended_size_usdc * classification.size_multiplier)
         signal.confidence = max(0.0, min(1.0, signal.confidence + classification.confidence_delta))
         return {
@@ -753,6 +781,7 @@ class StrategyOrchestrator:
             "size_multiplier": round(classification.size_multiplier, 3),
             "confidence_delta": round(classification.confidence_delta, 3),
             "reasons": classification.reasons,
+            "veto": bool(classification.veto),
         }
 
     def _apply_barbell_adjustment(
@@ -968,6 +997,8 @@ class StrategyOrchestrator:
             self._tail_risk_stats["penalized"] += 1
         if tail_risk.get("risk_class") == "high_tail":
             self._tail_risk_stats["high_risk"] += 1
+        if tail_risk.get("veto"):
+            self._tail_risk_stats["vetoed"] = self._tail_risk_stats.get("vetoed", 0) + 1
 
     def _cap_signal_size(self, signal: StrategySignal, original_size: float) -> None:
         if original_size <= 0:

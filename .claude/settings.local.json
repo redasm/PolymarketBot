@@ -63,7 +63,24 @@
       "PowerShell(& .\\\\.venv\\\\Scripts\\\\pip.exe install tzdata 2>&1 | Select-Object -Last 5)",
       "PowerShell(& 'C:\\\\AppProject\\\\PolymarketBot\\\\.venv\\\\Scripts\\\\python.exe' -m pip install tzdata 2>&1 | Select-Object -Last 5)",
       "Bash(.venv/Scripts/python.exe *)",
-      "Bash(git stash *)"
+      "Bash(git stash *)",
+      "Bash(python -m json.tool --no-ensure-ascii)",
+      "Bash(python -c ' *)",
+      "Bash(tail -2000 data/telemetry/2026-05-22.strategy_executions.ndjson)",
+      "Bash(\"/d/Program Files/Python311/python.exe\" -m pytest tests/test_t3_maker_exit_manager.py tests/test_shadow_position_lifecycle_exposure.py -x)",
+      "Bash(python -m pytest tests/test_quant_input_scanner.py tests/test_research_signal.py tests/test_main_helpers_cli_setup.py tests/test_research_cli.py tests/test_data_janitor.py -x --no-header)",
+      "Bash(python *)",
+      "Bash(where py *)",
+      "Bash(D:/Program Files/Python311/python.exe *)",
+      "Bash(\"D:/Program Files/Python311/python.exe\" -m pytest tests/test_data_janitor.py)",
+      "Bash(\"D:/Program Files/Python311/python.exe\" -m pytest tests/test_quant_input_scanner.py tests/test_research_signal.py tests/test_main_helpers_cli_setup.py tests/test_research_cli.py tests/test_data_janitor.py)",
+      "Bash(\"D:/Program Files/Python311/python.exe\" -m pytest)",
+      "Bash(\"D:/Program Files/Python311/python.exe\" -m pytest tests/test_run_bot_with_llm_inputs.py -v)",
+      "Bash(\"D:/Program Files/Python311/python.exe\" -m pytest tests/test_research_signal.py -v)",
+      "Bash(grep *)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(\"D:/Program Files/Python311/python.exe\" -m pytest tests/test_quant_input_scanner.py -x)",
+      "Bash(\"D:/Program Files/Python311/python.exe\" -m pytest --tb=short)"
     ]
   }
 }

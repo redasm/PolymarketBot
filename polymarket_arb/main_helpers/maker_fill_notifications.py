@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from polymarket_arb.event_recorder import EventRecorder
 from polymarket_arb.main_helpers.signal_helpers import apply_maker_fill_to_inventory
@@ -21,6 +21,7 @@ def handle_observed_maker_fills(
     event_name: str,
     apply_inventory: bool = True,
     inventory_deltas: dict[str, float] | None = None,
+    on_observed: Callable[[TradeRecord, float], None] | None = None,
 ) -> int:
     """Apply maker fill deltas, emit telemetry, and send one notification per new fill.
 
@@ -81,5 +82,8 @@ def handle_observed_maker_fills(
                 simulated=simulated,
                 now_ts=trade.timestamp,
             )
+
+        if on_observed is not None:
+            on_observed(trade, fill_delta)
 
     return observed

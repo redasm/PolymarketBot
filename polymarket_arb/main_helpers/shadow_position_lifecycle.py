@@ -93,6 +93,27 @@ class ShadowPositionLifecycle:
                 decision_context=decision_context or {},
             )
 
+    def exposure_by_market_usdc(self) -> dict[str, float]:
+        """Per-market USDC exposure summed across all open lots.
+
+        Used by the shadow-mode maker-fill guard to enforce
+        `RISK_MAX_EXPOSURE_PER_MARKET`. Pre-fix, the guard only
+        checked total open positions, so multiple maker fills on
+        the same condition_id could each book a $20 lot — the
+        2026-05-22 run accumulated 5×$20 on the Iran market while
+        the per-market cap was $25.
+        """
+        out: dict[str, float] = {}
+        for lots in self._lots_by_token.values():
+            for lot in lots:
+                if lot.remaining_size <= 1e-9:
+                    continue
+                cid = str(lot.condition_id or "")
+                if not cid:
+                    continue
+                out[cid] = out.get(cid, 0.0) + lot.remaining_size * lot.open_price
+        return out
+
     def snapshot(self) -> dict[str, Any]:
         unrealized = 0.0
         current_value = 0.0

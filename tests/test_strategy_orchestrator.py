@@ -206,7 +206,7 @@ def test_research_overlay_penalizes_but_does_not_veto_two_row_conflict():
     assert status["meta"]["research_overlay"]["vetoed"] == 0
 
 
-def test_tail_risk_discount_reduces_directional_high_tail_signal():
+def test_tail_risk_vetoes_directional_high_tail_signal():
     orchestrator = StrategyOrchestrator(total_bankroll=1000)
     market = _make_market()
     market.question = "Will there be an Iran Israel ceasefire this week?"
@@ -220,16 +220,42 @@ def test_tail_risk_discount_reduces_directional_high_tail_signal():
         recommended_size_usdc=100.0,
     )
 
-    assert orchestrator.submit_signal(signal, active_markets=[market]) is True
-    ready = orchestrator.process_signals()
-    tail_risk = ready[0].payload["tail_risk"]
+    accepted = orchestrator.submit_signal(signal, active_markets=[market])
     status = orchestrator.get_status()
 
-    assert tail_risk["risk_class"] == "high_tail"
-    assert tail_risk["size_multiplier"] == 0.5
-    assert ready[0].recommended_size_usdc == 50.0
-    assert ready[0].confidence == 0.60
+    assert accepted is False
+    assert orchestrator.process_signals() == []
     assert status["meta"]["tail_risk"]["high_risk"] == 1
+    assert status["meta"]["tail_risk"]["vetoed"] == 1
+
+
+def test_tail_risk_vetoes_maker_quote_on_geopolitical_market():
+    """T3 maker_quote on war/Iran/coup markets is rejected outright.
+
+    Pre-fix: tier filter excluded MARKET_MAKING, so a maker quote on
+    "Will US invade Iran" sailed through with a directional buy_yes
+    fill — exactly the position that blew the per-market exposure cap
+    during the 2026-05-22 shadow run.
+    """
+    orchestrator = StrategyOrchestrator(total_bankroll=1000)
+    market = _make_market()
+    market.question = "Will the U.S. invade Iran before 2027?"
+    signal = StrategySignal(
+        tier=StrategyTier.MARKET_MAKING,
+        signal_type="maker_quote",
+        market_id=market.condition_id[:12],
+        description="maker quote on tail market",
+        expected_edge=80.0,
+        confidence=0.5,
+        recommended_size_usdc=20.0,
+    )
+
+    accepted = orchestrator.submit_signal(signal, active_markets=[market])
+    status = orchestrator.get_status()
+
+    assert accepted is False
+    assert orchestrator.process_signals() == []
+    assert status["meta"]["tail_risk"]["vetoed"] == 1
 
 
 def test_research_overlay_vetoes_only_on_three_row_high_conflict():
