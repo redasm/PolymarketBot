@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import json
 import sys
@@ -113,6 +114,9 @@ def main() -> int:
     p_auto_baselines.add_argument("--max-candidates", type=int, default=40)
     p_auto_baselines.add_argument("--min-confidence", type=float, default=0.70)
 
+    p_llm_healthcheck = sub.add_parser("llm-healthcheck", help="Send one tiny request to the configured LLM")
+    p_llm_healthcheck.add_argument("--dotenv-path", default=None)
+
     p_obs = sub.add_parser("wallet-observations", help="Fetch wallet trades and emit observation JSON")
     p_obs.add_argument("--output", default=None, help="Optional JSON output file; written atomically")
     p_obs.add_argument("--wallet", action="append", required=True, help="Wallet address; repeatable")
@@ -190,6 +194,10 @@ def main() -> int:
     p_auto_promote.add_argument("--repeat-count", type=int, default=1, help="Use 0 to repeat forever")
 
     args = parser.parse_args()
+    if args.kind == "llm-healthcheck":
+        payload = _run_llm_healthcheck(args)
+        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        return 0 if payload.get("ok") else 1
 
     repeat_interval = float(getattr(args, "repeat_interval_sec", 0.0) or 0.0)
     repeat_count = int(getattr(args, "repeat_count", 1) or 0)
@@ -280,6 +288,8 @@ def _build_payload(args) -> Any:
                 json.dumps(candidates, ensure_ascii=False, separators=(",", ":")),
             )
         provider = create_provider(config)
+        args._last_llm_called = bool(candidates)
+        args._last_llm_skip_reason = "" if candidates else "no_candidates"
         rules = select_logical_constraints_with_llm(
             provider,
             candidates,
@@ -315,6 +325,8 @@ def _build_payload(args) -> Any:
                 json.dumps(candidates, ensure_ascii=False, separators=(",", ":")),
             )
         provider = create_provider(config)
+        args._last_llm_called = bool(candidates)
+        args._last_llm_skip_reason = "" if candidates else "no_candidates"
         baselines = select_event_baselines_with_llm(
             provider,
             candidates,
@@ -390,6 +402,65 @@ def _build_payload(args) -> Any:
     )
 
 
+def _run_llm_healthcheck(args) -> dict[str, Any]:
+    config = ArbConfig.from_env(args.dotenv_path, require_wallet=False)
+    provider_name = str(getattr(config, "ai_provider", "") or "")
+    api_base = str(getattr(config, "ai_api_base", "") or "")
+    model = str(getattr(config, "ai_model", "") or "")
+    started = time.monotonic()
+    try:
+        provider = create_provider(config)
+        response = _run_async(
+            _chat_healthcheck_and_close(
+                provider,
+                [
+                    {"role": "system", "content": "Return JSON only. This is a healthcheck."},
+                    {"role": "user", "content": '{"ping":"pong"}'},
+                ],
+            )
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "provider": provider_name,
+            "api_base": api_base,
+            "model": model,
+            "error": str(exc),
+        }
+    latency_ms = round((time.monotonic() - started) * 1000, 1)
+    return {
+        "ok": True,
+        "provider": provider_name,
+        "api_base": api_base,
+        "model": model,
+        "response_model": getattr(response, "model", ""),
+        "input_tokens": int(getattr(response, "input_tokens", 0) or 0),
+        "output_tokens": int(getattr(response, "output_tokens", 0) or 0),
+        "latency_ms": float(getattr(response, "latency_ms", 0.0) or latency_ms),
+        "content_preview": str(getattr(response, "content", "") or "")[:200],
+    }
+
+
+async def _chat_healthcheck_and_close(provider, messages):
+    try:
+        return await provider.chat(messages, temperature=0.0, json_mode=True)
+    finally:
+        client = getattr(provider, "_client", None)
+        close = getattr(client, "close", None) or getattr(client, "aclose", None)
+        if close is not None:
+            result = close()
+            if asyncio.iscoroutine(result):
+                await result
+
+
+def _run_async(awaitable):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(awaitable)
+    raise RuntimeError("Cannot run llm-healthcheck inside an active event loop")
+
+
 def _build_wallet_markouts_from_telemetry(args) -> list[dict[str, Any]]:
     telemetry_dir = Path(args.telemetry_dir)
     virtual_rows: list[dict[str, Any]] = []
@@ -431,6 +502,8 @@ def _write_status(
         "kind": getattr(args, "kind", ""),
         "updated_at": time.time(),
         "candidate_count": int(getattr(args, "_last_candidate_count", 0) or 0),
+        "llm_called": bool(getattr(args, "_last_llm_called", False)),
+        "llm_skip_reason": str(getattr(args, "_last_llm_skip_reason", "") or ""),
         "rule_count": len(rules),
         "baseline_count": baseline_count,
         "error": error,

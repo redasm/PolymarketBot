@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import types
 
 
 def test_scan_quant_strategy_inputs_builds_wallet_profiles_from_markout_file(tmp_path, capsys, monkeypatch) -> None:
@@ -666,6 +667,8 @@ def test_scan_quant_strategy_inputs_logical_rules_auto_fetches_candidates_and_ca
     assert candidates[0]["event_id"] == "event"
     assert status_payload["status"] == "ok"
     assert status_payload["candidate_count"] == len(candidates)
+    assert status_payload["llm_called"] is True
+    assert status_payload["llm_skip_reason"] == ""
     assert status_payload["rule_count"] == 1
     assert rules_payload["rules"] == [
         {
@@ -676,6 +679,124 @@ def test_scan_quant_strategy_inputs_logical_rules_auto_fetches_candidates_and_ca
             "tags": ["llm_selected"],
         }
     ]
+
+
+def test_scan_quant_strategy_inputs_logical_rules_auto_status_reports_no_llm_call_when_no_candidates(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from scripts import scan_quant_strategy_inputs
+
+    class _FakeScanner:
+        def __init__(self, config):
+            self.config = config
+
+        def fetch_active_events(self, *, limit=50):
+            return []
+
+    class _FakeProvider:
+        async def chat(self, messages, *, temperature=0.1, json_mode=False, tools=None):
+            raise AssertionError("LLM should not be called with no candidates")
+
+    status_output = tmp_path / "logical_rules_status.json"
+    monkeypatch.setattr(scan_quant_strategy_inputs, "MarketScanner", _FakeScanner)
+    monkeypatch.setattr(scan_quant_strategy_inputs, "create_provider", lambda _config: _FakeProvider())
+    monkeypatch.setattr(
+        scan_quant_strategy_inputs.ArbConfig,
+        "from_env",
+        lambda dotenv_path=None, require_wallet=False: types.SimpleNamespace(
+            gamma_host="https://gamma-api.polymarket.com",
+            ai_temperature=0.0,
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "scan_quant_strategy_inputs.py",
+            "logical-rules-auto",
+            "--fetch-gamma",
+            "--status-output",
+            str(status_output),
+        ],
+    )
+
+    assert scan_quant_strategy_inputs.main() == 0
+
+    status_payload = json.loads(status_output.read_text(encoding="utf-8"))
+    assert status_payload["status"] == "ok"
+    assert status_payload["candidate_count"] == 0
+    assert status_payload["llm_called"] is False
+    assert status_payload["llm_skip_reason"] == "no_candidates"
+
+
+def test_scan_quant_strategy_inputs_llm_healthcheck_calls_configured_provider(monkeypatch, capsys) -> None:
+    from scripts import scan_quant_strategy_inputs
+
+    class _FakeProvider:
+        async def chat(self, messages, *, temperature=0.1, json_mode=False, tools=None):
+            assert json_mode is True
+            assert messages[-1]["role"] == "user"
+            return types.SimpleNamespace(
+                content='{"ok":true,"message":"pong"}',
+                input_tokens=12,
+                output_tokens=6,
+                model="deepseek-v4-pro",
+                latency_ms=123.4,
+            )
+
+    monkeypatch.setattr(scan_quant_strategy_inputs, "create_provider", lambda _config: _FakeProvider())
+    monkeypatch.setattr(
+        scan_quant_strategy_inputs.ArbConfig,
+        "from_env",
+        lambda dotenv_path=None, require_wallet=False: types.SimpleNamespace(
+            ai_provider="deepseek",
+            ai_api_base="https://api.deepseek.com",
+            ai_model="deepseek-v4-pro",
+            ai_temperature=0.0,
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["scan_quant_strategy_inputs.py", "llm-healthcheck"])
+
+    assert scan_quant_strategy_inputs.main() == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["provider"] == "deepseek"
+    assert payload["api_base"] == "https://api.deepseek.com"
+    assert payload["model"] == "deepseek-v4-pro"
+    assert payload["response_model"] == "deepseek-v4-pro"
+    assert payload["input_tokens"] == 12
+    assert payload["output_tokens"] == 6
+    assert payload["content_preview"] == '{"ok":true,"message":"pong"}'
+
+
+def test_scan_quant_strategy_inputs_llm_healthcheck_reports_failure(monkeypatch, capsys) -> None:
+    from scripts import scan_quant_strategy_inputs
+
+    class _FailingProvider:
+        async def chat(self, messages, *, temperature=0.1, json_mode=False, tools=None):
+            raise RuntimeError("401 Unauthorized")
+
+    monkeypatch.setattr(scan_quant_strategy_inputs, "create_provider", lambda _config: _FailingProvider())
+    monkeypatch.setattr(
+        scan_quant_strategy_inputs.ArbConfig,
+        "from_env",
+        lambda dotenv_path=None, require_wallet=False: types.SimpleNamespace(
+            ai_provider="deepseek",
+            ai_api_base="https://api.deepseek.com",
+            ai_model="deepseek-v4-pro",
+            ai_temperature=0.0,
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["scan_quant_strategy_inputs.py", "llm-healthcheck"])
+
+    assert scan_quant_strategy_inputs.main() == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["provider"] == "deepseek"
+    assert "401 Unauthorized" in payload["error"]
 
 
 def test_scan_quant_strategy_inputs_event_baselines_auto_fetches_candidates_and_calls_llm(
@@ -761,6 +882,8 @@ def test_scan_quant_strategy_inputs_event_baselines_auto_fetches_candidates_and_
     assert candidates[0]["condition_id"] == "candidate"
     assert status["status"] == "ok"
     assert status["candidate_count"] == 1
+    assert status["llm_called"] is True
+    assert status["llm_skip_reason"] == ""
     assert status["baseline_count"] == 1
     assert baselines["candidate"]["baseline_probability"] == 0.58
     assert baselines["candidate"]["confidence"] == 0.82
