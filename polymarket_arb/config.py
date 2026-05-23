@@ -173,6 +173,31 @@ class ArbConfig:
     t2_max_hold_sec: float
     t2_exit_eval_interval_sec: float
     t2_optimal_stopping_enabled: bool
+    # Number of equal tranches to scale out a T2 position over for the
+    # "happy-path" exit triggers (take_profit / optimal_stopping). Each
+    # trigger sells `size_remaining / remaining_tranches`, so over N
+    # triggers the position is fully closed. stop_loss / time_stop /
+    # floor_dump always exit the full remaining size regardless of this
+    # setting. 1 = legacy single-stop behaviour. Kobylanski 2009: d-stop
+    # strictly dominates 1-stop when the model is uncertain, because each
+    # tranche locks in different price realisations of the same exit
+    # decision rule.
+    t2_scale_out_tranches: int
+    # Dynamic (ATR-equivalent) stop-loss. When enabled, the exit
+    # manager tracks a rolling per-position volatility (stdev of log
+    # returns of recent mid prices) and sets `stop_bps = clamp(k *
+    # vol_bps, min, max)`. Disabled by default — the static
+    # T2_STOP_LOSS_BPS is the safe baseline. Direction comes from
+    # HyperLiquid backtest article but the multiplier needs
+    # calibration on Polymarket binary-contract dynamics, which differ
+    # from perpetual futures. Until warm (fewer than
+    # T2_STOP_LOSS_DYNAMIC_WARMUP price observations), the static stop
+    # is used as a safe fallback.
+    t2_stop_loss_dynamic_enabled: bool
+    t2_stop_loss_dynamic_k: float
+    t2_stop_loss_min_bps: float
+    t2_stop_loss_max_bps: float
+    t2_stop_loss_dynamic_warmup: int
     # T2 long-horizon guard: directional bets on markets resolving more than
     # `t2_long_horizon_days` away (or with no end_date at all) require a
     # higher net edge to enter. Long-horizon binary contracts are priced
@@ -180,6 +205,16 @@ class ArbConfig:
     # default `live_min_net_edge_bps=25` is way too generous for them.
     t2_long_horizon_days: float
     t2_long_horizon_min_net_edge_bps: float
+    # Hard horizon cap for T2 collector. Pre-fix this was a hard-coded
+    # 90d in `collect_statistical_strategy_signals`, which dropped
+    # ~50% of the universe on long-dated election / geopolitical
+    # markets. 0 disables the cap.
+    t2_max_horizon_days: float
+    # Top-K per-cycle cap on T2 signals before the orchestrator's tier
+    # budget step. Without it the collector emits one signal per
+    # candidate market and the orchestrator skips 80+/cycle with
+    # `tier_budget_below_min_order`. 0 = no cap.
+    t2_max_signals_per_cycle: int
     # T2 extreme-price gate: reject directional entries at the tails of
     # [0, 1]. Empirical Polymarket data (Becker 2025, 72M trades) shows
     # BUY YES at price < 0.10 averaged -41% EV (longshot tax); the
@@ -192,6 +227,31 @@ class ArbConfig:
     # statistical edge. We demand a much higher net_edge there (default
     # 300 bps, vs 25 bps for the rest).
     t2_near_efficient_min_net_edge_bps: float
+    # Near-certainty rule (Article 4, Taleb / @stacyonchain). Markets
+    # priced 92-98¢ may systematically underprice tail risk. Empirical
+    # verification was blocked on free-tier data availability — see
+    # `scripts/verify_near_certainty_trap.py`. Shipped in SHADOW MODE
+    # by default: the rule computes what it would do on each signal
+    # but does not modify production behaviour. Operators flip
+    # `T2_NEAR_CERTAINTY_SHADOW_MODE=false` once enough live samples
+    # have accumulated for an offline evaluation.
+    t2_near_certainty_shadow_mode: bool
+    t2_near_certainty_high_threshold: float  # default 0.92
+    t2_near_certainty_low_threshold: float   # default 0.08
+    t2_near_certainty_size_multiplier: float  # default 0.60
+    t2_near_certainty_confidence_delta: float  # default -0.08
+    # Barbell pool (Taleb / Article 4). Treat T2 capital as two
+    # sub-buckets: data-driven (default ~80%) and tail (default ~15%,
+    # with the rest as reserve). When enabled, the orchestrator
+    # tracks per-class exposure and *relaxes* the tail_risk_high size
+    # discount (e.g. 0.5 → 0.85) while the tail bucket has room. Once
+    # the bucket is full, the discount snaps back to the harsh rule
+    # default so we don't pile into correlated tail bets. Disabled by
+    # default — operators flip on after observing the `barbell` block
+    # under orchestrator.meta over a few days.
+    t2_barbell_enabled: bool
+    t2_barbell_tail_budget_pct: float       # of T2 allocation; default 0.15
+    t2_barbell_tail_relaxed_multiplier: float  # default 0.85
     # T2 post-exit cooldown (cross-restart). After a successful exit or
     # abandoned-position release, the same market is locked out for
     # this many seconds so the bot does not immediately re-enter the
@@ -217,6 +277,21 @@ class ArbConfig:
     # can't completely cripple one side of the quote.
     t3_flow_bias_inventory_weight: float
     t3_flow_state_file: str
+
+    # T3 maker exit policy. Pre-fix, maker fills had NO exit path —
+    # a maker_crossed buy_yes at $0.23 on the Iran market just sat
+    # there bleeding mark-to-market until resolution in 2027. These
+    # mirror the T2 exit triggers but are simpler: no scale-out, no
+    # optimal-stopping, no escalation ladder.
+    #   maker_max_hold_sec: TTL stop (default 6h)
+    #   maker_stop_loss_bps: adverse move vs entry VWAP (default 300)
+    #   maker_take_profit_bps: favorable move captured (default 200)
+    #   maker_exit_eval_interval_sec: per-position cooldown between
+    #     evaluation passes, mirrors T2 (default 30)
+    maker_max_hold_sec: float
+    maker_stop_loss_bps: float
+    maker_take_profit_bps: float
+    maker_exit_eval_interval_sec: float
 
     # Shadow Mode (roadmap §三-阶段 1). Live trading is disabled while
     # `dry_run=True`; the engine instead simulates fills against the
@@ -266,17 +341,12 @@ class ArbConfig:
     ws_refresh_cycles: int
     ws_vol_feed_interval_sec: float
 
-    # AI 决策引擎
-    ai_enabled: bool
+    # LLM provider settings for offline/scanner tools.
     ai_provider: str
     ai_api_key: str
     ai_api_base: str
     ai_model: str
     ai_temperature: float
-    ai_eval_interval_sec: float
-    ai_max_cost_per_day: float
-    ai_override_risk: bool
-    ai_auto_recover_sec: float
 
     # Research Signal
     research_signal_enabled: bool
@@ -284,17 +354,20 @@ class ArbConfig:
     research_signal_max_items: int
     research_signal_cache_ttl_sec: int
     research_signal_cache_dir: str
-    research_signal_extra_rss_feeds: str
     research_signal_http_json_sources: str
-    research_signal_surf_enabled: bool
-    research_signal_surf_api_key: str
-    research_signal_surf_api_base: str
-    research_signal_surf_model: str
-    research_signal_surf_timeout_sec: float
-    research_signal_surf_cache_ttl_sec: float
-    research_signal_knowledge_enabled: bool
-    research_signal_knowledge_dir: str
-    research_signal_knowledge_max_matches: int
+    research_signal_feeds_file: str
+    # Crypto macro-sentiment collector (Fear & Greed). Free, no auth.
+    # Contributes a single sentiment row per crypto-keyword topic to
+    # the research_overlay aggregator. Shadow-equivalent: it just
+    # feeds the same pipeline as RSS / Surf / knowledge-base rows;
+    # the orchestrator decides what to do with it via its resonance
+    # scoring. Default on (no cost, low risk).
+    research_signal_crypto_macro_enabled: bool
+    research_signal_coingecko_enabled: bool
+    research_signal_funding_rate_enabled: bool
+    research_signal_econ_calendar_enabled: bool
+    research_signal_defillama_enabled: bool
+    research_signal_polymarket_activity_enabled: bool
 
     # Backtest
     backtest_enabled: bool
@@ -302,6 +375,26 @@ class ArbConfig:
     backtest_default_dataset: str
     backtest_slippage_bps: float
     backtest_reports_dir: str
+
+    # New quant strategy gates (default off / inert unless configured)
+    sniper_gate_enabled: bool = False
+    sniper_min_net_edge_bps: float = 500.0
+    sniper_min_confidence: float = 0.75
+    sniper_min_liquidity: float = 0.0
+    sniper_min_volume_24h: float = 0.0
+    sniper_max_correlation_score: float = 0.80
+    logical_constraints_json: str = ""
+    event_baselines_json: str = ""
+    wallet_alpha_profiles_json: str = ""
+    wallet_alpha_observations_json: str = ""
+    logical_constraints_file: str = ""
+    event_baselines_file: str = ""
+    wallet_alpha_profiles_file: str = ""
+    wallet_alpha_observations_file: str = ""
+    wallet_alpha_candidate_shadow_enabled: bool = False
+    wallet_alpha_shadow_validation_enabled: bool = True
+    wallet_alpha_shadow_max_signals_per_cycle: int = 5
+    wallet_alpha_shadow_max_exec_ms_per_cycle: float = 250.0
 
     def __post_init__(self) -> None:
         self.validate()
@@ -376,8 +469,8 @@ class ArbConfig:
             raise ValueError("RISK_MAX_OPEN_POSITIONS 必须大于 0")
         if self.max_exposure_per_market <= 0 or self.max_total_exposure <= 0:
             raise ValueError("风险敞口上限必须大于 0")
-        if self.max_daily_loss < 0 or self.ai_max_cost_per_day < 0:
-            raise ValueError("RISK_MAX_DAILY_LOSS 和 AI_MAX_COST_PER_DAY 不能为负数")
+        if self.max_daily_loss < 0:
+            raise ValueError("RISK_MAX_DAILY_LOSS 不能为负数")
         if self.risk_event_cooldown_sec < 0:
             raise ValueError("RISK_EVENT_COOLDOWN_SEC 不能为负数")
         if self.risk_pending_reservation_ttl_sec < 0:
@@ -465,16 +558,48 @@ class ArbConfig:
             raise ValueError("T2_MAX_HOLD_SEC 不能为负数")
         if self.t2_exit_eval_interval_sec < 0:
             raise ValueError("T2_EXIT_EVAL_INTERVAL_SEC 不能为负数")
+        if self.maker_max_hold_sec < 0:
+            raise ValueError("MAKER_MAX_HOLD_SEC 不能为负数")
+        if self.maker_stop_loss_bps < 0:
+            raise ValueError("MAKER_STOP_LOSS_BPS 不能为负数")
+        if self.maker_take_profit_bps < 0:
+            raise ValueError("MAKER_TAKE_PROFIT_BPS 不能为负数")
+        if self.maker_exit_eval_interval_sec < 0:
+            raise ValueError("MAKER_EXIT_EVAL_INTERVAL_SEC 不能为负数")
+        if self.t2_scale_out_tranches < 1:
+            raise ValueError("T2_SCALE_OUT_TRANCHES 必须 >= 1")
+        if self.t2_stop_loss_dynamic_k < 0:
+            raise ValueError("T2_STOP_LOSS_DYNAMIC_K 不能为负数")
+        if self.t2_stop_loss_min_bps < 0:
+            raise ValueError("T2_STOP_LOSS_MIN_BPS 不能为负数")
+        if self.t2_stop_loss_max_bps < self.t2_stop_loss_min_bps:
+            raise ValueError("T2_STOP_LOSS_MAX_BPS 必须 >= T2_STOP_LOSS_MIN_BPS")
+        if self.t2_stop_loss_dynamic_warmup < 2:
+            raise ValueError("T2_STOP_LOSS_DYNAMIC_WARMUP 必须 >= 2")
         if self.t2_long_horizon_days < 0:
             raise ValueError("T2_LONG_HORIZON_DAYS 不能为负数")
         if self.t2_long_horizon_min_net_edge_bps < 0:
             raise ValueError("T2_LONG_HORIZON_MIN_NET_EDGE_BPS 不能为负数")
+        if self.t2_max_horizon_days < 0:
+            raise ValueError("T2_MAX_HORIZON_DAYS 不能为负数")
+        if self.t2_max_signals_per_cycle < 0:
+            raise ValueError("T2_MAX_SIGNALS_PER_CYCLE 不能为负数")
         if not (0.0 <= self.t2_reject_price_below <= 0.5):
             raise ValueError("T2_REJECT_PRICE_BELOW 必须在 [0, 0.5]")
         if not (0.5 <= self.t2_reject_price_above <= 1.0):
             raise ValueError("T2_REJECT_PRICE_ABOVE 必须在 [0.5, 1.0]")
         if self.t2_near_efficient_min_net_edge_bps < 0:
             raise ValueError("T2_NEAR_EFFICIENT_MIN_NET_EDGE_BPS 不能为负数")
+        if not (0.5 < self.t2_near_certainty_high_threshold <= 1.0):
+            raise ValueError("T2_NEAR_CERTAINTY_HIGH_THRESHOLD 必须在 (0.5, 1.0]")
+        if not (0.0 <= self.t2_near_certainty_low_threshold < 0.5):
+            raise ValueError("T2_NEAR_CERTAINTY_LOW_THRESHOLD 必须在 [0, 0.5)")
+        if not (0.0 < self.t2_near_certainty_size_multiplier <= 1.0):
+            raise ValueError("T2_NEAR_CERTAINTY_SIZE_MULTIPLIER 必须在 (0, 1]")
+        if not (0.0 <= self.t2_barbell_tail_budget_pct <= 1.0):
+            raise ValueError("T2_BARBELL_TAIL_BUDGET_PCT 必须在 [0, 1]")
+        if not (0.0 < self.t2_barbell_tail_relaxed_multiplier <= 1.0):
+            raise ValueError("T2_BARBELL_TAIL_RELAXED_MULTIPLIER 必须在 (0, 1]")
         if self.t2_post_exit_cooldown_sec < 0:
             raise ValueError("T2_POST_EXIT_COOLDOWN_SEC 不能为负数")
         if self.t3_flow_bias_window_sec <= 0:
@@ -487,6 +612,18 @@ class ArbConfig:
             raise ValueError("T3_FLOW_BIAS_INVENTORY_WEIGHT 不能为负数")
         if self.shadow_maker_fill_latency_sec < 0:
             raise ValueError("SHADOW_MAKER_FILL_LATENCY_SEC 不能为负数")
+        if self.sniper_min_net_edge_bps < 0:
+            raise ValueError("SNIPER_MIN_NET_EDGE_BPS 不能为负数")
+        if not 0 <= self.sniper_min_confidence <= 1:
+            raise ValueError("SNIPER_MIN_CONFIDENCE 必须在 [0, 1] 区间")
+        if self.sniper_min_liquidity < 0 or self.sniper_min_volume_24h < 0:
+            raise ValueError("SNIPER_MIN_LIQUIDITY 和 SNIPER_MIN_VOLUME_24H 不能为负数")
+        if not 0 <= self.sniper_max_correlation_score <= 1:
+            raise ValueError("SNIPER_MAX_CORRELATION_SCORE 必须在 [0, 1] 区间")
+        if self.wallet_alpha_shadow_max_signals_per_cycle < 0:
+            raise ValueError("WALLET_ALPHA_SHADOW_MAX_SIGNALS_PER_CYCLE 不能为负数")
+        if self.wallet_alpha_shadow_max_exec_ms_per_cycle < 0:
+            raise ValueError("WALLET_ALPHA_SHADOW_MAX_EXEC_MS_PER_CYCLE 不能为负数")
         if not self.dry_run:
             if not self.live_trading_ack:
                 raise ValueError("实盘前必须设置 LIVE_TRADING_ACK=true")
@@ -507,7 +644,9 @@ class ArbConfig:
         require_wallet: bool = True,
     ) -> ArbConfig:
         """从 .env 文件和环境变量构建配置."""
-        if dotenv_path:
+        if str(dotenv_path or "") == "__ENV_ONLY__":
+            pass
+        elif dotenv_path:
             load_dotenv(dotenv_path, override=True)
         else:
             load_dotenv(override=True)
@@ -631,7 +770,7 @@ class ArbConfig:
             edge_volatility_spike_penalty=_env_float("EDGE_VOLATILITY_SPIKE_PENALTY", 0.7),
             edge_volatility_calm_ratio=_env_float("EDGE_VOLATILITY_CALM_RATIO", 0.8),
             edge_volatility_calm_boost=_env_float("EDGE_VOLATILITY_CALM_BOOST", 1.1),
-            t2_min_deviation=_env_float("T2_MIN_DEVIATION", 0.02),
+            t2_min_deviation=_env_float("T2_MIN_DEVIATION", 0.05),
             t2_max_spread_bps=_env_float("T2_MAX_SPREAD_BPS", 80.0),
             t2_min_top_depth=_env_float("T2_MIN_TOP_DEPTH", 100.0),
             t2_max_complement_error_bps=_env_float("T2_MAX_COMPLEMENT_ERROR_BPS", 150.0),
@@ -641,12 +780,40 @@ class ArbConfig:
             t2_max_hold_sec=_env_float("T2_MAX_HOLD_SEC", 6 * 3600.0),
             t2_exit_eval_interval_sec=_env_float("T2_EXIT_EVAL_INTERVAL_SEC", 30.0),
             t2_optimal_stopping_enabled=_env_bool("T2_OPTIMAL_STOPPING_ENABLED", True),
+            t2_scale_out_tranches=_env_int("T2_SCALE_OUT_TRANCHES", 3),
+            t2_stop_loss_dynamic_enabled=_env_bool("T2_STOP_LOSS_DYNAMIC_ENABLED", False),
+            t2_stop_loss_dynamic_k=_env_float("T2_STOP_LOSS_DYNAMIC_K", 2.0),
+            t2_stop_loss_min_bps=_env_float("T2_STOP_LOSS_MIN_BPS", 100.0),
+            t2_stop_loss_max_bps=_env_float("T2_STOP_LOSS_MAX_BPS", 1000.0),
+            t2_stop_loss_dynamic_warmup=_env_int("T2_STOP_LOSS_DYNAMIC_WARMUP", 5),
             t2_long_horizon_days=_env_float("T2_LONG_HORIZON_DAYS", 30.0),
             t2_long_horizon_min_net_edge_bps=_env_float("T2_LONG_HORIZON_MIN_NET_EDGE_BPS", 200.0),
+            t2_max_horizon_days=_env_float("T2_MAX_HORIZON_DAYS", 90.0),
+            t2_max_signals_per_cycle=_env_int("T2_MAX_SIGNALS_PER_CYCLE", 30),
             t2_reject_price_below=_env_float("T2_REJECT_PRICE_BELOW", 0.10),
             t2_reject_price_above=_env_float("T2_REJECT_PRICE_ABOVE", 0.90),
             t2_near_efficient_min_net_edge_bps=_env_float(
                 "T2_NEAR_EFFICIENT_MIN_NET_EDGE_BPS", 300.0
+            ),
+            t2_near_certainty_shadow_mode=_env_bool(
+                "T2_NEAR_CERTAINTY_SHADOW_MODE", True
+            ),
+            t2_near_certainty_high_threshold=_env_float(
+                "T2_NEAR_CERTAINTY_HIGH_THRESHOLD", 0.92
+            ),
+            t2_near_certainty_low_threshold=_env_float(
+                "T2_NEAR_CERTAINTY_LOW_THRESHOLD", 0.08
+            ),
+            t2_near_certainty_size_multiplier=_env_float(
+                "T2_NEAR_CERTAINTY_SIZE_MULTIPLIER", 0.60
+            ),
+            t2_near_certainty_confidence_delta=_env_float(
+                "T2_NEAR_CERTAINTY_CONFIDENCE_DELTA", -0.08
+            ),
+            t2_barbell_enabled=_env_bool("T2_BARBELL_ENABLED", False),
+            t2_barbell_tail_budget_pct=_env_float("T2_BARBELL_TAIL_BUDGET_PCT", 0.15),
+            t2_barbell_tail_relaxed_multiplier=_env_float(
+                "T2_BARBELL_TAIL_RELAXED_MULTIPLIER", 0.85
             ),
             t2_post_exit_cooldown_sec=_env_float("T2_POST_EXIT_COOLDOWN_SEC", 24 * 3600.0),
             t2_recent_exits_state_file=_env(
@@ -668,6 +835,12 @@ class ArbConfig:
             t3_flow_state_file=_env(
                 "T3_FLOW_STATE_FILE",
                 "data/telemetry/flow_state.json",
+            ),
+            maker_max_hold_sec=_env_float("MAKER_MAX_HOLD_SEC", 6 * 3600.0),
+            maker_stop_loss_bps=_env_float("MAKER_STOP_LOSS_BPS", 300.0),
+            maker_take_profit_bps=_env_float("MAKER_TAKE_PROFIT_BPS", 200.0),
+            maker_exit_eval_interval_sec=_env_float(
+                "MAKER_EXIT_EVAL_INTERVAL_SEC", 30.0
             ),
             tick_record_enabled=_env_bool("TICK_RECORD_ENABLED", False),
             tick_record_dir=_env("TICK_RECORD_DIR", "data/ticks"),
@@ -697,37 +870,65 @@ class ArbConfig:
             ws_max_markets=_env_int("WS_MAX_MARKETS", 20),
             ws_refresh_cycles=_env_int("WS_REFRESH_CYCLES", 200),
             ws_vol_feed_interval_sec=_env_float("WS_VOL_FEED_INTERVAL_SEC", 60.0),
-            ai_enabled=_env_bool("AI_ENABLED", False),
             ai_provider=_env("AI_PROVIDER", "openai"),
             ai_api_key=_env("AI_API_KEY") or _env("OPENAI_API_KEY"),
             ai_api_base=_env("AI_API_BASE"),
             ai_model=_env("AI_MODEL", "gpt-4o"),
             ai_temperature=_env_float("AI_TEMPERATURE", 0.1),
-            ai_eval_interval_sec=_env_float("AI_EVAL_INTERVAL_SEC", 30.0),
-            ai_max_cost_per_day=_env_float("AI_MAX_COST_PER_DAY", 5.0),
-            ai_override_risk=_env_bool("AI_OVERRIDE_RISK", False),
-            ai_auto_recover_sec=_env_float("AI_AUTO_RECOVER_SEC", 1800.0),
             research_signal_enabled=_env_bool("RESEARCH_SIGNAL_ENABLED", False),
             research_signal_window_sec=_env_int("RESEARCH_SIGNAL_WINDOW_SEC", 86400),
             research_signal_max_items=_env_int("RESEARCH_SIGNAL_MAX_ITEMS", 5),
             research_signal_cache_ttl_sec=_env_int("RESEARCH_SIGNAL_CACHE_TTL_SEC", 300),
             research_signal_cache_dir=_env("RESEARCH_SIGNAL_CACHE_DIR", "data/research_signal"),
-            research_signal_extra_rss_feeds=_env("RESEARCH_SIGNAL_EXTRA_RSS_FEEDS", ""),
             research_signal_http_json_sources=_env("RESEARCH_SIGNAL_HTTP_JSON_SOURCES", ""),
-            research_signal_surf_enabled=_env_bool("RESEARCH_SIGNAL_SURF_ENABLED", False),
-            research_signal_surf_api_key=_env("RESEARCH_SIGNAL_SURF_API_KEY", ""),
-            research_signal_surf_api_base=_env("RESEARCH_SIGNAL_SURF_API_BASE", "https://api.asksurf.ai/surf-ai"),
-            research_signal_surf_model=_env("RESEARCH_SIGNAL_SURF_MODEL", "surf-1.5-instant"),
-            research_signal_surf_timeout_sec=_env_float("RESEARCH_SIGNAL_SURF_TIMEOUT_SEC", 8.0),
-            research_signal_surf_cache_ttl_sec=_env_float("RESEARCH_SIGNAL_SURF_CACHE_TTL_SEC", 1800.0),
-            research_signal_knowledge_enabled=_env_bool("RESEARCH_SIGNAL_KNOWLEDGE_ENABLED", False),
-            research_signal_knowledge_dir=_env("RESEARCH_SIGNAL_KNOWLEDGE_DIR", "data/research_signal/knowledge"),
-            research_signal_knowledge_max_matches=_env_int("RESEARCH_SIGNAL_KNOWLEDGE_MAX_MATCHES", 3),
+            research_signal_feeds_file=_env("RESEARCH_SIGNAL_FEEDS_FILE", "data/quant_inputs/research_feeds.json"),
+            research_signal_crypto_macro_enabled=_env_bool(
+                "RESEARCH_SIGNAL_CRYPTO_MACRO_ENABLED", False
+            ),
+            research_signal_coingecko_enabled=_env_bool(
+                "RESEARCH_SIGNAL_COINGECKO_ENABLED", True
+            ),
+            research_signal_funding_rate_enabled=_env_bool(
+                "RESEARCH_SIGNAL_FUNDING_RATE_ENABLED", True
+            ),
+            research_signal_econ_calendar_enabled=_env_bool(
+                "RESEARCH_SIGNAL_ECON_CALENDAR_ENABLED", True
+            ),
+            research_signal_defillama_enabled=_env_bool(
+                "RESEARCH_SIGNAL_DEFILLAMA_ENABLED", True
+            ),
+            research_signal_polymarket_activity_enabled=_env_bool(
+                "RESEARCH_SIGNAL_POLYMARKET_ACTIVITY_ENABLED", True
+            ),
             backtest_enabled=_env_bool("BACKTEST_ENABLED", False),
             backtest_data_dir=_env("BACKTEST_DATA_DIR", "data/backtest"),
             backtest_default_dataset=_env("BACKTEST_DEFAULT_DATASET", "default"),
             backtest_slippage_bps=_env_float("BACKTEST_SLIPPAGE_BPS", 5.0),
             backtest_reports_dir=_env("BACKTEST_REPORTS_DIR", "research/backtest/output"),
+            sniper_gate_enabled=_env_bool("SNIPER_GATE_ENABLED", False),
+            sniper_min_net_edge_bps=_env_float("SNIPER_MIN_NET_EDGE_BPS", 500.0),
+            sniper_min_confidence=_env_float("SNIPER_MIN_CONFIDENCE", 0.75),
+            sniper_min_liquidity=_env_float("SNIPER_MIN_LIQUIDITY", 0.0),
+            sniper_min_volume_24h=_env_float("SNIPER_MIN_VOLUME_24H", 0.0),
+            sniper_max_correlation_score=_env_float("SNIPER_MAX_CORRELATION_SCORE", 0.80),
+            logical_constraints_json=_env("LOGICAL_CONSTRAINTS_JSON", ""),
+            event_baselines_json=_env("EVENT_BASELINES_JSON", ""),
+            wallet_alpha_profiles_json=_env("WALLET_ALPHA_PROFILES_JSON", ""),
+            wallet_alpha_observations_json=_env("WALLET_ALPHA_OBSERVATIONS_JSON", ""),
+            logical_constraints_file=_env("LOGICAL_CONSTRAINTS_FILE", ""),
+            event_baselines_file=_env("EVENT_BASELINES_FILE", ""),
+            wallet_alpha_profiles_file=_env("WALLET_ALPHA_PROFILES_FILE", ""),
+            wallet_alpha_observations_file=_env("WALLET_ALPHA_OBSERVATIONS_FILE", ""),
+            wallet_alpha_candidate_shadow_enabled=_env_bool("WALLET_ALPHA_CANDIDATE_SHADOW_ENABLED", False),
+            wallet_alpha_shadow_validation_enabled=_env_bool("WALLET_ALPHA_SHADOW_VALIDATION_ENABLED", True),
+            wallet_alpha_shadow_max_signals_per_cycle=_env_int(
+                "WALLET_ALPHA_SHADOW_MAX_SIGNALS_PER_CYCLE",
+                5,
+            ),
+            wallet_alpha_shadow_max_exec_ms_per_cycle=_env_float(
+                "WALLET_ALPHA_SHADOW_MAX_EXEC_MS_PER_CYCLE",
+                250.0,
+            ),
         )
 
         LOG.info(

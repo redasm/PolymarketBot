@@ -92,7 +92,131 @@ def _summarize_signals(rows: list[dict[str, Any]]) -> dict[str, Any]:
             {"signal_type": signal_type, "count": count}
             for signal_type, count in by_type.most_common(10)
         ],
+        "quant_strategies": _summarize_quant_strategy_signals(rows),
     }
+
+
+def _summarize_pnl_attribution(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    closed = [
+        row for row in rows
+        if str(row.get("event") or "") in {"position_closed", "position_partially_closed"}
+    ]
+    by_source: dict[str, dict[str, Any]] = {}
+    by_component: dict[str, dict[str, Any]] = {}
+    for row in closed:
+        pnl = _to_float(row.get("realized_pnl"))
+        fees = _to_float(row.get("fees"))
+        context = row.get("decision_context") if isinstance(row.get("decision_context"), dict) else {}
+        source = str(context.get("signal_source") or row.get("signal_source") or "unknown")
+        components = _component_list(context.get("signal_components") or row.get("signal_components"))
+        if not components:
+            components = [source]
+        _add_pnl_bucket(by_source, source, pnl=pnl, fees=fees)
+        for component in components:
+            _add_pnl_bucket(by_component, component, pnl=pnl, fees=fees)
+    return {
+        "closed_positions": len(closed),
+        "realized_pnl": round(sum(_to_float(row.get("realized_pnl")) for row in closed), 6),
+        "fees": round(sum(_to_float(row.get("fees")) for row in closed), 6),
+        "by_source": _finalize_pnl_buckets(by_source),
+        "by_component": _finalize_pnl_buckets(by_component),
+    }
+
+
+def _summarize_strategy_performance(
+    *,
+    signal_rows: list[dict[str, Any]],
+    execution_rows: list[dict[str, Any]],
+    lifecycle_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    by_tier: dict[str, dict[str, Any]] = {}
+    by_category: dict[str, dict[str, Any]] = {}
+    by_signal_type: dict[str, dict[str, Any]] = {}
+
+    for row in signal_rows:
+        tier = _row_tier(row)
+        category = _row_category(row)
+        signal_type = _row_signal_type(row)
+        for bucket_map, key in (
+            (by_tier, tier),
+            (by_category, category),
+            (by_signal_type, signal_type),
+        ):
+            _add_perf_bucket(bucket_map, key, signals=1)
+
+    for row in execution_rows:
+        tier = _row_tier(row)
+        category = _row_category(row)
+        signal_type = _row_signal_type(row)
+        status = str(row.get("status") or "").lower()
+        notional = _execution_notional(row)
+        expected_edge = _execution_expected_edge_usdc(row, notional)
+        executions = 1 if status in {"executed", "simulated", "submitted"} else 0
+        skipped = 1 if status == "skipped" or str(row.get("reason") or "") else 0
+        for bucket_map, key in (
+            (by_tier, tier),
+            (by_category, category),
+            (by_signal_type, signal_type),
+        ):
+            _add_perf_bucket(
+                bucket_map,
+                key,
+                attempts=1,
+                executions=executions,
+                skipped=skipped,
+                notional_usdc=notional,
+                expected_edge_usdc=expected_edge,
+            )
+
+    closed = [
+        row for row in lifecycle_rows
+        if str(row.get("event") or "") in {"position_closed", "position_partially_closed"}
+    ]
+    for row in closed:
+        tier = _row_tier(row)
+        category = _row_category(row)
+        signal_type = _row_signal_type(row)
+        pnl = _to_float(row.get("realized_pnl"))
+        fees = _to_float(row.get("fees"))
+        for bucket_map, key in (
+            (by_tier, tier),
+            (by_category, category),
+            (by_signal_type, signal_type),
+        ):
+            _add_perf_bucket(bucket_map, key, realized_pnl=pnl, fees=fees)
+
+    return {
+        "by_tier": _finalize_perf_buckets(by_tier),
+        "by_category": _finalize_perf_buckets(by_category),
+        "by_signal_type": _finalize_perf_buckets(by_signal_type),
+    }
+
+
+def _summarize_quant_strategy_signals(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    groups = {
+        "logical_constraint": "logical_constraint_",
+        "event_calendar": "event_calendar_",
+        "wallet_alpha": "wallet_alpha_",
+    }
+    out: dict[str, dict[str, Any]] = {}
+    for name, prefix in groups.items():
+        subset = [
+            row for row in rows
+            if str(row.get("signal_type") or "").startswith(prefix)
+        ]
+        if not subset:
+            continue
+        edges = [float(row.get("expected_edge") or 0.0) for row in subset]
+        confidences = [float(row.get("confidence") or 0.0) for row in subset]
+        submitted = sum(1 for row in subset if bool(row.get("submitted", False)))
+        out[name] = {
+            "count": len(subset),
+            "submitted": submitted,
+            "rejected": len(subset) - submitted,
+            "avg_expected_edge_bps": round(sum(edges) / len(edges), 6) if edges else 0.0,
+            "avg_confidence": round(sum(confidences) / len(confidences), 6) if confidences else 0.0,
+        }
+    return out
 
 
 def _summarize_ticks(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -105,6 +229,162 @@ def _summarize_ticks(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "unique_conditions": len(condition_ids),
         "unique_tokens": len(token_ids),
     }
+
+
+def _add_pnl_bucket(bucket_map: dict[str, dict[str, Any]], key: str, *, pnl: float, fees: float) -> None:
+    bucket = bucket_map.setdefault(
+        key or "unknown",
+        {"closed_positions": 0, "wins": 0, "losses": 0, "realized_pnl": 0.0, "fees": 0.0},
+    )
+    bucket["closed_positions"] += 1
+    bucket["wins"] += 1 if pnl > 0 else 0
+    bucket["losses"] += 1 if pnl < 0 else 0
+    bucket["realized_pnl"] += pnl
+    bucket["fees"] += fees
+
+
+def _add_perf_bucket(
+    bucket_map: dict[str, dict[str, Any]],
+    key: str,
+    *,
+    signals: int = 0,
+    attempts: int = 0,
+    executions: int = 0,
+    skipped: int = 0,
+    notional_usdc: float = 0.0,
+    expected_edge_usdc: float = 0.0,
+    realized_pnl: float = 0.0,
+    fees: float = 0.0,
+) -> None:
+    bucket = bucket_map.setdefault(
+        key or "unknown",
+        {
+            "signals": 0,
+            "attempts": 0,
+            "executions": 0,
+            "skipped": 0,
+            "notional_usdc": 0.0,
+            "expected_edge_usdc": 0.0,
+            "realized_pnl": 0.0,
+            "fees": 0.0,
+        },
+    )
+    bucket["signals"] += int(signals)
+    bucket["attempts"] += int(attempts)
+    bucket["executions"] += int(executions)
+    bucket["skipped"] += int(skipped)
+    bucket["notional_usdc"] += float(notional_usdc)
+    bucket["expected_edge_usdc"] += float(expected_edge_usdc)
+    bucket["realized_pnl"] += float(realized_pnl)
+    bucket["fees"] += float(fees)
+
+
+def _finalize_perf_buckets(bucket_map: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for key, bucket in sorted(bucket_map.items()):
+        notional = float(bucket["notional_usdc"])
+        fees = float(bucket["fees"])
+        realized = float(bucket["realized_pnl"])
+        out[key] = {
+            "signals": int(bucket["signals"]),
+            "attempts": int(bucket["attempts"]),
+            "executions": int(bucket["executions"]),
+            "skipped": int(bucket["skipped"]),
+            "notional_usdc": round(notional, 6),
+            "expected_edge_usdc": round(float(bucket["expected_edge_usdc"]), 6),
+            "realized_pnl": round(realized, 6),
+            "fees": round(fees, 6),
+            "net_pnl_after_fees": round(realized - fees, 6),
+            "fee_drag_bps": round(fees / notional * 10_000.0, 6) if notional > 0 else 0.0,
+        }
+    return out
+
+
+def _finalize_pnl_buckets(bucket_map: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for key, bucket in sorted(bucket_map.items()):
+        count = int(bucket["closed_positions"])
+        out[key] = {
+            "closed_positions": count,
+            "wins": int(bucket["wins"]),
+            "losses": int(bucket["losses"]),
+            "win_rate": round(float(bucket["wins"]) / count, 6) if count else 0.0,
+            "realized_pnl": round(float(bucket["realized_pnl"]), 6),
+            "fees": round(float(bucket["fees"]), 6),
+        }
+    return out
+
+
+def _component_list(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    return []
+
+
+def _row_tier(row: dict[str, Any]) -> str:
+    context = row.get("decision_context") if isinstance(row.get("decision_context"), dict) else {}
+    return str(row.get("tier") or context.get("tier") or "UNKNOWN")
+
+
+def _row_category(row: dict[str, Any]) -> str:
+    context = row.get("decision_context") if isinstance(row.get("decision_context"), dict) else {}
+    payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+    execution_check = row.get("execution_check") if isinstance(row.get("execution_check"), dict) else {}
+    return str(
+        row.get("category")
+        or context.get("category")
+        or payload.get("category")
+        or execution_check.get("category")
+        or "unknown"
+    )
+
+
+def _row_signal_type(row: dict[str, Any]) -> str:
+    context = row.get("decision_context") if isinstance(row.get("decision_context"), dict) else {}
+    return str(row.get("signal_type") or context.get("signal_type") or context.get("signal_source") or "unknown")
+
+
+def _execution_notional(row: dict[str, Any]) -> float:
+    for key in ("submitted_notional", "notional_usdc", "requested_notional"):
+        value = _to_float(row.get(key))
+        if value > 0:
+            return value
+    trades = row.get("trades")
+    if isinstance(trades, list):
+        total = 0.0
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+            price = _to_float(trade.get("economic_cost")) or _to_float(trade.get("price")) or _to_float(trade.get("fill_price"))
+            size = _to_float(trade.get("fill_size")) or _to_float(trade.get("size"))
+            total += max(0.0, price * size)
+        if total > 0:
+            return total
+    return 0.0
+
+
+def _execution_expected_edge_usdc(row: dict[str, Any], notional: float) -> float:
+    direct = _to_float(row.get("expected_edge_usdc"))
+    if direct:
+        return direct
+    per_share = _to_float(row.get("expected_edge_per_share"))
+    size = _to_float(row.get("filled_size")) or _to_float(row.get("submitted_size")) or _to_float(row.get("size"))
+    if per_share and size:
+        return per_share * size
+    execution_check = row.get("execution_check") if isinstance(row.get("execution_check"), dict) else {}
+    net_edge_bps = _to_float(execution_check.get("net_edge_bps"))
+    if net_edge_bps and notional:
+        return notional * net_edge_bps / 10_000.0
+    return 0.0
+
+
+def _to_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _build_issues(*, run_mode: str, trade_rows: list[dict[str, Any]]) -> list[str]:
@@ -166,6 +446,8 @@ def summarize_runtime_artifacts(
     opportunity_rows = _load_ndjson_rows(_telemetry_category_paths(telemetry_dir, "opportunities"))
     trade_rows = _load_ndjson_rows(_telemetry_category_paths(telemetry_dir, "trades"))
     signal_rows = _load_ndjson_rows(_telemetry_category_paths(telemetry_dir, "strategy_signals"))
+    execution_rows = _load_ndjson_rows(_telemetry_category_paths(telemetry_dir, "strategy_executions"))
+    lifecycle_rows = _load_ndjson_rows(_telemetry_category_paths(telemetry_dir, "positions_lifecycle"))
     tick_rows = _load_ndjson_rows(list(ticks_dir.glob("*.ndjson")))
 
     run_mode = _detect_run_mode(log_text)
@@ -176,6 +458,12 @@ def summarize_runtime_artifacts(
     opportunities = _summarize_opportunities(opportunity_rows)
     trades = _summarize_trades(trade_rows)
     signals = _summarize_signals(signal_rows)
+    pnl_attribution = _summarize_pnl_attribution(lifecycle_rows)
+    strategy_performance = _summarize_strategy_performance(
+        signal_rows=signal_rows,
+        execution_rows=execution_rows,
+        lifecycle_rows=lifecycle_rows,
+    )
     ticks = _summarize_ticks(tick_rows)
     issues = _build_issues(run_mode=run_mode, trade_rows=trade_rows)
 
@@ -185,6 +473,8 @@ def summarize_runtime_artifacts(
         "opportunities": opportunities,
         "trades": trades,
         "signals": signals,
+        "pnl_attribution": pnl_attribution,
+        "strategy_performance": strategy_performance,
         "ticks": ticks,
         "issues": issues,
     }

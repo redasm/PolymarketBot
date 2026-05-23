@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from polymarket_arb.models import MarketInfo, ResearchSignal, ResearchSignalReport, TokenInfo
+from polymarket_arb.strategies.signal_policies import NearCertaintyClassifier
 from polymarket_arb.strategies.strategy_orchestrator import (
     StrategyOrchestrator,
     StrategySignal,
@@ -45,9 +46,9 @@ def test_research_overlay_boosts_aligned_signal():
     )
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id=market.condition_id[:12],
-        description="LLM sees positive edge",
+        description="Stat arb positive edge",
         expected_edge=80.0,
         confidence=0.60,
         recommended_size_usdc=100.0,
@@ -104,9 +105,9 @@ def test_research_overlay_adds_resonance_for_three_aligned_sources():
     ]
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id=market.condition_id[:12],
-        description="LLM sees positive edge",
+        description="Stat arb positive edge",
         expected_edge=80.0,
         confidence=0.60,
         recommended_size_usdc=100.0,
@@ -120,6 +121,37 @@ def test_research_overlay_adds_resonance_for_three_aligned_sources():
     assert overlay["source_diversity"] == 3
     assert overlay["resonance_score"] >= 0.70
     assert ready[0].recommended_size_usdc > 110.0
+
+
+def test_signal_size_cap_limits_compounded_overlay_boosts():
+    orchestrator = StrategyOrchestrator(total_bankroll=1000, max_signal_size_multiplier=1.05)
+    market = _make_market()
+    market.raw["research_signals"] = [
+        ResearchSignal(
+            topic_id="event:event-1",
+            event_candidates=["event-1"],
+            summary="BTC momentum remains strong",
+            sources=["google_news_rss"],
+            confidence=0.90,
+            freshness_sec=60.0,
+            stance="bullish",
+        ).to_dict(),
+    ]
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="stat_buy_yes",
+        market_id=market.condition_id[:12],
+        description="Stat arb positive edge",
+        expected_edge=80.0,
+        confidence=0.60,
+        recommended_size_usdc=100.0,
+    )
+
+    assert orchestrator.submit_signal(signal, active_markets=[market]) is True
+    ready = orchestrator.process_signals()
+
+    assert ready[0].recommended_size_usdc == 105.0
+    assert ready[0].payload["risk_size_cap"]["max_signal_size_multiplier"] == 1.05
 
 
 def test_research_overlay_penalizes_but_does_not_veto_two_row_conflict():
@@ -148,9 +180,9 @@ def test_research_overlay_penalizes_but_does_not_veto_two_row_conflict():
     market.raw["research_signals"] = conflicting_rows
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id=market.condition_id[:12],
-        description="LLM sees positive edge",
+        description="Stat arb positive edge",
         expected_edge=70.0,
         confidence=0.65,
         recommended_size_usdc=100.0,
@@ -174,13 +206,13 @@ def test_research_overlay_penalizes_but_does_not_veto_two_row_conflict():
     assert status["meta"]["research_overlay"]["vetoed"] == 0
 
 
-def test_tail_risk_discount_reduces_directional_high_tail_signal():
+def test_tail_risk_vetoes_directional_high_tail_signal():
     orchestrator = StrategyOrchestrator(total_bankroll=1000)
     market = _make_market()
     market.question = "Will there be an Iran Israel ceasefire this week?"
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id=market.condition_id[:12],
         description="directional edge",
         expected_edge=90.0,
@@ -188,16 +220,42 @@ def test_tail_risk_discount_reduces_directional_high_tail_signal():
         recommended_size_usdc=100.0,
     )
 
-    assert orchestrator.submit_signal(signal, active_markets=[market]) is True
-    ready = orchestrator.process_signals()
-    tail_risk = ready[0].payload["tail_risk"]
+    accepted = orchestrator.submit_signal(signal, active_markets=[market])
     status = orchestrator.get_status()
 
-    assert tail_risk["risk_class"] == "high_tail"
-    assert tail_risk["size_multiplier"] == 0.5
-    assert ready[0].recommended_size_usdc == 50.0
-    assert ready[0].confidence == 0.60
+    assert accepted is False
+    assert orchestrator.process_signals() == []
     assert status["meta"]["tail_risk"]["high_risk"] == 1
+    assert status["meta"]["tail_risk"]["vetoed"] == 1
+
+
+def test_tail_risk_vetoes_maker_quote_on_geopolitical_market():
+    """T3 maker_quote on war/Iran/coup markets is rejected outright.
+
+    Pre-fix: tier filter excluded MARKET_MAKING, so a maker quote on
+    "Will US invade Iran" sailed through with a directional buy_yes
+    fill — exactly the position that blew the per-market exposure cap
+    during the 2026-05-22 shadow run.
+    """
+    orchestrator = StrategyOrchestrator(total_bankroll=1000)
+    market = _make_market()
+    market.question = "Will the U.S. invade Iran before 2027?"
+    signal = StrategySignal(
+        tier=StrategyTier.MARKET_MAKING,
+        signal_type="maker_quote",
+        market_id=market.condition_id[:12],
+        description="maker quote on tail market",
+        expected_edge=80.0,
+        confidence=0.5,
+        recommended_size_usdc=20.0,
+    )
+
+    accepted = orchestrator.submit_signal(signal, active_markets=[market])
+    status = orchestrator.get_status()
+
+    assert accepted is False
+    assert orchestrator.process_signals() == []
+    assert status["meta"]["tail_risk"]["vetoed"] == 1
 
 
 def test_research_overlay_vetoes_only_on_three_row_high_conflict():
@@ -234,9 +292,9 @@ def test_research_overlay_vetoes_only_on_three_row_high_conflict():
     ]
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id=market.condition_id[:12],
-        description="LLM sees positive edge",
+        description="Stat arb positive edge",
         expected_edge=70.0,
         confidence=0.65,
         recommended_size_usdc=100.0,
@@ -257,18 +315,17 @@ def test_research_overlay_vetoes_only_on_three_row_high_conflict():
 
 
 def test_strategy_status_exposes_tier_budgets_and_overlay_meta():
-    # Allocations were re-weighted toward T3 (maker) after Becker 2025
-    # documented the maker-side structural edge — see DEFAULT_ALLOCATIONS
-    # in strategy_orchestrator.py. The expected budgets below track the
-    # current 30 / 5 / 15 / 50 split on a $500 bankroll.
+    # Defaults stay conservative until maker queue position, adverse
+    # selection, and inventory attribution are validated out of sample.
+    # The expected budgets below track the current 35 / 10 / 35 / 20 split.
     orchestrator = StrategyOrchestrator(total_bankroll=500)
 
     status = orchestrator.get_status()
 
-    assert status["T0"]["budget"] == 150.0
-    assert status["T1"]["budget"] == 25.0
-    assert status["T2"]["budget"] == 75.0
-    assert status["T3"]["budget"] == 250.0
+    assert status["T0"]["budget"] == 175.0
+    assert status["T1"]["budget"] == 50.0
+    assert status["T2"]["budget"] == 175.0
+    assert status["T3"]["budget"] == 100.0
     assert status["meta"]["research_overlay"]["applied"] == 0
 
 
@@ -277,9 +334,9 @@ def test_research_overlay_ignores_unrelated_global_signals():
     market = _make_market()
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id=market.condition_id[:12],
-        description="LLM sees positive edge",
+        description="Stat arb positive edge",
         expected_edge=80.0,
         confidence=0.60,
         recommended_size_usdc=100.0,
@@ -324,9 +381,9 @@ def test_research_overlay_does_not_apply_without_market_match():
     market = _make_market()
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id="unknown-market",
-        description="LLM sees positive edge",
+        description="Stat arb positive edge",
         expected_edge=80.0,
         confidence=0.60,
         recommended_size_usdc=100.0,
@@ -359,7 +416,7 @@ def test_process_signals_can_be_marked_processed_without_leaking_pending():
     orchestrator = StrategyOrchestrator(total_bankroll=1000)
     signal = StrategySignal(
         tier=StrategyTier.STATISTICAL_ARB,
-        signal_type="ai_buy_yes",
+        signal_type="stat_buy_yes",
         market_id="market-1",
         description="signal",
         expected_edge=80.0,
@@ -400,6 +457,61 @@ def test_record_execution_can_book_real_exposure_on_failed_trade():
     status = orchestrator.get_status()
     assert status["T0"]["current_exposure"] == 42.5
     assert status["T0"]["trade_count"] == 1
+
+
+def test_drawdown_scaling_reduces_directional_signal_size_after_losses():
+    orchestrator = StrategyOrchestrator(total_bankroll=1000)
+    loss = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id="loss-market",
+        description="loss",
+        expected_edge=100.0,
+        confidence=0.8,
+        recommended_size_usdc=100.0,
+    )
+    orchestrator.record_execution(loss, success=True, pnl=-60.0, exposure_amount_usdc=0.0)
+    next_signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id="next-market",
+        description="next",
+        expected_edge=100.0,
+        confidence=0.8,
+        recommended_size_usdc=100.0,
+    )
+
+    assert orchestrator.submit_signal(next_signal) is True
+    ready = orchestrator.process_signals()
+
+    assert ready[0].recommended_size_usdc == 50.0
+    assert ready[0].payload["drawdown_size_scaling"]["multiplier"] == 0.5
+
+
+def test_drawdown_scaling_blocks_directional_signals_after_deep_drawdown():
+    orchestrator = StrategyOrchestrator(total_bankroll=1000)
+    loss = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id="loss-market",
+        description="loss",
+        expected_edge=100.0,
+        confidence=0.8,
+        recommended_size_usdc=100.0,
+    )
+    orchestrator.record_execution(loss, success=True, pnl=-160.0, exposure_amount_usdc=0.0)
+    next_signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id="next-market",
+        description="next",
+        expected_edge=100.0,
+        confidence=0.8,
+        recommended_size_usdc=100.0,
+    )
+
+    assert orchestrator.submit_signal(next_signal) is False
+    assert orchestrator.process_signals() == []
 
 
 def test_process_signals_prefers_higher_confidence_after_edge_normalization():
@@ -481,3 +593,156 @@ def test_record_processed_prunes_executed_signal_history():
     status = orchestrator.get_status()
 
     assert status["meta"]["executed_signals"] == 2000
+
+
+def test_near_certainty_shadow_mode_logs_but_does_not_modify_signal():
+    """Shadow mode: rule records would_apply_* but signal is unchanged."""
+    orchestrator = StrategyOrchestrator(
+        total_bankroll=1000,
+        near_certainty_classifier=NearCertaintyClassifier(
+            high_threshold=0.92, shadow_mode=True
+        ),
+    )
+    market = _make_market()
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id=market.condition_id,
+        description="directional buy yes at near-certainty",
+        expected_edge=80.0,
+        confidence=0.70,
+        recommended_size_usdc=100.0,
+        payload={"market_prob": 0.95},  # high-certainty zone
+    )
+
+    assert orchestrator.submit_signal(signal, active_markets=[market]) is True
+    ready = orchestrator.process_signals()
+    status = orchestrator.get_status()
+
+    near = ready[0].payload["near_certainty"]
+    assert near["applied"] is True
+    assert near["shadow_mode"] is True
+    assert near["risk_zone"] == "high_certainty"
+    # Shadow → signal NOT modified
+    assert ready[0].recommended_size_usdc == 100.0
+    assert ready[0].confidence == 0.70
+    # Telemetry: would_apply_high incremented, applied_high stayed 0
+    nc_stats = status["meta"]["near_certainty"]
+    assert nc_stats["would_apply_high"] == 1
+    assert nc_stats["applied_high"] == 0
+    assert nc_stats["shadow_mode"] is True
+
+
+def test_near_certainty_live_mode_applies_size_discount():
+    """Non-shadow mode: signal size/confidence ARE modified."""
+    orchestrator = StrategyOrchestrator(
+        total_bankroll=1000,
+        near_certainty_classifier=NearCertaintyClassifier(
+            high_threshold=0.92,
+            size_multiplier=0.60,
+            confidence_delta=-0.08,
+            shadow_mode=False,
+        ),
+    )
+    market = _make_market()
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id=market.condition_id,
+        description="buy yes at 0.95",
+        expected_edge=80.0,
+        confidence=0.70,
+        recommended_size_usdc=100.0,
+        payload={"market_prob": 0.95},
+    )
+
+    orchestrator.submit_signal(signal, active_markets=[market])
+    ready = orchestrator.process_signals()
+    status = orchestrator.get_status()
+
+    near = ready[0].payload["near_certainty"]
+    assert near["applied"] is True
+    assert near["shadow_mode"] is False
+    assert ready[0].recommended_size_usdc == 60.0   # 100 * 0.60
+    assert ready[0].confidence == 0.62              # 0.70 - 0.08
+    assert status["meta"]["near_certainty"]["applied_high"] == 1
+
+
+def test_near_certainty_buy_no_uses_inverted_price():
+    """BUY_NO at market_prob=0.05 (YES) means buying NO at 0.95 → high tail."""
+    orchestrator = StrategyOrchestrator(
+        total_bankroll=1000,
+        near_certainty_classifier=NearCertaintyClassifier(
+            high_threshold=0.92, shadow_mode=True
+        ),
+    )
+    market = _make_market()
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_no",
+        market_id=market.condition_id,
+        description="buy no when yes is near zero",
+        expected_edge=80.0,
+        confidence=0.70,
+        recommended_size_usdc=100.0,
+        payload={"market_prob": 0.05},  # YES at 0.05 → NO at 0.95
+    )
+
+    orchestrator.submit_signal(signal, active_markets=[market])
+    ready = orchestrator.process_signals()
+
+    near = ready[0].payload["near_certainty"]
+    assert near["applied"] is True
+    assert near["risk_zone"] == "high_certainty"  # NO side at 0.95
+
+
+def test_near_certainty_normal_zone_does_not_fire():
+    orchestrator = StrategyOrchestrator(total_bankroll=1000)
+    market = _make_market()
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="statistical_buy_yes",
+        market_id=market.condition_id,
+        description="buy yes in normal zone",
+        expected_edge=80.0,
+        confidence=0.70,
+        recommended_size_usdc=100.0,
+        payload={"market_prob": 0.55},
+    )
+
+    orchestrator.submit_signal(signal, active_markets=[market])
+    ready = orchestrator.process_signals()
+
+    near = ready[0].payload["near_certainty"]
+    assert near["applied"] is False
+    assert near["risk_zone"] == "normal"
+    assert ready[0].recommended_size_usdc == 100.0
+
+
+def test_near_certainty_skipped_for_market_making():
+    """Rule does NOT fire on T3 maker signals — they benefit from extremes via spread."""
+    orchestrator = StrategyOrchestrator(
+        total_bankroll=1000,
+        near_certainty_classifier=NearCertaintyClassifier(
+            high_threshold=0.92, shadow_mode=False
+        ),
+    )
+    market = _make_market()
+    signal = StrategySignal(
+        tier=StrategyTier.MARKET_MAKING,
+        signal_type="maker_quote",
+        market_id=market.condition_id,
+        description="maker at extreme",
+        expected_edge=80.0,
+        confidence=0.70,
+        recommended_size_usdc=100.0,
+        payload={"market_prob": 0.95},
+    )
+
+    orchestrator.submit_signal(signal, active_markets=[market])
+    ready = orchestrator.process_signals()
+
+    near = ready[0].payload["near_certainty"]
+    assert near["applied"] is False
+    assert near["risk_zone"] == "not_applicable"
+    assert ready[0].recommended_size_usdc == 100.0

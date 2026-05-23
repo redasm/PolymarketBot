@@ -6,8 +6,7 @@ These helpers own three orthogonal concerns of one scan cycle:
 - `start_ws_feed` — bind primary market + spawn the WebSocket mirror.
 - `scan_cycle` — sweep candidate markets/events for T0 arbitrage.
 - `find_pending_signal` / `find_pending_signal_overlay` — small lookups
-  the AI cycle uses to attach research overlay metadata to a freshly
-  submitted signal.
+  used to attach research overlay metadata to a freshly submitted signal.
 
 Each function takes its dependencies explicitly (no module-level state)
 so they can be unit-tested with stubs. The original implementations

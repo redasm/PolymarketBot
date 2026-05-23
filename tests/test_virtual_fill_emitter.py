@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from polymarket_arb.event_recorder import EventRecorder
+from polymarket_arb.main_helpers.shadow_position_lifecycle import ShadowPositionLifecycle
 from polymarket_arb.main_helpers.virtual_fill_emitter import VirtualFillEmitter
 from polymarket_arb.models import (
     OrderBookLevel,
@@ -94,8 +95,8 @@ def test_record_fill_emits_full_13_field_schema(tmp_path: Path) -> None:
     assert row["side"] == "BUY"
     assert row["is_maker"] is False
     assert row["tier"] == "T0_STRUCTURAL"
-    # Taker fee = 0.02 × fill_price × size = 0.02 × 0.515 × 10
-    assert row["fee"] == pytest.approx(0.103, rel=1e-3)
+    # Polymarket CLOB taker fee shape: fee_rate × price × (1 - price) × filled_size.
+    assert row["fee"] == pytest.approx(0.02 * 0.515 * (1 - 0.515) * 10.0, rel=1e-6)
     # Slippage = fill_price - intended_price = 0.005
     assert row["slippage"] == pytest.approx(0.005, abs=1e-6)
     assert row["decision_context"]["best_bid_at_decision"] == 0.49
@@ -182,9 +183,68 @@ def test_partial_fill_fee_uses_actual_filled_size(tmp_path: Path) -> None:
     recorder.close()
 
     row = _read_only_row(tmp_path)
-    # fee = 0.02 × 0.51 × 7.0 = 0.0714, NOT 0.02 × 0.51 × 100.0
-    assert row["fee"] == pytest.approx(0.02 * 0.51 * 7.0, rel=1e-6)
+    # fee uses the actual filled size, not request size.
+    assert row["fee"] == pytest.approx(0.02 * 0.51 * (1 - 0.51) * 7.0, rel=1e-6)
     assert row["result"]["filled_size"] == pytest.approx(7.0)
+
+
+def test_lifecycle_close_uses_entry_signal_attribution(tmp_path: Path) -> None:
+    recorder = EventRecorder(output_dir=str(tmp_path), enabled=True)
+    lifecycle = ShadowPositionLifecycle(event_recorder=recorder)
+    emitter = VirtualFillEmitter(
+        event_recorder=recorder,
+        book_snapshot_provider=None,
+        taker_fee_rate=0.0,
+        lifecycle=lifecycle,
+    )
+    buy = TradeRecord(
+        trade_id="buy-1",
+        arb_id="arb-1",
+        token_id="tok-5",
+        condition_id="cid-5",
+        side=OrderSide.BUY,
+        price=0.40,
+        size=10.0,
+        status=TradeStatus.FILLED,
+        fill_price=0.40,
+        fill_size=10.0,
+        simulated=True,
+    )
+    sell = TradeRecord(
+        trade_id="sell-1",
+        arb_id="arb-1",
+        token_id="tok-5",
+        condition_id="cid-5",
+        side=OrderSide.SELL,
+        price=0.55,
+        size=10.0,
+        status=TradeStatus.FILLED,
+        fill_price=0.55,
+        fill_size=10.0,
+        simulated=True,
+    )
+
+    emitter.record_fill(
+        buy,
+        tier="T2_STATISTICAL",
+        signal_context={"signal_source": "wallet_alpha", "signal_components": ["wallet_alpha"]},
+    )
+    emitter.record_fill(
+        sell,
+        tier="T2_EXIT",
+        signal_context={"signal_source": "t2_exit", "signal_components": ["exit_manager"]},
+    )
+    recorder.close()
+
+    rows = []
+    for path in tmp_path.glob("*.positions_lifecycle.ndjson"):
+        rows.extend(json.loads(line) for line in path.read_text(encoding="utf-8").splitlines())
+    close = next(row for row in rows if row["event"] == "position_closed")
+    assert close["decision_context"]["signal_source"] == "wallet_alpha"
+    assert close["decision_context"]["signal_components"] == ["wallet_alpha"]
+    assert close["lagged_follow_pnl_usdc"] == pytest.approx(1.5)
+    assert close["lagged_follow_pnl_net_usdc"] == pytest.approx(1.5)
+    assert close["markout_pnl_close_usdc"] == pytest.approx(1.5)
 
 
 def test_disabled_recorder_emits_nothing(tmp_path: Path) -> None:

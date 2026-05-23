@@ -46,6 +46,7 @@ from polymarket_arb.main_helpers.signal_helpers import (
     set_signal_execution_check,
     sum_trade_exposure,
 )
+from polymarket_arb.signal_attribution import infer_signal_attribution
 from polymarket_arb.models import (
     ArbLeg,
     ArbOpportunity,
@@ -208,6 +209,11 @@ def execute_strategy_signal(
             "signal_type": signal.signal_type,
             "market_id": signal.market_id,
             "event_title": opportunity.event_title,
+            "wallet_address": signal.payload.get("wallet_address", ""),
+            "wallet_profile_status": signal.payload.get("wallet_profile_status", ""),
+            "category": signal.payload.get("category", ""),
+            "lagged_follow_roi": signal.payload.get("lagged_follow_roi", None),
+            **infer_signal_attribution(signal.signal_type, signal.payload),
         }
         trades = executor.execute_arbitrage(
             opportunity,
@@ -389,6 +395,14 @@ def execute_strategy_signal(
             except Exception:
                 target_snap = None
         target_tick_size = float(getattr(target_snap, "tick_size", 0.01) or 0.01)
+        if target_order_side == OrderSide.BUY and target_snap is not None:
+            best_ask = getattr(target_snap, "best_ask", None)
+            if best_ask is not None and float(best_ask) <= target_price:
+                return False, "post_only_would_cross_best_ask", ExecutionDelta()
+        if target_order_side == OrderSide.SELL and target_snap is not None:
+            best_bid = getattr(target_snap, "best_bid", None)
+            if best_bid is not None and float(best_bid) >= target_price:
+                return False, "post_only_would_cross_best_bid", ExecutionDelta()
         maker_opp = ArbOpportunity(
             arb_type=ArbType.MARKET_MAKING,
             event_id=market.event_id or market.condition_id,
@@ -466,7 +480,13 @@ def execute_strategy_signal(
             ),
         )
         if trade.fill_size:
-            apply_maker_fill_to_inventory(maker_strategy, trade)
+            inventory_delta = apply_maker_fill_to_inventory(maker_strategy, trade)
+            if target_order_side == OrderSide.SELL and inventory_delta > 0:
+                orchestrator.record_settlement(
+                    StrategyTier.MARKET_MAKING,
+                    max(0.0, target_price * inventory_delta),
+                    0.0,
+                )
         dash_state.append_trade({
             "trade_id": trade.trade_id,
             "arb_id": trade.arb_id,

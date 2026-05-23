@@ -487,29 +487,29 @@ def _signal(market_id: str, signal_type: str, ts: float, overlay: dict | None = 
 
 
 def test_find_pending_signal_matches_on_market_type_and_timestamp() -> None:
-    target = _signal("mkt-1", "ai_buy", ts=100.0)
-    other = _signal("mkt-2", "ai_buy", ts=100.0)
+    target = _signal("mkt-1", "stat_buy", ts=100.0)
+    other = _signal("mkt-2", "stat_buy", ts=100.0)
     orchestrator = SimpleNamespace(_pending_signals=[other, target])
 
-    found = find_pending_signal(orchestrator, _signal("mkt-1", "ai_buy", ts=100.0))
+    found = find_pending_signal(orchestrator, _signal("mkt-1", "stat_buy", ts=100.0))
     assert found is target
 
 
 def test_find_pending_signal_returns_none_when_timestamp_differs() -> None:
-    pending = _signal("mkt-1", "ai_buy", ts=100.0)
+    pending = _signal("mkt-1", "stat_buy", ts=100.0)
     orchestrator = SimpleNamespace(_pending_signals=[pending])
 
-    found = find_pending_signal(orchestrator, _signal("mkt-1", "ai_buy", ts=101.0))
+    found = find_pending_signal(orchestrator, _signal("mkt-1", "stat_buy", ts=101.0))
     assert found is None
 
 
 def test_find_pending_signal_overlay_returns_copy_of_payload() -> None:
     overlay = {"applied": True, "boost": 1.2}
-    pending = _signal("mkt-1", "ai_buy", ts=42.0, overlay=overlay)
+    pending = _signal("mkt-1", "stat_buy", ts=42.0, overlay=overlay)
     orchestrator = SimpleNamespace(_pending_signals=[pending])
 
     result = find_pending_signal_overlay(
-        orchestrator, _signal("mkt-1", "ai_buy", ts=42.0)
+        orchestrator, _signal("mkt-1", "stat_buy", ts=42.0)
     )
     assert result == overlay
     result["applied"] = False  # mutating result must not bleed into pending

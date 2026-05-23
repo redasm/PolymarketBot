@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from collections import deque
+from dataclasses import replace
 import json
 import logging
 import os
@@ -23,8 +24,6 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
-from polymarket_arb.ai_advisor import AIAdvisor, create_ai_advisor
-from polymarket_arb.ai_context import MarketContextBuilder
 from polymarket_arb.arbitrage_detector import ArbitrageDetector
 from polymarket_arb.book_store import EnhancedBookStore
 from polymarket_arb.client_factory import build_readonly_client, build_trading_client
@@ -35,10 +34,6 @@ from polymarket_arb.edge_engine import EdgeEngine
 from polymarket_arb.event_recorder import EventRecorder
 from polymarket_arb.execution_engine import ExecutionEngine
 from polymarket_arb.logger_setup import setup_logging
-from polymarket_arb.main_helpers.ai_cycle import (
-    AI_EVAL_TIMEOUT_SEC as _AI_EVAL_TIMEOUT_SEC,
-    run_ai_cycle as _run_ai_cycle,
-)
 from polymarket_arb.main_helpers.cycle_runners import (
     find_pending_signal as _find_pending_signal,
     find_pending_signal_overlay as _find_pending_signal_overlay,
@@ -71,10 +66,8 @@ from polymarket_arb.main_helpers.cli_setup import (
     build_run_instance_id as _build_run_instance_id,
     create_cross_platform_scanner as _create_cross_platform_scanner,
     create_research_signal_service as _create_research_signal_service,
-    get_or_create_event_loop as _get_or_create_event_loop,
     load_last_backtest_report as _load_last_backtest_report,
     log_startup_summary as _log_startup_summary,
-    parse_extra_rss_feeds as _parse_extra_rss_feeds,
     parse_http_json_sources as _parse_http_json_sources,
     round_timing as _round_timing,
 )
@@ -87,8 +80,11 @@ from polymarket_arb.main_helpers.research_refresh import (
 )
 from polymarket_arb.main_helpers.signal_collectors import (
     collect_cross_platform_strategy_signals as _collect_cross_platform_strategy_signals,
+    collect_event_calendar_strategy_signals as _collect_event_calendar_strategy_signals,
+    collect_logical_constraint_strategy_signals as _collect_logical_constraint_strategy_signals,
     collect_maker_strategy_signals as _collect_maker_strategy_signals,
     collect_statistical_strategy_signals as _collect_statistical_strategy_signals,
+    collect_wallet_alpha_strategy_signals as _collect_wallet_alpha_strategy_signals,
 )
 from polymarket_arb.main_helpers.signal_helpers import (
     apply_maker_fill_to_inventory as _apply_maker_fill_to_inventory,
@@ -123,7 +119,7 @@ from polymarket_arb.main_helpers.dirty_market_tracker import DirtyMarketTracker
 from polymarket_arb.main_helpers.dashboard_serializers import (
     build_dashboard_trade_rows as _build_dashboard_trade_rows,
     build_ws_status as _build_ws_status,
-    estimate_ai_trade_outcome as _estimate_ai_trade_outcome,
+    estimate_trade_outcome as _estimate_trade_outcome,
     is_live_execution_success as _is_live_execution_success,
     serialize_opportunity_event as _serialize_opportunity_event,
     serialize_strategy_signal as _serialize_strategy_signal,
@@ -147,15 +143,24 @@ from polymarket_arb.market_scanner import MarketScanner
 from polymarket_arb.models import (
     MarketInfo,
     ResearchSignalReport,
+    TradeRecord,
 )
 from polymarket_arb.notifier import NotificationManager
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
 from polymarket_arb.portfolio_sync import PortfolioSync
+from polymarket_arb.quant_input_store import QuantInputStore
 from polymarket_arb.risk_manager import RiskManager
 from polymarket_arb.strategies.maker_strategy import DynamicSpreadCalculator, MakerStrategy
 from polymarket_arb.strategies.recent_exit_cooldown import make_recent_exit_cooldown_store
 from polymarket_arb.strategies.t2_exit_manager import T2ExitManager, t2_exit_telemetry
+from polymarket_arb.strategies.t3_maker_exit_manager import T3MakerExitManager
+from polymarket_arb.main_helpers.t2_model_prob import build_t2_model_prob_provider
+from polymarket_arb.strategies.signal_policies import (
+    BarbellPolicy,
+    NearCertaintyClassifier,
+)
 from polymarket_arb.strategies.statistical_model import StatisticalMispricingDetector
+from polymarket_arb.strategies.sniper_gate import SniperGate, SniperGateConfig
 from polymarket_arb.strategies.strategy_orchestrator import (
     StrategyOrchestrator,
     StrategySignal,
@@ -310,8 +315,8 @@ def _signal_dedupe_key(signal: StrategySignal) -> tuple[Any, ...]:
 
 
 # Startup / parsing / boot helpers (build_run_instance_id, log_startup_summary,
-# parse_extra_rss_feeds, parse_http_json_sources, create_research_signal_service,
-# create_cross_platform_scanner, round_timing, get_or_create_event_loop,
+# parse_http_json_sources, create_research_signal_service,
+# create_cross_platform_scanner, round_timing,
 # load_last_backtest_report) were extracted to
 # `polymarket_arb.main_helpers.cli_setup` and re-imported above under their
 # underscore aliases to keep the existing call graph stable.
@@ -359,6 +364,17 @@ def main(dotenv_path: str | None = None) -> None:
     executor = ExecutionEngine(config, trading_client or ro_client)
     risk_mgr = RiskManager(config)
     notifier = NotificationManager(config)
+    shadow_validation_enabled = bool(
+        not config.dry_run
+        and getattr(config, "wallet_alpha_shadow_validation_enabled", True)
+    )
+    shadow_config = replace(
+        config,
+        dry_run=True,
+        wallet_alpha_candidate_shadow_enabled=True,
+    ) if shadow_validation_enabled else config
+    shadow_executor = ExecutionEngine(shadow_config, ro_client) if shadow_validation_enabled else None
+    shadow_risk_mgr = RiskManager(shadow_config) if shadow_validation_enabled else None
 
     enhanced_store = EnhancedBookStore()
     vol_estimator = VolEstimator(
@@ -399,7 +415,7 @@ def main(dotenv_path: str | None = None) -> None:
         async_write=config.telemetry_async_write,
         queue_size=config.telemetry_async_queue_size,
     )
-    if config.dry_run:
+    if config.dry_run or shadow_validation_enabled:
         shadow_lifecycle = _ShadowPositionLifecycle(
             event_recorder=event_recorder,
             book_snapshot_provider=lambda token_id: ob_analyzer.get_snapshot(
@@ -414,7 +430,10 @@ def main(dotenv_path: str | None = None) -> None:
             taker_fee_rate=config.polymarket_taker_fee_rate,
             lifecycle=shadow_lifecycle,
         )
-        executor.set_virtual_fill_emitter(virtual_fill_emitter)
+        if config.dry_run:
+            executor.set_virtual_fill_emitter(virtual_fill_emitter)
+        elif shadow_executor is not None:
+            shadow_executor.set_virtual_fill_emitter(virtual_fill_emitter)
     else:
         shadow_lifecycle = None
     data_janitor = DataJanitor(
@@ -429,7 +448,6 @@ def main(dotenv_path: str | None = None) -> None:
         research_cache_dir=config.research_signal_cache_dir,
         research_cache_retention_days=config.data_research_cache_retention_days,
         research_cache_max_gb=config.data_research_cache_max_gb,
-        research_knowledge_dir=config.research_signal_knowledge_dir,
         backtest_data_dir=config.backtest_data_dir,
         backtest_retention_days=config.data_backtest_retention_days,
         backtest_max_gb=config.data_backtest_max_gb,
@@ -452,15 +470,77 @@ def main(dotenv_path: str | None = None) -> None:
             "focus_keywords": focus_keywords,
             "ws_enabled": config.ws_enabled,
             "research_enabled": config.research_signal_enabled,
-            "ai_enabled": config.ai_enabled,
             "maker_enabled": config.maker_strategy_enabled,
         })
     if config.data_cleanup_enabled:
         LOG.info("Data 定期清理已开启: interval=%.0fs", config.data_cleanup_interval_sec)
+    quant_input_store = QuantInputStore.from_config(config)
 
+    sniper_gate = (
+        SniperGate(
+            SniperGateConfig(
+                min_net_edge_bps=config.sniper_min_net_edge_bps,
+                min_confidence=config.sniper_min_confidence,
+                min_liquidity=config.sniper_min_liquidity,
+                min_volume_24h=config.sniper_min_volume_24h,
+                max_correlation_score=config.sniper_max_correlation_score,
+            )
+        )
+        if config.sniper_gate_enabled
+        else None
+    )
+    near_certainty_classifier = NearCertaintyClassifier(
+        high_threshold=config.t2_near_certainty_high_threshold,
+        low_threshold=config.t2_near_certainty_low_threshold,
+        size_multiplier=config.t2_near_certainty_size_multiplier,
+        confidence_delta=config.t2_near_certainty_confidence_delta,
+        shadow_mode=config.t2_near_certainty_shadow_mode,
+    )
+    # Barbell pool budget: tail bucket cap is a slice of the
+    # STATISTICAL_ARB allocation. Default 15% of T2's bankroll allocation.
+    t2_allocation_pct = StrategyOrchestrator.DEFAULT_ALLOCATIONS.get(
+        StrategyTier.STATISTICAL_ARB, 0.35
+    )
+    barbell_tail_budget = (
+        float(config.max_total_exposure)
+        * t2_allocation_pct
+        * float(config.t2_barbell_tail_budget_pct)
+    )
+    barbell_policy = BarbellPolicy(
+        enabled=config.t2_barbell_enabled,
+        tail_budget_usdc=barbell_tail_budget,
+        tail_relaxed_multiplier=config.t2_barbell_tail_relaxed_multiplier,
+    )
     orchestrator = StrategyOrchestrator(
         total_bankroll=config.max_total_exposure,
         max_signals_per_market_per_hour=config.t2_max_signals_per_market_per_hour,
+        near_certainty_classifier=near_certainty_classifier,
+        barbell_policy=barbell_policy,
+        sniper_gate=sniper_gate,
+    )
+    shadow_orchestrator = (
+        StrategyOrchestrator(
+            total_bankroll=shadow_config.max_total_exposure,
+            max_signals_per_market_per_hour=shadow_config.t2_max_signals_per_market_per_hour,
+            near_certainty_classifier=NearCertaintyClassifier(
+                high_threshold=shadow_config.t2_near_certainty_high_threshold,
+                low_threshold=shadow_config.t2_near_certainty_low_threshold,
+                size_multiplier=shadow_config.t2_near_certainty_size_multiplier,
+                confidence_delta=shadow_config.t2_near_certainty_confidence_delta,
+                shadow_mode=shadow_config.t2_near_certainty_shadow_mode,
+            ),
+            barbell_policy=BarbellPolicy(
+                enabled=shadow_config.t2_barbell_enabled,
+                tail_budget_usdc=(
+                    float(shadow_config.max_total_exposure)
+                    * t2_allocation_pct
+                    * float(shadow_config.t2_barbell_tail_budget_pct)
+                ),
+                tail_relaxed_multiplier=shadow_config.t2_barbell_tail_relaxed_multiplier,
+            ),
+        )
+        if shadow_validation_enabled
+        else None
     )
     flow_aggregator: Optional[FlowAggregator] = None
     flow_ingest: Optional[FlowIngest] = None
@@ -488,6 +568,10 @@ def main(dotenv_path: str | None = None) -> None:
             cooldown_store.cooldown_sec,
             len(cooldown_store.snapshot()),
         )
+    t2_model_prob_provider = build_t2_model_prob_provider(
+        statistical_detector=statistical_detector,
+        ob_analyzer=ob_analyzer,
+    )
     t2_exit_manager = T2ExitManager(
         config=config,
         executor=executor,
@@ -495,6 +579,20 @@ def main(dotenv_path: str | None = None) -> None:
         risk_manager=risk_mgr,
         notifier=notifier,
         cooldown_store=cooldown_store,
+        orchestrator=orchestrator,
+        model_prob_provider=t2_model_prob_provider,
+    )
+    shadow_t2_exit_manager = (
+        T2ExitManager(
+            config=shadow_config,
+            executor=shadow_executor,
+            ob_analyzer=ob_analyzer,
+            risk_manager=shadow_risk_mgr,
+            orchestrator=shadow_orchestrator,
+            model_prob_provider=t2_model_prob_provider,
+        )
+        if shadow_validation_enabled and shadow_executor is not None and shadow_risk_mgr is not None
+        else None
     )
     LOG.info(
         "T2 退出策略: stop_loss=%.0fbps tp_capture=%.0f%% max_hold=%.0fs eval=%.0fs optimal_stopping=%s",
@@ -504,7 +602,21 @@ def main(dotenv_path: str | None = None) -> None:
         config.t2_exit_eval_interval_sec,
         config.t2_optimal_stopping_enabled,
     )
-    ctx_builder = MarketContextBuilder()
+    t3_maker_exit_manager = T3MakerExitManager(
+        config=config,
+        executor=executor,
+        ob_analyzer=ob_analyzer,
+        risk_manager=risk_mgr,
+        notifier=notifier,
+        orchestrator=orchestrator,
+    )
+    LOG.info(
+        "T3 maker 退出策略: stop_loss=%.0fbps take_profit=%.0fbps max_hold=%.0fs eval=%.0fs",
+        config.maker_stop_loss_bps,
+        config.maker_take_profit_bps,
+        config.maker_max_hold_sec,
+        config.maker_exit_eval_interval_sec,
+    )
     research_signal_service: Optional["ResearchSignalService"] = _create_research_signal_service(config)
     research_signal_enabled = bool(config.research_signal_enabled and research_signal_service is not None)
     research_executor: ThreadPoolExecutor | None = (
@@ -522,15 +634,6 @@ def main(dotenv_path: str | None = None) -> None:
             config.portfolio_sync_timeout_sec,
             (portfolio_sync.source_address[:10] + "…") if portfolio_sync.source_address else "",
         )
-
-    ai_advisor: Optional[AIAdvisor] = None
-    if config.ai_enabled:
-        ai_advisor = create_ai_advisor(config)
-        if ai_advisor:
-            LOG.info(
-                "AI 决策引擎已启用: provider=%s, model=%s, interval=%.0fs",
-                config.ai_provider, config.ai_model, config.ai_eval_interval_sec,
-            )
 
     ws_feed: Optional[WebSocketFeed] = None
     ws_mirror: Optional[OrderBookMirror] = None
@@ -634,7 +737,6 @@ def main(dotenv_path: str | None = None) -> None:
             "research_sec": 0.0,
             "strategy_sec": 0.0,
             "execution_sec": 0.0,
-            "ai_sec": 0.0,
         }
         ob_analyzer.snapshot_stats(reset=True)
         scanned_markets: list[MarketInfo] = []
@@ -848,6 +950,19 @@ def main(dotenv_path: str | None = None) -> None:
                 time.sleep(60)
             else:
                 time.sleep(config.scan_interval_sec)
+            wallet_usdc = executor.get_available_collateral_balance(use_cache=True)
+            LOG.info(
+                "钱包余额观测: %s",
+                f"{wallet_usdc:.6f} USDC" if wallet_usdc is not None else "N/A",
+            )
+            notifier.observe_cycle(
+                daily_pnl=risk_mgr.state.daily_pnl,
+                open_positions=risk_mgr.state.open_positions,
+                total_exposure=risk_mgr.state.total_exposure,
+                is_halted=risk_mgr.state.is_halted,
+                halt_reason=risk_mgr.state.halt_reason,
+                wallet_usdc=wallet_usdc,
+            )
             continue
 
         # --- VolEstimator 喂入 mid price ---
@@ -955,6 +1070,57 @@ def main(dotenv_path: str | None = None) -> None:
             detector=statistical_detector,
         )
         strategy_signals.extend(statistical_signals)
+        quant_inputs = quant_input_store.snapshot()
+        strategy_signals.extend(
+            _collect_logical_constraint_strategy_signals(
+                config=config,
+                candidate_markets=scanned_markets,
+                ob_analyzer=ob_analyzer,
+                rules=quant_inputs.logical_constraints_json,
+                input_metadata=quant_inputs.input_metadata("logical_constraints"),
+            )
+        )
+        strategy_signals.extend(
+            _collect_event_calendar_strategy_signals(
+                config=config,
+                candidate_markets=scanned_markets,
+                ob_analyzer=ob_analyzer,
+                baselines=quant_inputs.event_baselines_json,
+                input_metadata=quant_inputs.input_metadata("event_baselines"),
+            )
+        )
+        strategy_signals.extend(
+            _collect_wallet_alpha_strategy_signals(
+                config=config,
+                candidate_markets=scanned_markets,
+                profiles=quant_inputs.wallet_alpha_profiles_json,
+                observations=quant_inputs.wallet_alpha_observations_json,
+                input_metadata={
+                    "profiles": quant_inputs.input_metadata("wallet_alpha_profiles"),
+                    "observations": quant_inputs.input_metadata("wallet_alpha_observations"),
+                },
+            )
+        )
+        shadow_candidate_signals = []
+        if shadow_validation_enabled:
+            shadow_candidate_signals = [
+                signal for signal in _collect_wallet_alpha_strategy_signals(
+                    config=shadow_config,
+                    candidate_markets=scanned_markets,
+                    profiles=quant_inputs.wallet_alpha_profiles_json,
+                    observations=quant_inputs.wallet_alpha_observations_json,
+                    input_metadata={
+                        "profiles": quant_inputs.input_metadata("wallet_alpha_profiles"),
+                        "observations": quant_inputs.input_metadata("wallet_alpha_observations"),
+                    },
+                )
+                if signal.signal_type.startswith("wallet_alpha_candidate_")
+            ]
+            max_shadow_signals = int(getattr(config, "wallet_alpha_shadow_max_signals_per_cycle", 5) or 0)
+            if max_shadow_signals > 0:
+                shadow_candidate_signals = shadow_candidate_signals[:max_shadow_signals]
+            else:
+                shadow_candidate_signals = []
         fair_values_by_market = {
             signal.market_id: float(signal.payload.get("model_prob"))
             for signal in statistical_signals
@@ -966,9 +1132,10 @@ def main(dotenv_path: str | None = None) -> None:
                 ob_analyzer=ob_analyzer,
                 maker_strategy=maker_strategy,
                 fair_values_by_market=fair_values_by_market,
-                detector=statistical_detector,
-                flow_aggregator=flow_aggregator,
-            )
+            detector=statistical_detector,
+            flow_aggregator=flow_aggregator,
+            event_baselines=quant_inputs.event_baselines_json,
+        )
             if config.maker_strategy_enabled
             else []
         )
@@ -1008,6 +1175,24 @@ def main(dotenv_path: str | None = None) -> None:
                 )
                 for compressed_payload in signal_telemetry.consume(signal_payload):
                     event_recorder.write_event("strategy_signals", compressed_payload)
+
+        if shadow_orchestrator is not None:
+            for candidate_signal in shadow_candidate_signals:
+                _ensure_signal_id(candidate_signal)
+                submitted = shadow_orchestrator.submit_signal(
+                    candidate_signal,
+                    active_markets=active_markets_for_overlay,
+                    research_report=research_report,
+                    research_signals=research_signals,
+                )
+                if event_recorder.is_enabled:
+                    signal_payload = _serialize_strategy_signal(
+                        _find_pending_signal(shadow_orchestrator, candidate_signal) or candidate_signal,
+                        submitted=submitted,
+                        research_overlay=_find_pending_signal_overlay(shadow_orchestrator, candidate_signal),
+                    )
+                    for compressed_payload in signal_telemetry.consume(signal_payload):
+                        event_recorder.write_event("strategy_signals", compressed_payload)
 
         cycle_timing["strategy_sec"] += time.perf_counter() - phase_start
         t2_collector_skips = dict(getattr(_collect_statistical_strategy_signals, "last_skip_summary", {}) or {})
@@ -1049,7 +1234,6 @@ def main(dotenv_path: str | None = None) -> None:
                 executor=executor,
                 risk_mgr=risk_mgr,
                 notifier=notifier,
-                ai_advisor=ai_advisor,
                 dash_state=dash_state,
                 event_recorder=event_recorder,
             )
@@ -1070,26 +1254,6 @@ def main(dotenv_path: str | None = None) -> None:
                     execution_blocked_by_forced_sync = True
                     break
         cycle_timing["execution_sec"] += time.perf_counter() - phase_start
-
-        if ai_advisor and ai_advisor.should_evaluate():
-            phase_start = time.perf_counter()
-            _run_ai_cycle(
-                ai_advisor=ai_advisor,
-                ctx_builder=ctx_builder,
-                active_markets=universe_markets if universe_markets else scanned_markets,
-                recent_trades=executor.get_recent_trades(),
-                book_store=enhanced_store,
-                vol_estimator=vol_estimator,
-                edge_decision=edge_decision,
-                risk_mgr=risk_mgr,
-                orchestrator=orchestrator,
-                dash_state=dash_state,
-                config=config,
-                research_report=research_report,
-                research_signals=research_signals,
-                event_recorder=event_recorder,
-            )
-            cycle_timing["ai_sec"] += time.perf_counter() - phase_start
 
         phase_start = time.perf_counter()
         # T2/T3 信号从 scanned_markets 生成（含 event markets），universe_markets 可能不含这些市场；
@@ -1196,6 +1360,65 @@ def main(dotenv_path: str | None = None) -> None:
                 },
                 "total": sum(insufficient_balance_skips.values()),
             })
+        if (
+            shadow_orchestrator is not None
+            and shadow_executor is not None
+            and shadow_risk_mgr is not None
+        ):
+            shadow_exec_start = time.perf_counter()
+            shadow_exec_budget_sec = (
+                float(getattr(config, "wallet_alpha_shadow_max_exec_ms_per_cycle", 250.0) or 0.0)
+                / 1000.0
+            )
+            for shadow_signal in shadow_orchestrator.process_signals():
+                if shadow_exec_budget_sec > 0 and (time.perf_counter() - shadow_exec_start) >= shadow_exec_budget_sec:
+                    shadow_orchestrator.record_processed(shadow_signal)
+                    if event_recorder.is_enabled:
+                        event_recorder.write_event("strategy_executions", {
+                            "execution_id": "",
+                            "signal_id": getattr(shadow_signal, "signal_id", ""),
+                            "tier": shadow_signal.tier.name,
+                            "signal_type": shadow_signal.signal_type,
+                            "market_id": shadow_signal.market_id,
+                            "status": "skipped",
+                            "mode": "shadow_validation",
+                            "reason": "shadow_validation_budget_exhausted",
+                        })
+                    continue
+                executed, reason, delta = _execute_strategy_signal(
+                    signal=shadow_signal,
+                    config=shadow_config,
+                    active_markets=execution_markets,
+                    ob_analyzer=ob_analyzer,
+                    executor=shadow_executor,
+                    risk_mgr=shadow_risk_mgr,
+                    orchestrator=shadow_orchestrator,
+                    dash_state=dash_state,
+                    event_recorder=event_recorder,
+                    maker_strategy=maker_strategy,
+                    notifier=notifier,
+                    t2_exit_manager=shadow_t2_exit_manager,
+                    cooldown_store=None,
+                )
+                total_simulated_successes += delta.simulated_successes
+                total_simulated_submissions += delta.simulated_submissions
+                total_simulated_expected_profit += delta.simulated_profit_total
+                if executed:
+                    continue
+                shadow_orchestrator.record_processed(shadow_signal)
+                if event_recorder.is_enabled:
+                    event_recorder.write_event("strategy_executions", {
+                        "execution_id": "",
+                        "signal_id": getattr(shadow_signal, "signal_id", ""),
+                        "tier": shadow_signal.tier.name,
+                        "signal_type": shadow_signal.signal_type,
+                        "market_id": shadow_signal.market_id,
+                        "status": "skipped",
+                        "mode": "shadow_validation",
+                        "reason": reason,
+                        **_structured_skip_reason(reason),
+                        "execution_check": dict(shadow_signal.payload.get("execution_check") or {}),
+                    })
         cycle_timing["strategy_execution_sec"] = time.perf_counter() - phase_start
 
         # T2 exit evaluation: stop-loss / take-profit / time-stop / optimal stopping.
@@ -1239,19 +1462,83 @@ def main(dotenv_path: str | None = None) -> None:
         except Exception as exc:
             LOG.warning("T2 退出评估异常: %s", exc)
 
+        # T3 maker exit evaluation: TTL / stop-loss / take-profit.
+        # Pre-fix, maker fills (including maker_crossed taker fills)
+        # had no exit path and rode the position to settlement.
+        try:
+            t3_exit_result = t3_maker_exit_manager.evaluate(active_markets=execution_markets)
+            if t3_exit_result.attempted > 0 and event_recorder.is_enabled:
+                if t3_exit_result.failed and not t3_exit_result.triggered and not t3_exit_result.partial:
+                    t3_exit_status = "exit_failed"
+                elif t3_exit_result.partial and not t3_exit_result.triggered:
+                    t3_exit_status = "partial_exit"
+                elif t3_exit_result.triggered and (t3_exit_result.failed or t3_exit_result.partial):
+                    t3_exit_status = "mixed"
+                else:
+                    t3_exit_status = "exited"
+                event_recorder.write_event(
+                    "strategy_executions",
+                    {
+                        "tier": StrategyTier.MARKET_MAKING.name,
+                        "signal_type": "t3_maker_exit",
+                        "market_id": "",
+                        "status": t3_exit_status,
+                        "trade_count": t3_exit_result.triggered,
+                        "attempted_count": t3_exit_result.attempted,
+                        "partial_count": t3_exit_result.partial,
+                        "failed_count": t3_exit_result.failed,
+                        "open_positions": len(t3_maker_exit_manager.open_positions),
+                        "exit_decisions": t3_exit_result.decisions,
+                    },
+                )
+        except Exception as exc:
+            LOG.warning("T3 maker 退出评估异常: %s", exc)
+
+        if shadow_t2_exit_manager is not None:
+            try:
+                shadow_exit_result = shadow_t2_exit_manager.evaluate(active_markets=execution_markets)
+                if shadow_exit_result.attempted > 0 and event_recorder.is_enabled:
+                    event_recorder.write_event(
+                        "strategy_executions",
+                        {
+                            "tier": StrategyTier.STATISTICAL_ARB.name,
+                            "signal_type": "wallet_alpha_candidate_shadow_exit",
+                            "market_id": "",
+                            "status": "shadow_exit_attempted",
+                            "trade_count": shadow_exit_result.triggered,
+                            "attempted_count": shadow_exit_result.attempted,
+                            "partial_count": shadow_exit_result.partial,
+                            "failed_count": shadow_exit_result.failed,
+                            "open_positions": len(shadow_t2_exit_manager.open_positions),
+                        },
+                    )
+            except Exception as exc:
+                LOG.warning("wallet alpha shadow 退出评估异常: %s", exc)
+
         if not config.dry_run:
+            live_markets_by_cid = {m.condition_id: m for m in execution_markets}
+
+            def _register_live_maker_fill(trade: TradeRecord, _fill_delta: float) -> None:
+                t3_maker_exit_manager.register_fill(
+                    trade=trade,
+                    market=live_markets_by_cid.get(trade.condition_id),
+                )
+
             _sync_live_order_statuses(
                 executor=executor,
                 risk_mgr=risk_mgr,
                 maker_strategy=maker_strategy,
                 event_recorder=event_recorder,
                 notifier=notifier,
+                orchestrator=orchestrator,
+                on_observed_maker_fill=_register_live_maker_fill,
             )
             _cancel_stale_maker_orders(
                 config=config,
                 executor=executor,
                 risk_mgr=risk_mgr,
                 event_recorder=event_recorder,
+                orchestrator=orchestrator,
             )
 
         if config.dry_run:
@@ -1262,12 +1549,56 @@ def main(dotenv_path: str | None = None) -> None:
             # cache layer the vast majority of the time, since the same
             # token usually had a snapshot fetched earlier in the cycle
             # by scan/signal collection.
+            shadow_fill_slots_used = 0
+            # Per-market exposure already booked from prior cycles, used
+            # to enforce RISK_MAX_EXPOSURE_PER_MARKET on shadow fills.
+            # Pre-fix, the guard only checked total position count, so
+            # five $20 fills on the same Iran market booked $100 against
+            # a $25 cap (2026-05-22 run).
+            shadow_market_exposure_base: dict[str, float] = (
+                shadow_lifecycle.exposure_by_market_usdc()
+                if shadow_lifecycle is not None
+                else {}
+            )
+            shadow_market_exposure_cycle: dict[str, float] = {}
+
+            def _shadow_maker_fill_guard(trade: TradeRecord, fill_size: float, cross_price: float):
+                nonlocal shadow_fill_slots_used
+                if str(getattr(trade.side, "value", trade.side)).upper() != "BUY":
+                    return True, ""
+                if risk_mgr.state.open_positions + shadow_fill_slots_used >= config.max_open_positions:
+                    return False, "shadow_open_position_cap"
+                cid = str(getattr(trade, "condition_id", "") or "")
+                notional = float(fill_size) * float(cross_price)
+                if cid:
+                    projected = (
+                        shadow_market_exposure_base.get(cid, 0.0)
+                        + shadow_market_exposure_cycle.get(cid, 0.0)
+                        + notional
+                    )
+                    if projected > config.max_exposure_per_market:
+                        return False, "shadow_per_market_exposure_cap"
+                    shadow_market_exposure_cycle[cid] = (
+                        shadow_market_exposure_cycle.get(cid, 0.0) + notional
+                    )
+                shadow_fill_slots_used += 1
+                return True, ""
+
             swept_maker_fills = executor.sweep_simulated_maker_fills(
                 lambda token_id: ob_analyzer.get_snapshot(
                     token_id, allow_rest_fallback=True, count_request=False
                 ),
                 fill_latency_sec=config.shadow_maker_fill_latency_sec,
+                fill_guard=_shadow_maker_fill_guard,
             )
+            shadow_markets_by_cid = {m.condition_id: m for m in execution_markets}
+
+            def _register_shadow_maker_fill(trade: TradeRecord, _fill_delta: float) -> None:
+                t3_maker_exit_manager.register_fill(
+                    trade=trade,
+                    market=shadow_markets_by_cid.get(trade.condition_id),
+                )
+
             observed_maker_fills = _handle_observed_maker_fills(
                 trades=swept_maker_fills,
                 maker_strategy=maker_strategy,
@@ -1275,6 +1606,7 @@ def main(dotenv_path: str | None = None) -> None:
                 event_recorder=event_recorder,
                 simulated=True,
                 event_name="shadow_maker_fill_observed",
+                on_observed=_register_shadow_maker_fill,
             )
             total_simulated_successes += observed_maker_fills
 
@@ -1290,9 +1622,12 @@ def main(dotenv_path: str | None = None) -> None:
             )
 
         shadow_snapshot: dict[str, Any] = {}
-        if config.dry_run and shadow_lifecycle is not None:
+        if shadow_lifecycle is not None:
             shadow_snapshot = shadow_lifecycle.snapshot()
-            risk_mgr.update_shadow_snapshot(shadow_snapshot)
+            if config.dry_run:
+                risk_mgr.update_shadow_snapshot(shadow_snapshot)
+            elif shadow_risk_mgr is not None:
+                shadow_risk_mgr.update_shadow_snapshot(shadow_snapshot)
         telemetry_risk_state = risk_mgr.state
 
         vol_snap = vol_estimator.snapshot()
@@ -1380,6 +1715,10 @@ def main(dotenv_path: str | None = None) -> None:
             last_telemetry_heartbeat_ts = now_ts
 
         wallet_usdc = executor.get_available_collateral_balance(use_cache=True)
+        LOG.info(
+            "钱包余额观测: %s",
+            f"{wallet_usdc:.6f} USDC" if wallet_usdc is not None else "N/A",
+        )
         notifier.observe_cycle(
             daily_pnl=telemetry_risk_state.daily_pnl,
             open_positions=telemetry_risk_state.open_positions,
@@ -1502,7 +1841,7 @@ def main(dotenv_path: str | None = None) -> None:
     )
 
 
-# Telemetry / dashboard serialisation / pending-signal lookups / AI
-# cycle were extracted to `polymarket_arb.main_helpers.{dashboard_serializers,
-# cycle_runners, ai_cycle}` and re-imported above under their underscore
-# aliases so the call graph here stays unchanged.
+# Telemetry / dashboard serialisation / pending-signal lookups were
+# extracted to `polymarket_arb.main_helpers.{dashboard_serializers,
+# cycle_runners}` and re-imported above under their underscore aliases
+# so the call graph here stays unchanged.

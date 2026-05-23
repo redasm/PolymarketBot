@@ -278,6 +278,59 @@ def test_statistical_arb_blocked_by_collateral() -> None:
     assert reason == "insufficient_balance"
 
 
+def test_wallet_alpha_candidate_shadow_signal_can_execute_in_dry_run() -> None:
+    class _Executor:
+        def ensure_sufficient_collateral(self, _amount):
+            return True, "", None
+
+        def execute_arbitrage(self, opp, size, **kwargs):
+            assert kwargs["virtual_fill_context"]["wallet_address"] == "0xwallet"
+            return [
+                TradeRecord(
+                    trade_id="trade-1",
+                    arb_id="arb-1",
+                    token_id=opp.legs[0].token_id,
+                    condition_id=opp.legs[0].condition_id,
+                    side=opp.legs[0].side,
+                    price=opp.legs[0].price,
+                    size=size,
+                    status=TradeStatus.FILLED,
+                    fill_price=opp.legs[0].price,
+                    fill_size=size,
+                    simulated=True,
+                )
+            ]
+
+        def is_successful_execution(self, _opp, trades):
+            return bool(trades)
+
+    ob = SimpleNamespace(
+        get_snapshot=lambda _t: SimpleNamespace(
+            best_ask=0.5,
+            best_bid=0.49,
+            asks=[SimpleNamespace(price=0.5, size=100.0)],
+            bids=[SimpleNamespace(price=0.49, size=100.0)],
+        ),
+        get_executable_ask_price=lambda _t, _s: (0.5, 2.0),
+    )
+    sig = _signal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="wallet_alpha_candidate_buy_yes",
+        payload={
+            "action": "BUY_YES",
+            "deviation": 0.03,
+            "wallet_address": "0xwallet",
+            "wallet_profile_status": "candidate_unvalidated",
+        },
+    )
+
+    success, reason, delta = _run(sig, ob_analyzer=ob, executor=_Executor())
+
+    assert success is True
+    assert reason == ""
+    assert delta.simulated_successes == 1
+
+
 # ---------- T3 (market making) early returns ---------------------------------
 
 
@@ -317,6 +370,125 @@ def test_maker_no_executable_side_when_quote_payload_not_dict() -> None:
     success, reason, _ = _run(sig)
     assert success is False
     assert reason == "maker_no_executable_side"
+
+
+def test_maker_inventory_sell_releases_t3_orchestrator_exposure() -> None:
+    class _Executor:
+        def ensure_sufficient_collateral(self, _amount):
+            raise AssertionError("sell inventory should not require collateral")
+
+        def submit_limit_order(self, **kwargs):
+            return TradeRecord(
+                trade_id="trade-1",
+                arb_id="arb-1",
+                token_id=kwargs["token_id"],
+                condition_id=kwargs["condition_id"],
+                side=kwargs["side"],
+                price=kwargs["price"],
+                size=kwargs["size"],
+                status=TradeStatus.FILLED,
+                fill_price=kwargs["price"],
+                fill_size=kwargs["size"],
+                simulated=False,
+                post_only=True,
+                order_type_name="GTC",
+                economic_cost=kwargs["price"],
+            )
+
+        def is_successful_execution(self, *_args, **_kwargs):
+            return True
+
+    class _Risk:
+        def pre_trade_check(self, *_args, **_kwargs):
+            raise AssertionError("sell inventory should not open new risk")
+
+        def record_execution(self, *_args, **_kwargs):
+            raise AssertionError("sell inventory should not increase exposure")
+
+    maker_strategy = MakerStrategy(default_size=1.0)
+    maker_strategy.update_inventory("yes-1", "BUY", 2.0)
+    orchestrator = StrategyOrchestrator(total_bankroll=10.0)
+    buy_signal = _signal(tier=StrategyTier.MARKET_MAKING)
+    orchestrator.record_execution(buy_signal, success=True, exposure_amount_usdc=1.0)
+    sig = _signal(
+        tier=StrategyTier.MARKET_MAKING,
+        payload={
+            "quote": {
+                "fair_value": 0.50,
+                "bid_price": 0.49,
+                "ask_price": 0.60,
+                "bid_size": 1.0,
+                "ask_size": 1.0,
+            }
+        },
+    )
+
+    success, reason, _delta = execute_strategy_signal(
+        signal=sig,
+        config=_config(dry_run=False),
+        active_markets=[_binary_market()],
+        ob_analyzer=SimpleNamespace(get_snapshot=lambda _token_id: SimpleNamespace(tick_size=0.01)),
+        executor=_Executor(),
+        risk_mgr=_Risk(),
+        orchestrator=orchestrator,
+        dash_state=DashboardState(),
+        event_recorder=_Recorder(),
+        maker_strategy=maker_strategy,
+        notifier=_Notifier(),
+    )
+
+    assert success is True
+    assert reason == ""
+    assert orchestrator.get_status()["T3"]["current_exposure"] == pytest.approx(0.4)
+
+
+def test_maker_buy_post_only_rejects_crossing_snapshot() -> None:
+    class _Executor:
+        def ensure_sufficient_collateral(self, _amount):
+            raise AssertionError("crossing post-only should be rejected before collateral check")
+
+        def submit_limit_order(self, **_kwargs):
+            raise AssertionError("crossing post-only should not submit")
+
+    class _Risk:
+        def pre_trade_check(self, _opp, size):
+            return True, "", size
+
+        def record_execution(self, *_args, **_kwargs):
+            raise AssertionError("rejected quote should not book risk")
+
+    sig = _signal(
+        tier=StrategyTier.MARKET_MAKING,
+        payload={
+            "quote": {
+                "fair_value": 0.50,
+                "bid_price": 0.49,
+                "ask_price": None,
+                "bid_size": 1.0,
+                "ask_size": 0.0,
+            }
+        },
+    )
+
+    success, reason, delta = execute_strategy_signal(
+        signal=sig,
+        config=_config(dry_run=True),
+        active_markets=[_binary_market()],
+        ob_analyzer=SimpleNamespace(
+            get_snapshot=lambda _token_id: SimpleNamespace(tick_size=0.01, best_ask=0.48)
+        ),
+        executor=_Executor(),
+        risk_mgr=_Risk(),
+        orchestrator=StrategyOrchestrator(total_bankroll=10.0),
+        dash_state=DashboardState(),
+        event_recorder=_Recorder(),
+        maker_strategy=MakerStrategy(default_size=1.0),
+        notifier=_Notifier(),
+    )
+
+    assert success is False
+    assert reason == "post_only_would_cross_best_ask"
+    assert delta == ExecutionDelta()
 
 
 # ---------- ExecutionDelta dataclass shape -----------------------------------

@@ -585,34 +585,6 @@ class RiskManager:
                     cap,
                 )
 
-    def apply_ai_adjustment(self, adjustments: dict) -> None:
-        """应用 AI 建议的风控参数调整（受硬上限约束）.
-
-        调整因子范围 [0.5, 1.5]，乘以 .env 中的原始值。
-        AI 永远无法将参数提高到原始配置值的 150% 以上。
-
-        Args:
-            adjustments: {"max_exposure_factor": float, "daily_loss_factor": float}
-        """
-        if not adjustments:
-            return
-
-        with self._lock:
-            base_exposure = self._config.max_total_exposure
-            base_daily_loss = self._config.max_daily_loss
-
-            if "max_exposure_factor" in adjustments:
-                factor = max(0.5, min(1.5, float(adjustments["max_exposure_factor"])))
-                new_val = base_exposure * factor
-                LOG.info("AI 风控调整: max_total_exposure %.2f -> %.2f (factor=%.2f)", base_exposure, new_val, factor)
-                self._effective_max_total_exposure = new_val
-
-            if "daily_loss_factor" in adjustments:
-                factor = max(0.5, min(1.5, float(adjustments["daily_loss_factor"])))
-                new_val = base_daily_loss * factor
-                LOG.info("AI 风控调整: max_daily_loss %.2f -> %.2f (factor=%.2f)", base_daily_loss, new_val, factor)
-                self._effective_max_daily_loss = new_val
-
     def reset_halt(self) -> None:
         """手动解除熔断."""
         with self._lock:

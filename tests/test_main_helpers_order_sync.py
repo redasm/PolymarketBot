@@ -73,6 +73,14 @@ class _Notifier:
         return True
 
 
+class _Orchestrator:
+    def __init__(self) -> None:
+        self.settlements: list[tuple[Any, float, float]] = []
+
+    def record_settlement(self, tier: Any, amount: float, pnl: float) -> None:
+        self.settlements.append((tier, amount, pnl))
+
+
 def _trade(
     *,
     trade_id: str = "t1",
@@ -90,6 +98,9 @@ def _trade(
     notification_accounted_size: float = 0.0,
     expected_edge_per_share: float = 0.0,
     event_title: str = "",
+    size: float = 4.0,
+    price: float = 0.5,
+    economic_cost: float | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         trade_id=trade_id,
@@ -102,6 +113,9 @@ def _trade(
         error=error,
         side=SimpleNamespace(value=side_value),
         timestamp=timestamp,
+        price=price,
+        size=size,
+        economic_cost=economic_cost if economic_cost is not None else price,
         post_only=post_only,
         inventory_accounted_size=inventory_accounted_size,
         notification_accounted_size=notification_accounted_size,
@@ -220,6 +234,55 @@ def test_sync_changes_notify_new_maker_fill_delta() -> None:
     assert notifier.successes[0]["expected_profit"] == pytest.approx(0.04)
 
 
+def test_sync_releases_t3_budget_for_cancelled_unfilled_maker_buy() -> None:
+    orchestrator = _Orchestrator()
+    cancelled = [
+        _trade(
+            trade_id="t1",
+            status_value="cancelled",
+            side_value="BUY",
+            size=4.0,
+            fill_size=0.0,
+            price=0.25,
+        )
+    ]
+
+    sync_live_order_statuses(
+        executor=_executor(sync_result=SimpleNamespace(polled=cancelled, changed=cancelled)),
+        risk_mgr=_RiskMgr(),
+        maker_strategy=_MakerStrategy(),
+        event_recorder=_Recorder(),
+        orchestrator=orchestrator,
+    )
+
+    assert orchestrator.settlements == [(3, pytest.approx(1.0), 0.0)]
+
+
+def test_sync_releases_t3_budget_for_maker_sell_fill_delta() -> None:
+    orchestrator = _Orchestrator()
+    sell_fill = [
+        _trade(
+            trade_id="t1",
+            status_value="partial",
+            side_value="SELL",
+            size=4.0,
+            fill_size=1.5,
+            price=0.40,
+            inventory_accounted_size=0.5,
+        )
+    ]
+
+    sync_live_order_statuses(
+        executor=_executor(sync_result=SimpleNamespace(polled=sell_fill, changed=sell_fill)),
+        risk_mgr=_RiskMgr(),
+        maker_strategy=_MakerStrategy(),
+        event_recorder=_Recorder(),
+        orchestrator=orchestrator,
+    )
+
+    assert orchestrator.settlements == [(3, pytest.approx(0.4), 0.0)]
+
+
 def test_sync_disabled_recorder_skips_events_but_still_reconciles() -> None:
     risk = _RiskMgr()
     changed = [_trade(trade_id="t1")]
@@ -318,6 +381,34 @@ def test_cancel_stale_reconciles_and_emits_one_event_per_trade() -> None:
         ("risk_events", "maker_order_cancelled", "o1"),
         ("risk_events", "maker_order_cancelled", "o2"),
     ]
+
+
+def test_cancel_stale_releases_t3_budget_for_unfilled_buy_orders() -> None:
+    rec = _Recorder()
+    risk = _RiskMgr()
+    orchestrator = _Orchestrator()
+    cancelled = [
+        _trade(
+            trade_id="t1",
+            order_id="o1",
+            side_value="BUY",
+            status_value="cancelled",
+            size=10.0,
+            fill_size=2.0,
+            price=0.30,
+        )
+    ]
+
+    cancel_stale_maker_orders(
+        config=_config(60.0),
+        executor=_executor(cancel_result=cancelled),
+        risk_mgr=risk,
+        event_recorder=rec,
+        orchestrator=orchestrator,
+    )
+
+    assert risk.reconciled == [cancelled]
+    assert orchestrator.settlements == [(3, pytest.approx(2.4), 0.0)]
 
 
 def test_cancel_swallow_exception_records_error_event() -> None:

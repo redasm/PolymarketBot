@@ -2,8 +2,8 @@
 
 These functions used to live inline in `main_loop.py` and were untested
 in isolation. Moving them out unlocks (this) regression suite that pins
-their wire format — the dashboard FastAPI layer + AI feedback loop both
-consume these dicts, so silent shape changes break downstream consumers.
+their wire format — the dashboard FastAPI layer and telemetry consumers
+both consume these dicts, so silent shape changes break downstream consumers.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from polymarket_arb.main_helpers.dashboard_serializers import (
     build_dashboard_trade_rows,
-    estimate_ai_trade_outcome,
+    estimate_trade_outcome,
     has_simulated_trades,
     lookup_market_snapshot,
     reported_execution_success,
@@ -149,27 +149,27 @@ def test_reported_execution_success_live_passes_through():
     assert not reported_execution_success(live_execution_success=False, trades=live)
 
 
-def test_estimate_ai_trade_outcome_success_uses_min_filled_size():
+def test_estimate_trade_outcome_success_uses_min_filled_size():
     opp = _make_opp(net_edge=0.10)
     trades = [
         _make_trade(fill_size=8.0, status=TradeStatus.FILLED),
         _make_trade(fill_size=12.0, status=TradeStatus.FILLED),
     ]
-    pnl = estimate_ai_trade_outcome(opp, trades, arb_success=True, adj_size=10.0)
+    pnl = estimate_trade_outcome(opp, trades, arb_success=True, adj_size=10.0)
     assert pnl == 0.10 * 8.0
 
 
-def test_estimate_ai_trade_outcome_failure_with_partial_fills_returns_negative_realized():
+def test_estimate_trade_outcome_failure_with_partial_fills_returns_negative_realized():
     opp = _make_opp(net_edge=0.10, total_cost=0.95)
     trades = [_make_trade(fill_size=4.0, economic_cost=0.45, status=TradeStatus.PARTIAL)]
-    pnl = estimate_ai_trade_outcome(opp, trades, arb_success=False, adj_size=10.0)
+    pnl = estimate_trade_outcome(opp, trades, arb_success=False, adj_size=10.0)
     assert pnl == -0.45 * 4.0
 
 
-def test_estimate_ai_trade_outcome_failure_no_fill_falls_back_to_total_cost():
+def test_estimate_trade_outcome_failure_no_fill_falls_back_to_total_cost():
     opp = _make_opp(net_edge=0.10, total_cost=0.95)
     trades = [_make_trade(fill_size=0.0, status=TradeStatus.FAILED)]
-    pnl = estimate_ai_trade_outcome(opp, trades, arb_success=False, adj_size=10.0)
+    pnl = estimate_trade_outcome(opp, trades, arb_success=False, adj_size=10.0)
     assert pnl == -0.95 * 10.0
 
 
@@ -244,7 +244,30 @@ def test_serialize_strategy_signal_round_trip():
     assert payload["tier"] == "STATISTICAL_ARB"
     assert payload["submitted"] is True
     assert payload["research_overlay"] == {"r": 1}
-    assert payload["payload"] == {"hint": "ok"}
+    assert payload["payload"] == {
+        "hint": "ok",
+        "signal_source": "unknown",
+        "signal_components": ["unknown"],
+    }
+
+
+def test_serialize_strategy_signal_adds_attribution_fields():
+    signal = StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type="wallet_alpha_buy_yes",
+        market_id="cX",
+        description="wallet follow",
+        expected_edge=800.0,
+        confidence=0.8,
+        recommended_size_usdc=20.0,
+        payload={"wallet_address": "0xabc"},
+    )
+
+    payload = serialize_strategy_signal(signal, submitted=True)
+
+    assert payload["signal_source"] == "wallet_alpha"
+    assert payload["signal_components"] == ["wallet_alpha"]
+    assert payload["payload"]["signal_source"] == "wallet_alpha"
 
 
 def test_lookup_market_snapshot_exact_then_prefix_then_empty():

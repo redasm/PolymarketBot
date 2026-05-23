@@ -110,6 +110,7 @@ class ExecutionEngine:
         self._gtc_order_type = self._resolve_named_order_type("GTC")
         self._balance_cache: float | None = None
         self._balance_cache_ts: float = 0.0
+        self._last_balance_error_log_ts: float = 0.0
         # Set whenever a rollback hits a transient (network) failure, so the
         # main loop can force a portfolio sync before approving new trades.
         # Cleared by `consume_force_portfolio_resync()`.
@@ -616,23 +617,36 @@ class ExecutionEngine:
         self._balance_cache_ts = 0.0
 
     def _fetch_collateral_balance_uncached(self) -> float | None:
-        balance_params = self._build_collateral_balance_params()
         try:
+            balance_params = self._build_collateral_balance_params()
             if balance_params is None:
                 response = self._client.get_balance_allowance()
             else:
                 response = self._client.get_balance_allowance(balance_params)
-        except TypeError:
+        except TypeError as exc:
             if self._config.signature_type == 3:
+                self._log_balance_query_failure("balance_allowance_type_error", exc)
                 return None
             try:
                 fallback_params = self._build_legacy_balance_params_with_signature(-1)
                 response = self._client.get_balance_allowance(fallback_params)
-            except Exception:
+            except Exception as fallback_exc:
+                self._log_balance_query_failure("balance_allowance_legacy_fallback", fallback_exc)
                 return None
-        except Exception:
+        except Exception as exc:
+            self._log_balance_query_failure("balance_allowance", exc)
             return None
-        return self._parse_balance_response(response)
+        parsed = self._parse_balance_response(response)
+        if parsed is None:
+            self._log_balance_query_failure("balance_parse", "response did not contain a usable collateral balance")
+        return parsed
+
+    def _log_balance_query_failure(self, phase: str, error: Exception | str) -> None:
+        now = time.time()
+        if now - self._last_balance_error_log_ts < 60.0:
+            return
+        self._last_balance_error_log_ts = now
+        LOG.warning("CLOB USDC 余额查询失败: phase=%s error=%s", phase, error)
 
     def _build_collateral_balance_params(self) -> Any | None:
         if self._config.signature_type == 3:
@@ -732,6 +746,7 @@ class ExecutionEngine:
         *,
         fill_latency_sec: float = 0.0,
         now_ts: float | None = None,
+        fill_guard: Any | None = None,
     ) -> list[TradeRecord]:
         """Shadow-mode maker-fill sweep (roadmap §三-阶段 1).
 
@@ -795,6 +810,27 @@ class ExecutionEngine:
             else:
                 fill_size = requested_size
             partial = fill_size + 1e-9 < requested_size
+            if fill_guard is not None:
+                try:
+                    guard_result = fill_guard(trade, fill_size, cross_price)
+                except Exception as exc:  # pragma: no cover - guard failures should be conservative
+                    LOG.warning("shadow maker fill guard failed for %s: %s", trade.trade_id, exc)
+                    continue
+                allowed = bool(guard_result)
+                reason = ""
+                if isinstance(guard_result, tuple):
+                    allowed = bool(guard_result[0])
+                    reason = str(guard_result[1] if len(guard_result) > 1 else "")
+                if not allowed:
+                    LOG.info(
+                        "[SHADOW] maker quote fill skipped by guard: trade=%s side=%s limit=%.4f cross=%.4f reason=%s",
+                        trade.trade_id,
+                        trade.side.value,
+                        limit_price,
+                        cross_price,
+                        reason or "guard_rejected",
+                    )
+                    continue
 
             trade.status = TradeStatus.PARTIAL if partial else TradeStatus.FILLED
             trade.fill_price = limit_price

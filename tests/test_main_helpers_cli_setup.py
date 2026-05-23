@@ -19,10 +19,8 @@ import pytest
 from polymarket_arb.main_helpers.cli_setup import (
     build_run_instance_id,
     create_research_signal_service,
-    get_or_create_event_loop,
     load_last_backtest_report,
     log_startup_summary,
-    parse_extra_rss_feeds,
     parse_http_json_sources,
     round_timing,
 )
@@ -47,22 +45,6 @@ def test_round_timing_clamps_negative_and_rounds():
     assert round_timing(0.123456789) == 0.1235
     assert round_timing(None) == 0.0  # type: ignore[arg-type]
     assert round_timing(0.0) == 0.0
-
-
-def test_parse_extra_rss_feeds_handles_named_and_unnamed_entries():
-    raw = "feed_a=https://a.example/rss, https://b.example/rss ,=https://c.example/rss"
-    out = parse_extra_rss_feeds(raw)
-    assert out == [
-        ("feed_a", "https://a.example/rss"),
-        ("rss_feed_2", "https://b.example/rss"),
-        ("rss_feed_3", "https://c.example/rss"),  # blank name -> auto-name
-    ]
-
-
-def test_parse_extra_rss_feeds_drops_blank_templates_and_empty_items():
-    raw = " , name_only=  , real=https://x.example/rss"
-    out = parse_extra_rss_feeds(raw)
-    assert out == [("real", "https://x.example/rss")]
 
 
 def test_parse_http_json_sources_returns_dict_list():
@@ -115,16 +97,6 @@ def test_create_research_signal_service_handles_missing_module(monkeypatch, capl
         out = create_research_signal_service(cfg)
     assert out is None
     assert any("模块导入失败" in record.getMessage() for record in caplog.records)
-
-
-def test_get_or_create_event_loop_reuses_existing_loop():
-    loop = get_or_create_event_loop()
-    try:
-        loop2 = get_or_create_event_loop()
-        assert loop is loop2
-        assert not loop.is_closed()
-    finally:
-        loop.close()
 
 
 def test_load_last_backtest_report_missing_dir_returns_disabled():

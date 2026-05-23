@@ -1,8 +1,8 @@
 """Source weighting helpers for research signals.
 
 Inspired by multi-source news pipelines: distinguish market seed rows,
-aggregator feeds, primary media, and local knowledge so scoring can
-reward corroborated and timely evidence without over-trusting any one feed.
+aggregator feeds, and primary media so scoring can reward corroborated
+and timely evidence without over-trusting any one feed.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ _DEFAULT_PROFILE = {
 _SOURCE_PROFILES: dict[str, dict[str, object]] = {
     "polymarket_market": {"label": "Polymarket Market", "type": "market_seed", "tier": 4, "weight": 0.18},
     "google_news_rss": {"label": "Google News RSS", "type": "aggregator", "tier": 3, "weight": 0.62},
-    "local_knowledge_base": {"label": "Local Knowledge Base", "type": "knowledge", "tier": 2, "weight": 0.78},
     "coindesk": {"label": "CoinDesk", "type": "crypto_media", "tier": 2, "weight": 0.76},
     "cointelegraph": {"label": "Cointelegraph", "type": "crypto_media", "tier": 2, "weight": 0.72},
     "the_block": {"label": "The Block", "type": "crypto_media", "tier": 2, "weight": 0.79},

@@ -21,6 +21,14 @@ from research.backtest.execution_model.base import (
 from research.backtest.replay.runner import BacktestRunConfig, BacktestRunner
 from research.backtest.reports.reporting import save_best_scan_result, save_scan_results
 
+STRATEGY_NAME_MAP = {
+    "t0": "t0_structural_arbitrage",
+    "t2": "t2_statistical_arbitrage",
+    "logical-constraint": "logical_constraint",
+    "event-calendar": "event_calendar",
+    "wallet-alpha": "wallet_alpha",
+}
+
 
 def _parse_csv_numbers(raw: str | None, cast):
     if not raw:
@@ -71,7 +79,7 @@ def main() -> None:
     parser.add_argument("--dataset", default=None, help="Dataset name under BACKTEST_DATA_DIR")
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--dotenv-path", default=None, help="Optional .env path for ArbConfig")
-    parser.add_argument("--strategy", default="t0", choices=["t0", "t2"])
+    parser.add_argument("--strategy", default="t0", choices=sorted(STRATEGY_NAME_MAP))
     parser.add_argument("--execution-model", default="depth", choices=["depth", "top", "queue"])
     parser.add_argument("--scan-slippage-bps", default=None, help="Comma-separated slippage bps values")
     parser.add_argument("--scan-latency-ms", default=None, help="Comma-separated latency ms values")
@@ -95,7 +103,7 @@ def main() -> None:
     dataset = args.dataset or config.backtest_default_dataset
     output_dir = args.output_dir or config.backtest_reports_dir
     runner = BacktestRunner(config.backtest_data_dir)
-    strategy_name = "t0_structural_arbitrage" if args.strategy == "t0" else "t2_statistical_arbitrage"
+    strategy_name = STRATEGY_NAME_MAP[args.strategy]
     strategy = type("BacktestStrategy", (), {"strategy_name": strategy_name})()
 
     slippage_values = _parse_csv_numbers(args.scan_slippage_bps, float)

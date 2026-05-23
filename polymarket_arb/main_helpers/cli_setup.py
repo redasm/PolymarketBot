@@ -13,7 +13,6 @@ covered with a focused unit test.
 
 from __future__ import annotations
 
-import asyncio
 import importlib
 import json
 import logging
@@ -89,39 +88,14 @@ def log_startup_summary(config: ArbConfig, run_id: str) -> None:
         config.portfolio_sync_interval_sec,
     )
     LOG.info(
-        "策略: maker=%s | 研究/AI: research=%s knowledge=%s ai=%s provider=%s model=%s",
+        "策略: maker=%s | 研究: research=%s feeds_file=%s | LLM配置: provider=%s model=%s",
         config.maker_strategy_enabled,
         config.research_signal_enabled,
-        config.research_signal_knowledge_enabled,
-        config.ai_enabled,
+        config.research_signal_feeds_file,
         config.ai_provider,
         config.ai_model,
     )
     LOG.info("=" * 60)
-
-
-def parse_extra_rss_feeds(raw: str) -> list[tuple[str, str]]:
-    """Parse `RESEARCH_SIGNAL_EXTRA_RSS_FEEDS` into `(name, template)` pairs.
-
-    Supports two encodings within a comma-separated list:
-    - `name=https://example.com/rss` (explicit name)
-    - `https://example.com/rss`      (auto-name `rss_feed_<idx>`)
-    """
-    feeds: list[tuple[str, str]] = []
-    for idx, item in enumerate(raw.split(","), start=1):
-        item = item.strip()
-        if not item:
-            continue
-        if "=" in item:
-            name, template = item.split("=", 1)
-            name = name.strip() or f"rss_feed_{idx}"
-        else:
-            name, template = f"rss_feed_{idx}", item
-        template = template.strip()
-        if not template:
-            continue
-        feeds.append((name, template))
-    return feeds
 
 
 def parse_http_json_sources(raw: str) -> list[dict]:
@@ -168,17 +142,14 @@ def create_research_signal_service(config: ArbConfig) -> Optional["ResearchSigna
             max_items=config.research_signal_max_items,
             cache_ttl_sec=config.research_signal_cache_ttl_sec,
             cache_dir=config.research_signal_cache_dir,
-            extra_rss_feeds=parse_extra_rss_feeds(config.research_signal_extra_rss_feeds),
+            feeds_file=config.research_signal_feeds_file,
             http_json_sources=parse_http_json_sources(config.research_signal_http_json_sources),
-            surf_enabled=config.research_signal_surf_enabled,
-            surf_api_key=config.research_signal_surf_api_key,
-            surf_api_base=config.research_signal_surf_api_base,
-            surf_model=config.research_signal_surf_model,
-            surf_timeout_sec=config.research_signal_surf_timeout_sec,
-            surf_cache_ttl_sec=config.research_signal_surf_cache_ttl_sec,
-            knowledge_base_dir=config.research_signal_knowledge_dir,
-            knowledge_base_enabled=config.research_signal_knowledge_enabled,
-            knowledge_max_matches=config.research_signal_knowledge_max_matches,
+            crypto_macro_enabled=config.research_signal_crypto_macro_enabled,
+            coingecko_enabled=config.research_signal_coingecko_enabled,
+            funding_rate_enabled=config.research_signal_funding_rate_enabled,
+            econ_calendar_enabled=config.research_signal_econ_calendar_enabled,
+            defillama_enabled=config.research_signal_defillama_enabled,
+            polymarket_activity_enabled=config.research_signal_polymarket_activity_enabled,
         )
     except Exception as e:
         LOG.error("Research Signal 功能已禁用: 初始化失败: %s", e, exc_info=True)
@@ -216,24 +187,6 @@ def create_cross_platform_scanner(
 def round_timing(value: float) -> float:
     """Clamp negative noise + round to 4 decimals for telemetry payloads."""
     return round(max(0.0, float(value or 0.0)), 4)
-
-
-def get_or_create_event_loop() -> asyncio.AbstractEventLoop:
-    """Return a usable event loop, creating one if needed.
-
-    `asyncio.get_event_loop()` raises in worker threads on Python 3.10+
-    when no loop is bound; this helper creates and binds one so callers
-    in non-async contexts (e.g. the AI advisor's sync wrappers) don't
-    need to know that detail.
-    """
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            raise RuntimeError
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    return loop
 
 
 def load_last_backtest_report(backtest_reports_dir: str) -> dict:

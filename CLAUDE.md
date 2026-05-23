@@ -85,7 +85,7 @@ Before queueing directional signals, `StrategyOrchestrator` applies two adjustme
 - **`ai_advisor.py`** — Optional LLM layer (`AIAdvisor`); market evaluation, execution decisions, dynamic risk adjustments — all still pass through RiskManager
 - **`notifier.py` + `feishu_notifier.py`** — Unified notification routing (trade success/failure, fatal errors, PnL alerts, daily summary) via Feishu app-bot OpenAPI
 - **`portfolio_sync.py`** — Low-frequency real-account sync (positions + daily realized PnL → dashboard/risk state); does not touch the high-frequency scan/execute path
-- **`research_signal/`** — Collectors / normalizers / scorers package feeding the orchestrator's research overlay (RSS, optional local JSONL knowledge base under `data/research_signal/knowledge/`)
+- **`research_signal/`** — Collectors / normalizers / scorers package feeding the orchestrator's research overlay (RSS feeds curated by the `research-feeds-llm` worker into `data/quant_inputs/research_feeds.json`)
 - **`research/backtest/`** — Separate offline backtest runner package (distinct from `research_signal/`); driven by `python -m research.backtest.run`
 
 ### AI Layer
@@ -104,7 +104,7 @@ T3 market making: $200 (20%)
 ### Data & Telemetry
 
 - Tick recording: `TICK_RECORD_ENABLED=true` → `data/ticks/YYYY-MM-DD.ndjson` (rolls at 200MB)
-- Strategy signals: `data/telemetry/*.strategy_signals.ndjson` — T1/T2/T3 signals written here even when no T0 arb fires. **Seeing "0 arbs" in T0 does not mean the other tiers have no signals; check this file too.** The cycle metric `arbs_found_total` only counts T0 structural opportunities.
+- Strategy signals: `data/telemetry/*.strategy_signals.ndjson` — T1/T2/T3 signals written here even when no T0 arb fires. **Seeing "0 arbs" in T0 does not mean the other tiers have no signals; check this file too.** The cycle metric `arbs_found_total` is the orchestrator's directional-signal count (T0 + T1 + T2 + new logical/event/wallet tiers, not T3 maker quotes); the dedicated `t0_opportunities_total` field on the same row is what isolates T0 structural arbs.
 - Cycle metrics: `data/telemetry/*.cycle_metrics.ndjson` — one row per scan cycle with `book_stats` (ws_hit / cache_hit / rest_fallback breakdown), `timing_stats`, exposure, position count.
 - Strategy executions: `data/telemetry/*.strategy_executions.ndjson` — entries, exits, and orchestrator-skipped aggregates (`skip_reasons` includes `per_market_rate_cap`, `tier_budget_below_min_order`).
 - Risk events: `data/telemetry/*.risk_events.ndjson` — currently also captures `cycle_summary` and `portfolio_sync` rows (i.e., it's a superset, not just trip events).
@@ -181,6 +181,7 @@ For observation mode (before going live), broaden scanning with `ARB_MARKET_FOCU
 - `LIVE_TRADING_BASELINE.md` — baseline parameters for going live with small capital
 - `SERVER_OBSERVABILITY.md` — log/telemetry watch recommendations for unattended servers
 - `EXTERNAL_REFERENCES.md` — external research / data source references
+- `PENDING_VALIDATIONS.md` — checklist for graduating shadow-mode features (NearCertaintyRule, dynamic stop, barbell pool, on-chain signals) to live; lists data sources needed and the env flags to flip on each validation
 
 ## Testing
 

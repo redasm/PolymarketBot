@@ -41,7 +41,6 @@ class DataJanitor:
         research_cache_dir: str,
         research_cache_retention_days: int,
         research_cache_max_gb: float,
-        research_knowledge_dir: str,
         backtest_data_dir: str,
         backtest_retention_days: int,
         backtest_max_gb: float,
@@ -57,7 +56,7 @@ class DataJanitor:
                 Path(research_cache_dir),
                 research_cache_retention_days,
                 research_cache_max_gb,
-                lambda path: Path(research_knowledge_dir) in path.parents or path == Path(research_knowledge_dir),
+                None,
             ),
             ("backtest", Path(backtest_data_dir), backtest_retention_days, backtest_max_gb, None),
         ]

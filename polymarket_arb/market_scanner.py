@@ -117,6 +117,8 @@ def _parse_market(raw: dict) -> Optional[MarketInfo]:
             outcomes = json.loads(outcomes)
         except Exception:
             outcomes = []
+    if not isinstance(outcomes, list):
+        outcomes = []
 
     outcome_prices_raw = raw.get("outcomePrices") or raw.get("outcome_prices") or []
     if isinstance(outcome_prices_raw, str):
@@ -125,6 +127,8 @@ def _parse_market(raw: dict) -> Optional[MarketInfo]:
             outcome_prices_raw = json.loads(outcome_prices_raw)
         except Exception:
             outcome_prices_raw = []
+    if not isinstance(outcome_prices_raw, list):
+        outcome_prices_raw = []
     outcome_prices = [
         _coerce_float(p)
         for p in outcome_prices_raw
@@ -153,6 +157,8 @@ def _parse_market(raw: dict) -> Optional[MarketInfo]:
                 clob_token_ids = json.loads(clob_token_ids)
             except Exception:
                 clob_token_ids = [part.strip() for part in clob_token_ids.split(",") if part.strip()]
+        if not isinstance(clob_token_ids, list):
+            clob_token_ids = []
         for idx, token_id in enumerate(clob_token_ids):
             outcome = _normalize_text(outcomes[idx]) if idx < len(outcomes) else f"Outcome {idx + 1}"
             price = outcome_prices[idx] if idx < len(outcome_prices) else 0.0
@@ -184,6 +190,9 @@ def _parse_market(raw: dict) -> Optional[MarketInfo]:
     )
 
 
+_PARSE_FAILURE_LOGGED: set[str] = set()
+
+
 def _safe_parse_market(raw: Any, *, context: str) -> Optional[MarketInfo]:
     if not isinstance(raw, dict):
         LOG.warning("%s 跳过非对象 market 行: type=%s", context, type(raw).__name__)
@@ -192,7 +201,15 @@ def _safe_parse_market(raw: Any, *, context: str) -> Optional[MarketInfo]:
         return _parse_market(raw)
     except Exception as exc:
         condition_id = raw.get("condition_id") or raw.get("conditionId") or ""
-        LOG.warning("%s 跳过无法解析的 market 行 condition=%s: %s", context, condition_id, exc)
+        key = f"{context}|{condition_id}|{type(exc).__name__}"
+        if key in _PARSE_FAILURE_LOGGED:
+            LOG.debug("%s 跳过无法解析的 market 行 condition=%s: %s", context, condition_id, exc)
+        else:
+            _PARSE_FAILURE_LOGGED.add(key)
+            LOG.warning(
+                "%s 跳过无法解析的 market 行 condition=%s: %s (后续相同错误降为 DEBUG)",
+                context, condition_id, exc,
+            )
         return None
 
 

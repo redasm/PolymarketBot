@@ -20,15 +20,18 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Callable
 
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.event_recorder import EventRecorder
 from polymarket_arb.execution_engine import ExecutionEngine
 from polymarket_arb.main_helpers.maker_fill_notifications import handle_observed_maker_fills
 from polymarket_arb.main_helpers.signal_helpers import apply_maker_fill_to_inventory
+from polymarket_arb.models import TradeRecord
 from polymarket_arb.notifier import NotificationManager
 from polymarket_arb.risk_manager import RiskManager
 from polymarket_arb.strategies.maker_strategy import MakerStrategy
+from polymarket_arb.strategies.strategy_orchestrator import StrategyOrchestrator, StrategyTier
 
 LOG = logging.getLogger("main_loop")
 
@@ -40,6 +43,8 @@ def sync_live_order_statuses(
     maker_strategy: MakerStrategy,
     event_recorder: EventRecorder,
     notifier: NotificationManager | None = None,
+    orchestrator: StrategyOrchestrator | None = None,
+    on_observed_maker_fill: Callable[[TradeRecord, float], None] | None = None,
 ) -> None:
     """Poll the venue for pending order statuses and apply fills.
 
@@ -64,6 +69,11 @@ def sync_live_order_statuses(
                 trade.trade_id: apply_maker_fill_to_inventory(maker_strategy, trade)
                 for trade in order_sync.changed
             }
+            _release_t3_exposure_for_synced_orders(
+                orchestrator,
+                order_sync.changed,
+                inventory_deltas=inventory_deltas,
+            )
             handle_observed_maker_fills(
                 trades=order_sync.changed,
                 maker_strategy=maker_strategy,
@@ -73,6 +83,7 @@ def sync_live_order_statuses(
                 event_name="live_maker_fill_observed",
                 apply_inventory=False,
                 inventory_deltas=inventory_deltas,
+                on_observed=on_observed_maker_fill,
             )
         if event_recorder.is_enabled and order_sync.changed:
             for trade in order_sync.changed:
@@ -104,6 +115,7 @@ def cancel_stale_maker_orders(
     executor: ExecutionEngine,
     risk_mgr: RiskManager,
     event_recorder: EventRecorder,
+    orchestrator: StrategyOrchestrator | None = None,
 ) -> None:
     """Cancel any maker (post-only GTC) orders older than the TTL.
 
@@ -120,6 +132,7 @@ def cancel_stale_maker_orders(
         )
         if cancelled_stale:
             risk_mgr.reconcile_pending_order_statuses(cancelled_stale)
+            _release_t3_exposure_for_synced_orders(orchestrator, cancelled_stale)
             if event_recorder.is_enabled:
                 for trade in cancelled_stale:
                     event_recorder.write_event("risk_events", {
@@ -139,3 +152,67 @@ def cancel_stale_maker_orders(
                 "error": str(exc),
                 "ts": time.time(),
             })
+
+
+def _release_t3_exposure_for_synced_orders(
+    orchestrator: StrategyOrchestrator | None,
+    trades: list,
+    *,
+    inventory_deltas: dict[str, float] | None = None,
+) -> None:
+    if orchestrator is None:
+        return
+    for trade in trades:
+        amount = _t3_exposure_release_amount(
+            trade,
+            inventory_delta=(inventory_deltas or {}).get(str(getattr(trade, "trade_id", "")), 0.0),
+        )
+        if amount <= 0:
+            continue
+        try:
+            orchestrator.record_settlement(StrategyTier.MARKET_MAKING, amount, 0.0)
+        except Exception as exc:  # pragma: no cover - telemetry path must not break sync
+            LOG.warning("释放 T3 策略预算失败: trade=%s amount=%.4f err=%s", getattr(trade, "trade_id", ""), amount, exc)
+
+
+def _t3_exposure_release_amount(trade, *, inventory_delta: float = 0.0) -> float:
+    if not bool(getattr(trade, "post_only", False)):
+        return 0.0
+    side = _side_value(trade)
+    price = _trade_price(trade)
+    if price <= 0:
+        return 0.0
+    if side == "SELL":
+        return price * max(0.0, float(inventory_delta or 0.0))
+    if side != "BUY":
+        return 0.0
+    status = _status_value(trade)
+    if status not in {"cancelled", "canceled", "failed"}:
+        return 0.0
+    requested = max(0.0, _float(getattr(trade, "size", 0.0)))
+    filled = max(0.0, _float(getattr(trade, "fill_size", 0.0)))
+    return price * max(0.0, requested - filled)
+
+
+def _trade_price(trade) -> float:
+    economic_cost = getattr(trade, "economic_cost", None)
+    if economic_cost not in (None, ""):
+        return max(0.0, _float(economic_cost))
+    return max(0.0, _float(getattr(trade, "price", 0.0)))
+
+
+def _status_value(trade) -> str:
+    return str(getattr(getattr(trade, "status", ""), "value", getattr(trade, "status", ""))).lower()
+
+
+def _side_value(trade) -> str:
+    return str(getattr(getattr(trade, "side", ""), "value", getattr(trade, "side", ""))).upper()
+
+
+def _float(value) -> float:
+    try:
+        if value in (None, ""):
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0

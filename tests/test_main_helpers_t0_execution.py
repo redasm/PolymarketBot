@@ -14,7 +14,6 @@ Pins the per-opportunity gating chain:
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
@@ -221,7 +220,6 @@ def test_dry_run_simulated_success_returns_simulated_delta() -> None:
         executor=_executor(trades=[_trade(simulated=True)]),
         risk_mgr=risk,
         notifier=notifier,
-        ai_advisor=None,
         dash_state=dash,
         event_recorder=rec,
     )
@@ -254,7 +252,6 @@ def test_live_success_records_through_risk_mgr_and_notifies() -> None:
         executor=_executor(trades=[_trade(simulated=False)]),
         risk_mgr=risk,
         notifier=notifier,
-        ai_advisor=None,
         dash_state=dash,
         event_recorder=rec,
     )
@@ -281,7 +278,6 @@ def test_depth_verification_failure_bails_with_stable_reason() -> None:
         executor=_executor(),
         risk_mgr=_RiskMgrAccept(),
         notifier=_Notifier(),
-        ai_advisor=None,
         dash_state=_DashState(),
         event_recorder=rec,
     )
@@ -298,7 +294,6 @@ def test_pre_trade_reject_bails_with_stable_reason() -> None:
         executor=_executor(),
         risk_mgr=_RiskMgrReject("max_positions_reached"),
         notifier=_Notifier(),
-        ai_advisor=None,
         dash_state=_DashState(),
         event_recorder=rec,
     )
@@ -317,63 +312,11 @@ def test_collateral_reject_bails_with_stable_reason() -> None:
         executor=_executor(collateral_ok=False, collateral_reason="insufficient_balance"),
         risk_mgr=_RiskMgrAccept(),
         notifier=_Notifier(),
-        ai_advisor=None,
         dash_state=_DashState(),
         event_recorder=rec,
     )
     assert delta == ExecutionDelta()
     assert _has_event(rec, "risk_events", "balance_reject")
-
-
-# ---------- AI advisor wiring -----------------------------------------------
-
-
-def test_ai_advisor_record_outcome_called_only_in_live_mode() -> None:
-    """Dry-run path skips AI outcome update entirely."""
-    advisor_calls: list[Any] = []
-    advisor = SimpleNamespace(record_trade_outcome=lambda payload: advisor_calls.append(payload))
-
-    execute_t0_opportunity(
-        opp=_opp(),
-        config=_config(dry_run=True),
-        detector=_detector(),
-        executor=_executor(trades=[_trade(simulated=True)]),
-        risk_mgr=_RiskMgrAccept(),
-        notifier=_Notifier(),
-        ai_advisor=advisor,
-        dash_state=_DashState(),
-        event_recorder=_Recorder(),
-    )
-    assert advisor_calls == []
-
-    # Live mode: the call should fire.
-    execute_t0_opportunity(
-        opp=_opp(),
-        config=_config(dry_run=False),
-        detector=_detector(),
-        executor=_executor(trades=[_trade(simulated=False)]),
-        risk_mgr=_RiskMgrAccept(),
-        notifier=_Notifier(),
-        ai_advisor=advisor,
-        dash_state=_DashState(),
-        event_recorder=_Recorder(),
-    )
-    assert len(advisor_calls) == 1
-
-
-def test_no_ai_advisor_does_not_crash() -> None:
-    delta = execute_t0_opportunity(
-        opp=_opp(),
-        config=_config(dry_run=False),
-        detector=_detector(),
-        executor=_executor(trades=[_trade(simulated=False)]),
-        risk_mgr=_RiskMgrAccept(),
-        notifier=_Notifier(),
-        ai_advisor=None,
-        dash_state=_DashState(),
-        event_recorder=_Recorder(),
-    )
-    assert delta.live_successes == 1
 
 
 # ---------- target_size math ------------------------------------------------
@@ -396,7 +339,6 @@ def test_zero_total_cost_bypasses_division_and_floors_target_size() -> None:
         executor=_executor(),
         risk_mgr=_RiskMgrAccept(),
         notifier=_Notifier(),
-        ai_advisor=None,
         dash_state=_DashState(),
         event_recorder=_Recorder(),
     )
@@ -421,7 +363,6 @@ def test_target_size_clamped_by_max_executable_size() -> None:
         executor=_executor(),
         risk_mgr=_RiskMgrAccept(),
         notifier=_Notifier(),
-        ai_advisor=None,
         dash_state=_DashState(),
         event_recorder=_Recorder(),
     )

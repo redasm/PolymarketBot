@@ -225,7 +225,7 @@ def resolve_strategy_signal_action(signal: StrategySignal) -> str:
 def find_market_for_signal(signal_market_id: str, markets: list[MarketInfo]) -> MarketInfo | None:
     """Locate the `MarketInfo` for a signal, accepting truncated condition_ids.
 
-    Some upstream sources (logs, dashboard rows, AI prompts) carry only a
+    Some upstream sources (logs, dashboard rows) carry only a
     truncated `condition_id`. The prefix fallback lets the executor
     reconcile signals against the live universe without strict equality.
     """

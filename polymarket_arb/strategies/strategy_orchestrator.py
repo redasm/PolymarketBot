@@ -53,7 +53,12 @@ from dataclasses import dataclass, field, replace
 from enum import IntEnum
 from typing import Any, Optional
 
-from polymarket_arb.strategies.signal_policies import TailRiskClassifier
+from polymarket_arb.strategies.signal_policies import (
+    BarbellPolicy,
+    NearCertaintyClassifier,
+    NearCertaintyResult,
+    TailRiskClassifier,
+)
 from research_signal.normalizers.topic import topic_overlap_score
 
 LOG = logging.getLogger(__name__)
@@ -109,10 +114,10 @@ class StrategyOrchestrator:
     # is halved because it's the role the paper most clearly identifies
     # as a negative-EV game in efficient categories.
     DEFAULT_ALLOCATIONS = {
-        StrategyTier.STRUCTURAL_ARB: 0.30,
-        StrategyTier.CROSS_PLATFORM: 0.05,
-        StrategyTier.STATISTICAL_ARB: 0.15,
-        StrategyTier.MARKET_MAKING: 0.50,
+        StrategyTier.STRUCTURAL_ARB: 0.35,
+        StrategyTier.CROSS_PLATFORM: 0.10,
+        StrategyTier.STATISTICAL_ARB: 0.35,
+        StrategyTier.MARKET_MAKING: 0.20,
     }
     _MAX_SIGNAL_HISTORY = 2000
     # Per-market-per-hour cap applies only to directional tiers; T0 / T3 are
@@ -129,17 +134,53 @@ class StrategyOrchestrator:
         *,
         max_signals_per_market_per_hour: int = 2,
         tail_risk_classifier: Optional[TailRiskClassifier] = None,
+        near_certainty_classifier: Optional[NearCertaintyClassifier] = None,
+        barbell_policy: Optional[BarbellPolicy] = None,
+        sniper_gate: Any | None = None,
+        max_signal_size_multiplier: float = 1.35,
     ):
         self._bankroll = total_bankroll
+        self._peak_equity = max(0.0, float(total_bankroll))
         alloc_map = allocations or self.DEFAULT_ALLOCATIONS
 
         self._allocations: dict[StrategyTier, StrategyAllocation] = {}
         for tier, pct in alloc_map.items():
             self._allocations[tier] = StrategyAllocation(tier=tier, allocation_pct=pct)
         self._tail_risk_classifier = tail_risk_classifier or TailRiskClassifier()
+        # Near-certainty rule defaults to shadow mode. Operators wire a
+        # non-shadow instance from config once empirical validation is
+        # complete (see scripts/verify_near_certainty_trap.py).
+        self._near_certainty_classifier = (
+            near_certainty_classifier or NearCertaintyClassifier()
+        )
+        # Barbell pool: see signal_policies.BarbellPolicy. Disabled by
+        # default — operator wires a real instance from config once
+        # the data_driven_exposure / tail_exposure split surfaced under
+        # `meta.barbell` looks healthy.
+        self._barbell_policy = barbell_policy or BarbellPolicy(
+            enabled=False, tail_budget_usdc=0.0
+        )
+        # Per-class T2 exposure tracker for the barbell. The keys are
+        # the bucket names returned by BarbellPolicy.classify_bucket
+        # ("data_driven" / "tail"). Updated on submit (positive) and on
+        # `record_settlement` for STATISTICAL_ARB tier (negative).
+        self._t2_class_exposure_usdc: dict[str, float] = {
+            "data_driven": 0.0,
+            "tail": 0.0,
+        }
+        # Tracks (signal_id → (bucket, amount)) so settlement can debit
+        # the right bucket. Bounded along with executed_signals via the
+        # MAX_SIGNAL_HISTORY cap.
+        self._t2_class_signal_ledger: dict[str, tuple[str, float]] = {}
+        self._sniper_gate = sniper_gate
 
         self._pending_signals: list[StrategySignal] = []
         self._executed_signals: list[StrategySignal] = []
+        self._sniper_gate_stats = {
+            "applied": 0,
+            "accepted": 0,
+            "rejected": 0,
+        }
         self._research_overlay_stats = {
             "applied": 0,
             "boosted": 0,
@@ -150,6 +191,19 @@ class StrategyOrchestrator:
             "applied": 0,
             "penalized": 0,
             "high_risk": 0,
+            "vetoed": 0,
+        }
+        # Near-certainty telemetry. `would_apply_*` counts shadow-mode
+        # hits where the rule would have fired but did not modify the
+        # signal. `applied_*` counts only fires under live (non-shadow)
+        # mode. Operators use the would_apply samples to validate the
+        # rule offline before flipping shadow_mode=false.
+        self._near_certainty_stats = {
+            "evaluated": 0,
+            "would_apply_high": 0,
+            "would_apply_longshot": 0,
+            "applied_high": 0,
+            "applied_longshot": 0,
         }
         self._overlay_history: list[dict[str, Any]] = []
         self._last_skip_reasons: dict[str, int] = {}
@@ -162,6 +216,7 @@ class StrategyOrchestrator:
         self._signal_history_by_market: dict[tuple[StrategyTier, str], list[float]] = {}
         self._max_signals_per_market_per_hour = max(0, int(max_signals_per_market_per_hour))
         self._rate_cap_log_state: dict[tuple[StrategyTier, str], tuple[float, int]] = {}
+        self._max_signal_size_multiplier = max(1.0, float(max_signal_size_multiplier))
 
     def submit_signal(
         self,
@@ -171,6 +226,36 @@ class StrategyOrchestrator:
         research_report: dict | Any | None = None,
         research_signals: list[Any] | None = None,
     ) -> bool:
+        active_markets = active_markets or []
+        original_size = max(0.0, float(signal.recommended_size_usdc))
+        if self._sniper_gate is not None:
+            market = self._find_market(signal.market_id, active_markets)
+            gate_decision = self._sniper_gate.evaluate(signal, market=market)
+            self._record_sniper_gate(gate_decision)
+            if not gate_decision.accepted:
+                self._record_process_skip(signal, "sniper_gate_reject")
+                LOG.info(
+                    "策略信号被 sniper gate 拦截: tier=%s market=%s reasons=%s",
+                    signal.tier,
+                    signal.market_id[:12] if signal.market_id else "?",
+                    gate_decision.reasons,
+                )
+                return False
+            if getattr(gate_decision, "size_multiplier", 1.0) != 1.0:
+                signal = replace(
+                    signal,
+                    recommended_size_usdc=max(
+                        0.0,
+                        signal.recommended_size_usdc * float(gate_decision.size_multiplier),
+                    ),
+                    payload={
+                        **dict(signal.payload),
+                        "sniper_gate": {
+                            "size_multiplier": round(float(gate_decision.size_multiplier), 3),
+                            "reasons": list(gate_decision.reasons),
+                        },
+                    },
+                )
         if not self._check_per_market_rate_cap(signal):
             self._record_process_skip(signal, "per_market_rate_cap")
             self._log_rate_cap_skip(signal)
@@ -180,7 +265,7 @@ class StrategyOrchestrator:
         signal_copy = replace(signal, payload=dict(signal.payload))
         overlay = self._apply_research_overlay(
             signal_copy,
-            active_markets=active_markets or [],
+            active_markets=active_markets,
             research_report=research_report,
             research_signals=research_signals or [],
         )
@@ -196,10 +281,40 @@ class StrategyOrchestrator:
             return False
         tail_risk = self._apply_tail_risk_adjustment(
             signal_copy,
-            active_markets=active_markets or [],
+            active_markets=active_markets,
         )
         signal_copy.payload["tail_risk"] = tail_risk
         self._record_tail_risk(tail_risk)
+        if tail_risk.get("veto"):
+            LOG.info(
+                "策略信号被 tail_risk veto: tier=%s market=%s risk_class=%s reasons=%s",
+                signal_copy.tier,
+                signal_copy.market_id[:12] if signal_copy.market_id else "?",
+                tail_risk.get("risk_class"),
+                tail_risk.get("reasons", []),
+            )
+            self._record_process_skip(signal_copy, "tail_risk_veto")
+            return False
+        barbell = self._apply_barbell_adjustment(signal_copy, tail_risk, original_size)
+        signal_copy.payload["barbell"] = barbell
+        near_certainty = self._apply_near_certainty_adjustment(
+            signal_copy,
+            active_markets=active_markets,
+        )
+        signal_copy.payload["near_certainty"] = near_certainty
+        self._record_near_certainty(near_certainty)
+        self._cap_signal_size(signal_copy, original_size)
+        # Book exposure to the per-class ledger AFTER all multipliers
+        # have been applied. Tracking here (not at execution time)
+        # over-counts skipped signals, but for the shadow-default mode
+        # that's fine — operators look at the trend, not the
+        # cents-accurate level. settlement debits via signal_id.
+        self._book_barbell_exposure(signal_copy, barbell)
+        drawdown_scaling = self._apply_drawdown_size_scaling(signal_copy)
+        signal_copy.payload["drawdown_size_scaling"] = drawdown_scaling
+        if drawdown_scaling.get("blocked"):
+            self._record_process_skip(signal_copy, "drawdown_size_scaling_block")
+            return False
         self._record_per_market_submission(signal_copy)
         self._pending_signals.append(signal_copy)
         return True
@@ -277,6 +392,7 @@ class StrategyOrchestrator:
             alloc.trade_count += 1
             alloc.last_trade_ts = time.time()
         alloc.realized_pnl += pnl
+        self._refresh_peak_equity()
         self._append_executed_signal(signal)
 
     def record_processed(self, signal: StrategySignal) -> None:
@@ -289,9 +405,11 @@ class StrategyOrchestrator:
         if alloc:
             alloc.current_exposure = max(0, alloc.current_exposure - amount)
             alloc.realized_pnl += pnl
+            self._refresh_peak_equity()
 
     def update_bankroll(self, new_bankroll: float) -> None:
         self._bankroll = new_bankroll
+        self._refresh_peak_equity()
 
     def _append_executed_signal(self, signal: StrategySignal) -> None:
         self._executed_signals.append(signal)
@@ -321,6 +439,27 @@ class StrategyOrchestrator:
             "executed_signals": len(self._executed_signals),
             "research_overlay": dict(self._research_overlay_stats),
             "tail_risk": dict(self._tail_risk_stats),
+            "near_certainty": {
+                **dict(self._near_certainty_stats),
+                "shadow_mode": self._near_certainty_classifier.shadow_mode,
+            },
+            "barbell": {
+                "enabled": self._barbell_policy.enabled,
+                "tail_budget_usdc": round(
+                    float(self._barbell_policy.tail_budget_usdc), 4
+                ),
+                "exposure_usdc": {
+                    k: round(float(v), 4)
+                    for k, v in self._t2_class_exposure_usdc.items()
+                },
+                "ledger_size": len(self._t2_class_signal_ledger),
+            },
+            "sniper_gate": dict(self._sniper_gate_stats),
+            "equity": {
+                "current": round(self._current_equity(), 8),
+                "peak": round(self._peak_equity, 8),
+                "drawdown": round(self._current_drawdown(), 8),
+            },
             "recent_overlays": list(self._overlay_history[-10:]),
             "last_skip_reasons": dict(self._last_skip_reasons),
             "last_skipped_by_tier": dict(self._last_skipped_by_tier),
@@ -609,23 +748,239 @@ class StrategyOrchestrator:
         active_markets: list[Any],
     ) -> dict[str, Any]:
         action = self._resolve_signal_action(signal)
-        if signal.tier not in {StrategyTier.STATISTICAL_ARB, StrategyTier.CROSS_PLATFORM}:
-            return {"applied": False, "risk_class": "not_applicable", "size_multiplier": 1.0, "reasons": []}
-        if action not in {"BUY_YES", "BUY_NO"}:
-            return {"applied": False, "risk_class": "not_directional", "size_multiplier": 1.0, "reasons": []}
+        # T0 STRUCTURAL_ARB is price-locked (Σask<1-fee). Multi-leg arb's
+        # PnL doesn't depend on which way the underlying resolves, so the
+        # tail-risk overlay is a no-op there.
+        # T3 MARKET_MAKING is INCLUDED here even though it has no
+        # BUY_YES/BUY_NO action — a maker quote on a "Will US invade Iran"
+        # market is exactly the kind of directional, no-fair-value tail
+        # exposure the overlay exists to block. The veto branch (below)
+        # is what stops those quotes from being placed at all.
+        if signal.tier not in {
+            StrategyTier.STATISTICAL_ARB,
+            StrategyTier.CROSS_PLATFORM,
+            StrategyTier.MARKET_MAKING,
+        }:
+            return {"applied": False, "risk_class": "not_applicable", "size_multiplier": 1.0, "reasons": [], "veto": False}
+        # Directional gate applies to T2/T1 only — T3 maker quotes don't
+        # carry an action and we still want to classify them.
+        if signal.tier != StrategyTier.MARKET_MAKING and action not in {"BUY_YES", "BUY_NO"}:
+            return {"applied": False, "risk_class": "not_directional", "size_multiplier": 1.0, "reasons": [], "veto": False}
 
         market = self._find_market(signal.market_id, active_markets)
         text = self._tail_risk_text(signal, market)
         classification = self._tail_risk_classifier.classify(text)
-        signal.recommended_size_usdc = max(0.0, signal.recommended_size_usdc * classification.size_multiplier)
-        signal.confidence = max(0.0, min(1.0, signal.confidence + classification.confidence_delta))
+        # T3 maker quotes are non-directional (profit from spread, not
+        # resolution direction). Apply a floor on size_multiplier so T3
+        # is never fully zeroed — reduced exposure is enough.
+        _T3_SIZE_FLOOR = 0.30
+        if signal.tier == StrategyTier.MARKET_MAKING and not classification.veto:
+            effective_mult = max(_T3_SIZE_FLOOR, classification.size_multiplier)
+            effective_conf_delta = max(-0.3, classification.confidence_delta)
+        else:
+            effective_mult = classification.size_multiplier
+            effective_conf_delta = classification.confidence_delta
+        signal.recommended_size_usdc = max(0.0, signal.recommended_size_usdc * effective_mult)
+        signal.confidence = max(0.0, min(1.0, signal.confidence + effective_conf_delta))
+        effective_veto = bool(classification.veto)
         return {
             "applied": True,
             "risk_class": classification.risk_class,
-            "size_multiplier": round(classification.size_multiplier, 3),
-            "confidence_delta": round(classification.confidence_delta, 3),
+            "size_multiplier": round(effective_mult, 3),
+            "confidence_delta": round(effective_conf_delta, 3),
             "reasons": classification.reasons,
+            "veto": effective_veto,
         }
+
+    def _apply_barbell_adjustment(
+        self,
+        signal: StrategySignal,
+        tail_risk: dict[str, Any],
+        original_size: float,
+    ) -> dict[str, Any]:
+        """Maybe relax the tail_risk size discount under the barbell pool.
+
+        Only acts on STATISTICAL_ARB tier (where the tail/data_driven
+        split is meaningful). When the policy returns a multiplier
+        override, the rule's discount is REPLACED at the original size
+        — i.e. we don't multiply discounts. Otherwise the signal is
+        left as `_apply_tail_risk_adjustment` produced it.
+        """
+        if signal.tier != StrategyTier.STATISTICAL_ARB:
+            return {
+                "applied": False,
+                "enabled": self._barbell_policy.enabled,
+                "bucket": "not_applicable",
+                "reasons": [],
+            }
+        risk_class = str(tail_risk.get("risk_class", ""))
+        # Use the original (pre-adjustment) size to ask the policy
+        # "would this fit?"; the policy itself decides whether to
+        # override the multiplier.
+        tail_exposure = self._t2_class_exposure_usdc.get("tail", 0.0)
+        decision = self._barbell_policy.decide(
+            risk_class=risk_class,
+            signal_size_usdc=original_size,
+            current_tail_exposure_usdc=tail_exposure,
+        )
+        applied = False
+        if decision.multiplier_override is not None:
+            # Replace whatever tail_risk already applied with the
+            # relaxed multiplier, against the *original* size.
+            signal.recommended_size_usdc = max(
+                0.0, float(original_size) * float(decision.multiplier_override)
+            )
+            applied = True
+        return {
+            "applied": applied,
+            "enabled": self._barbell_policy.enabled,
+            "bucket": decision.bucket,
+            "multiplier_override": (
+                None
+                if decision.multiplier_override is None
+                else round(float(decision.multiplier_override), 3)
+            ),
+            "tail_exposure_before_usdc": round(float(tail_exposure), 4),
+            "tail_budget_usdc": round(float(self._barbell_policy.tail_budget_usdc), 4),
+            "reasons": list(decision.reasons),
+        }
+
+    def _book_barbell_exposure(
+        self, signal: StrategySignal, barbell: dict[str, Any]
+    ) -> None:
+        """Record this submission against the per-class exposure ledger."""
+        if signal.tier != StrategyTier.STATISTICAL_ARB:
+            return
+        bucket = str(barbell.get("bucket", "data_driven"))
+        if bucket not in self._t2_class_exposure_usdc:
+            return
+        amount = max(0.0, float(signal.recommended_size_usdc))
+        if amount <= 0:
+            return
+        self._t2_class_exposure_usdc[bucket] += amount
+        if signal.signal_id:
+            self._t2_class_signal_ledger[signal.signal_id] = (bucket, amount)
+        # Bound ledger size so the dict can't grow unbounded.
+        if len(self._t2_class_signal_ledger) > self._MAX_SIGNAL_HISTORY:
+            oldest = next(iter(self._t2_class_signal_ledger))
+            self._t2_class_signal_ledger.pop(oldest, None)
+
+    def _release_barbell_exposure(self, signal_id: str, amount: float) -> None:
+        """Debit a previously-booked entry. Use on settlement of T2 signals."""
+        if not signal_id:
+            return
+        booked = self._t2_class_signal_ledger.pop(signal_id, None)
+        if booked is None:
+            return
+        bucket, booked_amount = booked
+        debit = min(booked_amount, max(0.0, float(amount)))
+        self._t2_class_exposure_usdc[bucket] = max(
+            0.0, self._t2_class_exposure_usdc[bucket] - debit
+        )
+
+    def _apply_near_certainty_adjustment(
+        self,
+        signal: StrategySignal,
+        *,
+        active_markets: list[Any],
+    ) -> dict[str, Any]:
+        """Apply (or shadow-log) the near-certainty discount.
+
+        The rule reads the signal's `market_prob` field (set by the
+        statistical detector) — that is the price on the side the
+        signal is asking the bot to BUY, in [0, 1]. Tier filter mirrors
+        tail_risk: only T2 / T1 directional signals (T0 structural arb
+        is price-locked; T3 maker is bid-ask symmetric and benefits
+        from extreme prices via spread, not from buying them).
+        """
+        action = self._resolve_signal_action(signal)
+        if signal.tier not in {StrategyTier.STATISTICAL_ARB, StrategyTier.CROSS_PLATFORM}:
+            return {
+                "applied": False,
+                "shadow_mode": self._near_certainty_classifier.shadow_mode,
+                "risk_zone": "not_applicable",
+                "size_multiplier": 1.0,
+                "reasons": [],
+            }
+        if action not in {"BUY_YES", "BUY_NO"}:
+            return {
+                "applied": False,
+                "shadow_mode": self._near_certainty_classifier.shadow_mode,
+                "risk_zone": "not_directional",
+                "size_multiplier": 1.0,
+                "reasons": [],
+            }
+
+        market_price = self._resolve_signal_market_price(signal, active_markets, action)
+        result = self._near_certainty_classifier.classify(market_price)
+
+        if result.applied and not self._near_certainty_classifier.shadow_mode:
+            signal.recommended_size_usdc = max(
+                0.0, signal.recommended_size_usdc * result.size_multiplier
+            )
+            signal.confidence = max(
+                0.0, min(1.0, signal.confidence + result.confidence_delta)
+            )
+
+        return {
+            "applied": result.applied,
+            "shadow_mode": result.shadow_mode,
+            "risk_zone": result.risk_zone,
+            "market_price": (
+                None if result.market_price is None else round(result.market_price, 4)
+            ),
+            "size_multiplier": round(result.size_multiplier, 3),
+            "confidence_delta": round(result.confidence_delta, 3),
+            "reasons": list(result.reasons),
+        }
+
+    def _resolve_signal_market_price(
+        self,
+        signal: StrategySignal,
+        active_markets: list[Any],
+        action: str,
+    ) -> float | None:
+        """Return the price of the side the signal wants to BUY, or None.
+
+        Statistical signals carry `market_prob` in their payload (YES-
+        space mid). For BUY_NO the buy-side price is 1 - market_prob.
+        For other tiers we fall back to the active-market token list.
+        """
+        payload = signal.payload or {}
+        yes_price = payload.get("market_prob")
+        if isinstance(yes_price, (int, float)):
+            yes_price = float(yes_price)
+            if action == "BUY_NO":
+                return max(0.0, min(1.0, 1.0 - yes_price))
+            return max(0.0, min(1.0, yes_price))
+
+        market = self._find_market(signal.market_id, active_markets)
+        if market is None:
+            return None
+        tokens = getattr(market, "tokens", []) or []
+        target_outcome = "yes" if action == "BUY_YES" else "no"
+        for token in tokens:
+            outcome = (getattr(token, "outcome", "") or "").strip().lower()
+            if outcome == target_outcome:
+                price = float(getattr(token, "price", 0.0) or 0.0)
+                if 0.0 < price <= 1.0:
+                    return price
+        return None
+
+    def _record_near_certainty(self, near_certainty: dict[str, Any]) -> None:
+        self._near_certainty_stats["evaluated"] += 1
+        if not near_certainty.get("applied"):
+            return
+        zone = near_certainty.get("risk_zone", "")
+        shadow = bool(near_certainty.get("shadow_mode"))
+        if zone == "high_certainty":
+            self._near_certainty_stats["would_apply_high"] += 1
+            if not shadow:
+                self._near_certainty_stats["applied_high"] += 1
+        elif zone == "longshot":
+            self._near_certainty_stats["would_apply_longshot"] += 1
+            if not shadow:
+                self._near_certainty_stats["applied_longshot"] += 1
 
     def _tail_risk_text(self, signal: StrategySignal, market: Any | None) -> str:
         parts = [signal.description, signal.market_id]
@@ -650,6 +1005,71 @@ class StrategyOrchestrator:
             self._tail_risk_stats["penalized"] += 1
         if tail_risk.get("risk_class") == "high_tail":
             self._tail_risk_stats["high_risk"] += 1
+        if tail_risk.get("veto"):
+            self._tail_risk_stats["vetoed"] = self._tail_risk_stats.get("vetoed", 0) + 1
+
+    def _cap_signal_size(self, signal: StrategySignal, original_size: float) -> None:
+        if original_size <= 0:
+            return
+        max_size = original_size * self._max_signal_size_multiplier
+        if signal.recommended_size_usdc <= max_size:
+            return
+        signal.recommended_size_usdc = max_size
+        signal.payload["risk_size_cap"] = {
+            "max_signal_size_multiplier": round(self._max_signal_size_multiplier, 3),
+            "base_size_usdc": round(original_size, 8),
+            "capped_size_usdc": round(max_size, 8),
+        }
+
+    def _apply_drawdown_size_scaling(self, signal: StrategySignal) -> dict[str, Any]:
+        if signal.tier not in {StrategyTier.STATISTICAL_ARB, StrategyTier.CROSS_PLATFORM}:
+            return {"applied": False, "multiplier": 1.0, "drawdown": round(self._current_drawdown(), 8)}
+        drawdown = self._current_drawdown()
+        multiplier = self._drawdown_multiplier(drawdown)
+        payload = {
+            "applied": multiplier < 1.0,
+            "blocked": multiplier <= 0.0,
+            "multiplier": multiplier,
+            "drawdown": round(drawdown, 8),
+            "current_equity": round(self._current_equity(), 8),
+            "peak_equity": round(self._peak_equity, 8),
+        }
+        if multiplier <= 0.0:
+            signal.recommended_size_usdc = 0.0
+            return payload
+        if multiplier < 1.0:
+            signal.recommended_size_usdc = max(0.0, signal.recommended_size_usdc * multiplier)
+        return payload
+
+    @staticmethod
+    def _drawdown_multiplier(drawdown: float) -> float:
+        if drawdown >= 0.15:
+            return 0.0
+        if drawdown >= 0.10:
+            return 0.25
+        if drawdown >= 0.05:
+            return 0.50
+        if drawdown >= 0.03:
+            return 0.75
+        return 1.0
+
+    def _current_equity(self) -> float:
+        return float(self._bankroll) + sum(float(alloc.realized_pnl) for alloc in self._allocations.values())
+
+    def _current_drawdown(self) -> float:
+        if self._peak_equity <= 0:
+            return 0.0
+        return max(0.0, (self._peak_equity - self._current_equity()) / self._peak_equity)
+
+    def _refresh_peak_equity(self) -> None:
+        self._peak_equity = max(self._peak_equity, self._current_equity())
+
+    def _record_sniper_gate(self, decision: Any) -> None:
+        self._sniper_gate_stats["applied"] += 1
+        if getattr(decision, "accepted", False):
+            self._sniper_gate_stats["accepted"] += 1
+        else:
+            self._sniper_gate_stats["rejected"] += 1
 
     def _match_research_rows(
         self,

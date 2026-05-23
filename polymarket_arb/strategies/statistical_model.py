@@ -160,7 +160,7 @@ class BayesianPriceModel:
         momentum_weight: float = 0.08,
         cross_market_weight: float = 0.15,
         spot_weight: float = 0.40,
-        min_deviation_threshold: float = 0.03,
+        min_deviation_threshold: float = 0.05,
     ):
         self._obi_weight = obi_weight
         self._momentum_weight = momentum_weight
@@ -190,12 +190,13 @@ class BayesianPriceModel:
         Returns:
             模型估计的概率 (0-1)
         """
-        # 极端概率市场（长尾/高确定性）对盘口压力更敏感。
-        regime_multiplier = 1.0 + min(1.5, abs(market_price - 0.5) * 3.0)
+        # Extreme-price contracts have asymmetric downside. Treat short-term
+        # OBI/momentum as less reliable near 0/1 instead of pressing harder.
+        microstructure_multiplier = self._microstructure_multiplier(market_price)
         return compute_general_fair_value(
             market_price,
-            obi_score=obi_score * regime_multiplier,
-            momentum_score=momentum_score * regime_multiplier,
+            obi_score=obi_score * microstructure_multiplier,
+            momentum_score=momentum_score * microstructure_multiplier,
             cross_market_deviation=cross_market_deviation,
             spot_fair=spot_fair,
             obi_weight=self._obi_weight,
@@ -203,6 +204,11 @@ class BayesianPriceModel:
             cross_weight=self._cross_weight,
             spot_weight=self._spot_weight,
         )
+
+    @staticmethod
+    def _microstructure_multiplier(market_price: float) -> float:
+        price = max(0.0, min(1.0, float(market_price)))
+        return max(0.25, 1.0 - min(0.75, abs(price - 0.5) * 1.5))
 
 
 class StatisticalMispricingDetector:
@@ -214,7 +220,7 @@ class StatisticalMispricingDetector:
     def __init__(
         self,
         model: Optional[BayesianPriceModel] = None,
-        min_deviation: float = 0.03,
+        min_deviation: float = 0.05,
         min_confidence: float = 0.5,
     ):
         self._model = model or BayesianPriceModel()
@@ -277,6 +283,7 @@ class StatisticalMispricingDetector:
         obi = OrderBookImbalanceSignal.compute(bids_total_size, asks_total_size)
         momentum = self._momentum.compute(market_id)
         cross_dev = self._compute_cross_market_signal(market_id, market_price, related_market_prices)
+        microstructure_multiplier = self._model._microstructure_multiplier(market_price)
 
         model_prob = self._model.estimate(
             market_price,
@@ -289,8 +296,8 @@ class StatisticalMispricingDetector:
         deviation_pct = deviation / market_price if market_price > 0 else 0
 
         components = [
-            self._normalize_signal_strength(obi),
-            self._normalize_signal_strength(momentum),
+            self._normalize_signal_strength(obi * microstructure_multiplier),
+            self._normalize_signal_strength(momentum * microstructure_multiplier),
         ]
         if abs(cross_dev) > 0:
             components.append(min(1.0, abs(cross_dev) * 4.0))
@@ -312,6 +319,7 @@ class StatisticalMispricingDetector:
                 "obi": obi,
                 "momentum": momentum,
                 "cross_market": cross_dev,
+                "microstructure_multiplier": microstructure_multiplier,
             },
         )
 

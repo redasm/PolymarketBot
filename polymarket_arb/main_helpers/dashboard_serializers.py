@@ -2,8 +2,8 @@
 
 Every function here turns a domain object (`ArbOpportunity`, `TradeRecord`,
 `MarketInfo`, `StrategySignal`, …) into a plain `dict` ready for the
-dashboard FastAPI layer, the NDJSON event log, or the AI advisor's prompt
-context. They are deliberately side-effect free so they can be:
+dashboard FastAPI layer, NDJSON event log, or backtest/reporting code.
+They are deliberately side-effect free so they can be:
 
 - snapshotted in tests without booting the loop,
 - reused by other entry points (e.g. backtest reports), and
@@ -24,6 +24,7 @@ from polymarket_arb.book_store import EnhancedBookStore
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.execution_engine import ExecutionEngine
 from polymarket_arb.models import ArbOpportunity, MarketInfo
+from polymarket_arb.signal_attribution import infer_signal_attribution
 from polymarket_arb.strategies.strategy_orchestrator import StrategySignal
 
 
@@ -35,7 +36,7 @@ def reported_execution_success(*, live_execution_success: bool, trades: list[Any
     """Treat a fully-filled simulated batch as 'success' for dashboard rows.
 
     The live executor returns False for simulated trades because no real
-    orders went out, but the dashboard / AI-feedback loop wants to know
+    orders went out, but the dashboard PnL preview wants to know
     whether the *strategy* would have worked in dry-run, so we promote
     "all legs filled" to True only when the batch is simulated.
     """
@@ -48,7 +49,7 @@ def reported_execution_success(*, live_execution_success: bool, trades: list[Any
     return live_execution_success
 
 
-def estimate_ai_trade_outcome(
+def estimate_trade_outcome(
     verified: ArbOpportunity,
     trades: list[Any],
     arb_success: bool,
@@ -56,8 +57,8 @@ def estimate_ai_trade_outcome(
 ) -> float:
     """Estimate realised PnL for an executed opportunity.
 
-    Used by the AI feedback loop and the dashboard PnL preview. On success,
-    PnL = `net_edge * min(filled_sizes)` since structural arbitrage profit
+    Used by dashboard and telemetry PnL previews. On success, PnL =
+    `net_edge * min(filled_sizes)` since structural arbitrage profit
     is bounded by the smallest leg fill. On failure, we count the cash that
     actually moved (sum of `economic_cost * fill_size`); if no leg even
     partially filled, we fall back to the full theoretical entry cost as a
@@ -136,7 +137,7 @@ def serialize_trade_execution(
         "requested_size": adj_size,
         "expected_net_edge": opp.net_edge,
         "expected_total_cost": opp.total_cost,
-        "trade_outcome_estimate": estimate_ai_trade_outcome(opp, trades, reported_success, adj_size),
+        "trade_outcome_estimate": estimate_trade_outcome(opp, trades, reported_success, adj_size),
         "trades": [
             {
                 "trade_id": getattr(trade, "trade_id", ""),
@@ -172,7 +173,7 @@ def build_dashboard_trade_rows(
     different numbers per leg that would confuse the UI.
     """
     mode = "simulated" if has_simulated_trades(trades) else "live"
-    expected_profit = estimate_ai_trade_outcome(
+    expected_profit = estimate_trade_outcome(
         opp,
         trades,
         dashboard_execution_success,
@@ -208,10 +209,16 @@ def serialize_strategy_signal(
     submitted: bool,
     research_overlay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    attribution = infer_signal_attribution(signal.signal_type, signal.payload)
+    payload = dict(signal.payload)
+    payload.setdefault("signal_source", attribution["signal_source"])
+    payload.setdefault("signal_components", list(attribution["signal_components"]))
     return {
         "signal_id": getattr(signal, "signal_id", ""),
         "tier": signal.tier.name,
         "signal_type": signal.signal_type,
+        "signal_source": attribution["signal_source"],
+        "signal_components": list(attribution["signal_components"]),
         "market_id": signal.market_id,
         "description": signal.description,
         "expected_edge": signal.expected_edge,
@@ -220,7 +227,7 @@ def serialize_strategy_signal(
         "urgency": signal.urgency,
         "submitted": submitted,
         "research_overlay": dict(research_overlay or {}),
-        "payload": dict(signal.payload),
+        "payload": payload,
         "timestamp": signal.timestamp,
     }
 

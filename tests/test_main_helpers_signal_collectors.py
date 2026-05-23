@@ -8,6 +8,7 @@ silent regressions for the orchestrator + dashboard.
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -15,8 +16,11 @@ import pytest
 from polymarket_arb.main_helpers.flow_aggregator import FlowAggregator
 from polymarket_arb.main_helpers.signal_collectors import (
     collect_cross_platform_strategy_signals,
+    collect_event_calendar_strategy_signals,
+    collect_logical_constraint_strategy_signals,
     collect_maker_strategy_signals,
     collect_statistical_strategy_signals,
+    collect_wallet_alpha_strategy_signals,
 )
 from polymarket_arb.models import MarketInfo, OrderBookLevel, OrderBookSnapshot, TokenInfo
 from polymarket_arb.strategies.strategy_orchestrator import StrategyTier
@@ -119,6 +123,318 @@ def test_collect_cross_platform_translates_each_opportunity():
     assert len(sig.description) <= 120
     assert sig.payload["pair_id"] == "pair-X"
     assert sig.payload["edge_pct"] == 0.012
+
+
+# --------- new quant strategies ----------
+
+
+def test_collect_logical_constraints_returns_empty_without_rules():
+    cfg = make_test_config()
+    snapshots = {"a-yes": _balanced_snapshot("a-yes"), "b-yes": _balanced_snapshot("b-yes")}
+
+    out = collect_logical_constraint_strategy_signals(
+        config=cfg,
+        candidate_markets=[_binary_market("a"), _binary_market("b")],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        rules=[],
+    )
+
+    assert out == []
+
+
+def test_collect_logical_constraints_uses_yes_mid_prices_from_books():
+    cfg = make_test_config(default_order_size_usdc=11.0)
+    snapshots = {
+        "candidate-yes": _balanced_snapshot("candidate-yes", mid=0.62),
+        "party-yes": _balanced_snapshot("party-yes", mid=0.55),
+    }
+
+    out = collect_logical_constraint_strategy_signals(
+        config=cfg,
+        candidate_markets=[
+            _binary_market("candidate", yes_price=0.62),
+            _binary_market("party", yes_price=0.55),
+        ],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        rules=[
+            {
+                "subject_market_id": "candidate",
+                "bound_market_id": "party",
+                "relation_type": "subject_lte_bound",
+                "min_violation_bps": 200,
+            }
+        ],
+        input_metadata={"source": "file", "sha256": "abc"},
+    )
+
+    assert len(out) == 1
+    assert out[0].signal_type == "logical_constraint_directional_buy_bound"
+    assert out[0].market_id == "party"
+    assert out[0].recommended_size_usdc == 11.0
+    assert out[0].payload["quant_input"]["name"] == "logical_constraints"
+    assert out[0].payload["quant_input"]["sha256"] == "abc"
+
+
+def test_collect_logical_constraints_rejects_expired_rule_schema():
+    cfg = make_test_config(default_order_size_usdc=11.0)
+    snapshots = {
+        "candidate-yes": _balanced_snapshot("candidate-yes", mid=0.62),
+        "party-yes": _balanced_snapshot("party-yes", mid=0.55),
+    }
+
+    out = collect_logical_constraint_strategy_signals(
+        config=cfg,
+        candidate_markets=[
+            _binary_market("candidate", yes_price=0.62),
+            _binary_market("party", yes_price=0.55),
+        ],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        rules={
+            "schema_version": 1,
+            "generated_at": time.time() - 7200,
+            "expires_at": time.time() - 3600,
+            "rules": [
+                {
+                    "subject_market_id": "candidate",
+                    "bound_market_id": "party",
+                    "relation_type": "subject_lte_bound",
+                    "min_violation_bps": 200,
+                }
+            ],
+        },
+    )
+
+    assert out == []
+
+
+def test_collect_event_calendar_uses_explicit_baseline_metadata():
+    cfg = make_test_config(default_order_size_usdc=9.0)
+    market = _binary_market("event")
+    snapshots = {"event-yes": _balanced_snapshot("event-yes", mid=0.45)}
+
+    out = collect_event_calendar_strategy_signals(
+        config=cfg,
+        candidate_markets=[market],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        baselines={
+            "event": {
+                "event_baseline_probability": 0.55,
+                "event_confidence": 0.80,
+                "time_to_event_sec": 3600,
+                "generated_at": time.time(),
+            }
+        },
+        input_metadata={"source": "file", "sha256": "def"},
+    )
+
+    assert len(out) == 1
+    assert out[0].signal_type == "event_calendar_buy_yes"
+    assert out[0].market_id == "event"
+    assert out[0].recommended_size_usdc == 9.0
+    assert out[0].payload["quant_input"]["name"] == "event_baselines"
+    assert out[0].payload["quant_input"]["sha256"] == "def"
+
+
+def test_collect_event_calendar_requires_fresh_snapshot_even_when_token_price_exists():
+    cfg = make_test_config(default_order_size_usdc=9.0)
+    market = _binary_market("event")
+    market.tokens[0].price = 0.45
+
+    out = collect_event_calendar_strategy_signals(
+        config=cfg,
+        candidate_markets=[market],
+        ob_analyzer=_StubBookAnalyzer({}),
+        baselines={
+            "event": {
+                "baseline_probability": 0.55,
+                "confidence": 0.80,
+                "time_to_event_sec": 3600,
+                "generated_at": time.time(),
+            }
+        },
+    )
+
+    assert out == []
+
+
+def test_collect_event_calendar_ignores_market_raw_baseline_metadata():
+    cfg = make_test_config(default_order_size_usdc=9.0)
+    market = _binary_market("event")
+    market.raw.update(
+        {
+            "event_baseline_probability": 0.55,
+            "event_confidence": 0.80,
+            "time_to_event_sec": 3600,
+        }
+    )
+
+    out = collect_event_calendar_strategy_signals(
+        config=cfg,
+        candidate_markets=[market],
+        ob_analyzer=_StubBookAnalyzer({"event-yes": _balanced_snapshot("event-yes", mid=0.45)}),
+    )
+
+    assert out == []
+
+
+def test_collect_event_calendar_returns_empty_without_baseline_metadata():
+    cfg = make_test_config()
+
+    out = collect_event_calendar_strategy_signals(
+        config=cfg,
+        candidate_markets=[_binary_market("event")],
+        ob_analyzer=_StubBookAnalyzer({"event-yes": _balanced_snapshot("event-yes", mid=0.45)}),
+    )
+
+    assert out == []
+
+
+def test_collect_wallet_alpha_converts_accepted_observation_to_signal():
+    cfg = make_test_config(default_order_size_usdc=7.0)
+    market = _binary_market("weather")
+    profiles = {
+        "0xgood": {
+            "trade_count": 40,
+            "realized_roi": 0.25,
+            "lagged_follow_roi": 0.08,
+            "max_drawdown": 0.10,
+            "concentration_score": 0.20,
+            "category_edges": {"weather": 0.09},
+        }
+    }
+    observations = [
+        {
+            "wallet_address": "0xgood",
+            "market_id": "weather",
+            "category": "weather",
+            "action": "BUY_YES",
+            "observed_size_usdc": 100.0,
+        }
+    ]
+
+    out = collect_wallet_alpha_strategy_signals(
+        config=cfg,
+        candidate_markets=[market],
+        profiles=profiles,
+        observations=observations,
+        input_metadata={
+            "profiles": {"source": "file", "sha256": "profiles"},
+            "observations": {"source": "file", "sha256": "observations"},
+        },
+    )
+
+    assert len(out) == 1
+    assert out[0].signal_type == "wallet_alpha_buy_yes"
+    assert out[0].market_id == "weather"
+    assert out[0].recommended_size_usdc > 7.0
+    assert out[0].payload["wallet_size_multiplier"] > 1.0
+    assert out[0].payload["wallet_address"] == "0xgood"
+    assert out[0].payload["quant_input"]["name"] == "wallet_alpha"
+    assert out[0].payload["quant_input"]["profiles"]["sha256"] == "profiles"
+    assert out[0].payload["quant_input"]["observations"]["sha256"] == "observations"
+
+
+def test_collect_wallet_alpha_rejects_expired_profile_schema():
+    cfg = make_test_config(default_order_size_usdc=7.0)
+    market = _binary_market("weather")
+    profiles = {
+        "schema_version": 1,
+        "generated_at": time.time() - 7200,
+        "expires_at": time.time() - 3600,
+        "wallets": {
+            "0xgood": {
+                "trade_count": 40,
+                "realized_roi": 0.25,
+                "lagged_follow_roi": 0.08,
+                "max_drawdown": 0.10,
+                "concentration_score": 0.20,
+                "category_edges": {"weather": 0.09},
+            }
+        },
+    }
+
+    out = collect_wallet_alpha_strategy_signals(
+        config=cfg,
+        candidate_markets=[market],
+        profiles=profiles,
+        observations=[{"wallet_address": "0xgood", "market_id": "weather", "action": "BUY_YES"}],
+    )
+
+    assert out == []
+
+
+def test_collect_wallet_alpha_rejects_unfollowable_wallet_profile():
+    cfg = make_test_config()
+    profiles = {
+        "0xflash": {
+            "trade_count": 4,
+            "realized_roi": 2.0,
+            "lagged_follow_roi": -0.05,
+            "max_drawdown": 0.60,
+            "concentration_score": 0.90,
+            "category_edges": {"crypto": 2.0},
+        }
+    }
+
+    out = collect_wallet_alpha_strategy_signals(
+        config=cfg,
+        candidate_markets=[_binary_market("crypto")],
+        profiles=profiles,
+        observations=[
+            {
+                "wallet_address": "0xflash",
+                "market_id": "crypto",
+                "category": "crypto",
+                "action": "BUY_YES",
+            }
+        ],
+    )
+
+    assert out == []
+
+
+def test_collect_wallet_alpha_can_emit_unvalidated_candidate_only_in_dry_run():
+    cfg = make_test_config(dry_run=True, wallet_alpha_candidate_shadow_enabled=True)
+
+    out = collect_wallet_alpha_strategy_signals(
+        config=cfg,
+        candidate_markets=[_binary_market("m1")],
+        profiles={},
+        observations=[
+            {
+                "wallet_address": "0xcandidate",
+                "market_id": "m1",
+                "category": "macro",
+                "action": "BUY_YES",
+                "observed_size_usdc": 12,
+            }
+        ],
+    )
+
+    assert len(out) == 1
+    assert out[0].signal_type == "wallet_alpha_candidate_buy_yes"
+    assert out[0].payload["wallet_profile_status"] == "candidate_unvalidated"
+    assert out[0].payload["deviation"] > 0
+    assert out[0].expected_edge > 0
+
+
+def test_collect_wallet_alpha_candidate_shadow_is_disabled_in_live_mode():
+    cfg = make_test_config(
+        dry_run=False,
+        live_trading_ack=True,
+        portfolio_sync_enabled=True,
+        polymarket_taker_fee_rate=0.02,
+        wallet_alpha_candidate_shadow_enabled=True,
+    )
+
+    out = collect_wallet_alpha_strategy_signals(
+        config=cfg,
+        candidate_markets=[_binary_market("m1")],
+        profiles={},
+        observations=[{"wallet_address": "0xcandidate", "market_id": "m1", "action": "BUY_YES"}],
+    )
+
+    assert out == []
 
 
 # --------- T2: statistical ----------
@@ -274,6 +590,38 @@ def test_collect_maker_uses_supplied_fair_value():
     assert detector.estimate_calls == []  # didn't fall back
 
 
+def test_collect_maker_records_queue_position_telemetry():
+    snapshots = {
+        "m-yes": OrderBookSnapshot(
+            token_id="m-yes",
+            best_bid=0.49,
+            best_ask=0.51,
+            bids=[
+                OrderBookLevel(price=0.49, size=25.0),
+                OrderBookLevel(price=0.48, size=100.0),
+            ],
+            asks=[
+                OrderBookLevel(price=0.51, size=40.0),
+                OrderBookLevel(price=0.52, size=100.0),
+            ],
+            tick_size=0.01,
+        )
+    }
+    maker = _StubMaker(quote=_maker_quote(bid=0.49, ask=0.51))
+
+    out = collect_maker_strategy_signals(
+        candidate_markets=[_binary_market("m")],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        maker_strategy=maker,
+        fair_values_by_market={"m": 0.50},
+    )
+
+    queue = out[0].payload["queue_position"]
+    assert queue["bid_ahead_size"] == 25.0
+    assert queue["ask_ahead_size"] == 40.0
+    assert queue["telemetry_only"] is True
+
+
 def test_collect_maker_falls_back_to_detector_when_no_fair_value():
     snapshots = {"m-yes": _balanced_snapshot("m-yes", mid=0.50)}
     detector = _StubDetector(model_prob=0.50)
@@ -338,6 +686,33 @@ def test_collect_maker_attaches_flow_bias_when_aggregator_has_data():
     assert bias["taker_yes_share"] == pytest.approx(0.70)
     assert bias["lean"] == "yes"
     assert bias["is_stable"] is True
+
+
+def test_collect_maker_applies_event_time_toxic_flow_spread_multiplier():
+    now = time.time()
+    snapshots = {"m-yes": _balanced_snapshot("m-yes", mid=0.50)}
+    maker = _StubMaker(quote=_maker_quote())
+
+    out = collect_maker_strategy_signals(
+        candidate_markets=[_binary_market("m")],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        maker_strategy=maker,
+        fair_values_by_market={"m": 0.50},
+        event_baselines={
+            "m": {
+                "baseline_probability": 0.50,
+                "confidence": 0.80,
+                "time_to_event_sec": 20 * 60,
+                "generated_at": now,
+            }
+        },
+    )
+
+    assert len(out) == 1
+    assert maker.calls[0]["spread_multiplier"] == pytest.approx(1.5)
+    assert out[0].payload["event_time_toxicity"]["applied"] is True
+    assert out[0].payload["event_time_toxicity"]["size_multiplier"] == pytest.approx(0.75)
+    assert out[0].recommended_size_usdc == pytest.approx(9.0)
 
 
 def test_collect_maker_omits_flow_bias_when_aggregator_has_no_data():

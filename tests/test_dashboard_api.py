@@ -1,10 +1,6 @@
 """Dashboard API state tests for research/backtest endpoints."""
 
-import time
-
-from fastapi.testclient import TestClient
-
-from polymarket_arb.dashboard_api import DashboardState, app, set_state
+from polymarket_arb.dashboard_api import DashboardState
 
 
 def test_dashboard_state_snapshot_includes_research_and_backtest_fields():
@@ -79,7 +75,6 @@ def test_dashboard_state_disabled_becomes_noop():
     state.append_trade({"trade_id": "noop"})
     state.append_error({"message": "noop"})
     state.append_pnl_point({"timestamp": 1.0})
-    state.append_ai_decision({"action": "BUY_YES"})
 
     snap = state.snapshot()
     assert snap["enabled"] is False
@@ -89,39 +84,3 @@ def test_dashboard_state_disabled_becomes_noop():
     assert snap["recent_trades"] == []
     assert snap["recent_errors"] == []
     assert snap["pnl_history"] == []
-
-
-def test_api_ai_enriches_decisions_with_market_validation():
-    state = DashboardState()
-    state.update(
-        ai_status={"enabled": True, "provider": "openai", "model": "gpt-test", "call_count": 3, "daily_cost_usd": 0.0123},
-        market_catalog={
-            "c1": {
-                "question": "Will BTC go up this week?",
-                "yes_price": 0.62,
-                "volume_24h": 1000,
-                "liquidity": 500,
-            }
-        },
-    )
-    state.append_ai_decision({
-        "action": "BUY_YES",
-        "market_id": "c1",
-        "confidence": 0.78,
-        "recommended_size_pct": 0.05,
-        "reasoning": "Momentum and research are aligned.",
-        "decision_price": 0.55,
-        "timestamp": time.time() - 600,
-        "submitted": True,
-    })
-    set_state(state)
-
-    client = TestClient(app)
-    response = client.get("/api/ai")
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["status"]["enabled"] is True
-    assert payload["decisions"][0]["market_question"] == "Will BTC go up this week?"
-    assert payload["decisions"][0]["current_price"] == 0.62
-    assert payload["decisions"][0]["validation"]["status"] == "correct"

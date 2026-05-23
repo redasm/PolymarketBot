@@ -18,7 +18,7 @@ the right reject reason:
    on partial failure inside `ExecutionEngine`).
 7. Reconcile risk-manager state (live trades only — simulated never
    touch the venue), serialise the trade payload, mirror to dashboard.
-8. Notify success / failure + feed AI advisor (live only).
+8. Notify success / failure.
 
 Returns an `ExecutionDelta` with the four counters populated:
 `live_successes`, `simulated_successes`, `live_profit_total`,
@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import logging
 
-from polymarket_arb.ai_advisor import AIAdvisor
 from polymarket_arb.arbitrage_detector import ArbitrageDetector
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.dashboard_api import DashboardState
@@ -37,7 +36,6 @@ from polymarket_arb.event_recorder import EventRecorder
 from polymarket_arb.execution_engine import ExecutionEngine
 from polymarket_arb.main_helpers.dashboard_serializers import (
     build_dashboard_trade_rows,
-    estimate_ai_trade_outcome,
     has_simulated_trades,
     is_live_execution_success,
     serialize_opportunity_event,
@@ -61,7 +59,6 @@ def execute_t0_opportunity(
     executor: ExecutionEngine,
     risk_mgr: RiskManager,
     notifier: NotificationManager,
-    ai_advisor: AIAdvisor | None,
     dash_state: DashboardState,
     event_recorder: EventRecorder,
 ) -> ExecutionDelta:
@@ -79,8 +76,7 @@ def execute_t0_opportunity(
     - On reject: one `risk_events` entry naming the reject reason.
     - On accept: one `opportunities` entry (verified stage), one
       `trades` entry, one dashboard opportunity card, one trade row
-      per leg, optional AI outcome update (live only), optional
-      success/failure notification.
+      per leg, optional success/failure notification.
     """
     delta = ExecutionDelta()
 
@@ -169,10 +165,6 @@ def execute_t0_opportunity(
         dash_state.append_trade(trade_row)
 
     filled = [t for t in trades if t.status.value == "filled"]
-    if ai_advisor is not None and not config.dry_run:
-        ai_advisor.record_trade_outcome(
-            estimate_ai_trade_outcome(verified, trades, live_execution_success, adj_size)
-        )
     if live_execution_success and filled:
         notifier.notify_trade_success(
             event_title=opp.event_title,

@@ -508,6 +508,42 @@ def test_backtest_cli_prefers_explicit_output_dir(tmp_path: Path, monkeypatch):
     assert captured["output_dir"] == expected_output_dir
 
 
+def test_backtest_cli_maps_quant_strategy_choice(tmp_path: Path, monkeypatch):
+    from research.backtest import run as backtest_run
+
+    captured = {}
+
+    class _StubRunner:
+        def __init__(self, data_dir):
+            captured["data_dir"] = data_dir
+
+        def run(self, strategy, dataset, execution_model, config):
+            captured["strategy_name"] = strategy.strategy_name
+            return BacktestReport(strategy_name=strategy.strategy_name, dataset_name=dataset)
+
+    monkeypatch.setattr(backtest_run, "BacktestRunner", _StubRunner)
+    monkeypatch.setattr(
+        backtest_run.ArbConfig,
+        "from_env",
+        lambda dotenv_path=None, require_wallet=False: type(
+            "Cfg",
+            (),
+            {
+                "backtest_default_dataset": "default-dataset",
+                "backtest_reports_dir": "config-output-dir",
+                "backtest_data_dir": "data/backtest",
+                "polymarket_taker_fee_rate": 0.02,
+                "backtest_slippage_bps": 5.0,
+            },
+        )(),
+    )
+    monkeypatch.setattr(sys, "argv", ["run.py", "--strategy", "event-calendar"])
+
+    backtest_run.main()
+
+    assert captured["strategy_name"] == "event_calendar"
+
+
 def test_backtest_runner_can_run_t2_markout_strategy(tmp_path: Path):
     dataset_dir = tmp_path / "t2sample"
     dataset_dir.mkdir(parents=True)
@@ -544,6 +580,138 @@ def test_backtest_runner_can_run_t2_markout_strategy(tmp_path: Path):
     assert report.total_signals >= 1
     assert report.total_trades >= 1
     assert report.filled_trades >= 1
+
+
+def test_backtest_runner_can_run_event_calendar_strategy(tmp_path: Path):
+    dataset_dir = tmp_path / "event-calendar"
+    dataset_dir.mkdir(parents=True)
+    (dataset_dir / "market_snapshots.jsonl").write_text(
+        (
+            '{"ts_ms":1000,"condition_id":"event","event_id":"e1","question":"Will CPI beat?",'
+            '"yes_token_id":"yes","no_token_id":"no","yes_best_bid":0.40,"yes_best_ask":0.42,'
+            '"yes_bid_size":500,"yes_ask_size":120,"no_best_bid":0.58,"no_best_ask":0.60,'
+            '"no_bid_size":120,"no_ask_size":500,"baseline_probability":0.50,'
+            '"confidence":0.80,"time_to_event_sec":1800}\n'
+            '{"ts_ms":400000,"condition_id":"event","event_id":"e1","question":"Will CPI beat?",'
+            '"yes_token_id":"yes","no_token_id":"no","yes_best_bid":0.46,"yes_best_ask":0.48,'
+            '"yes_bid_size":500,"yes_ask_size":120,"no_best_bid":0.52,"no_best_ask":0.54,'
+            '"no_bid_size":120,"no_ask_size":500,"baseline_probability":0.50,'
+            '"confidence":0.80,"time_to_event_sec":1200}\n'
+        ),
+        encoding="utf-8",
+    )
+    dotenv_path = write_test_env(tmp_path)
+
+    runner = BacktestRunner(tmp_path)
+    strategy = type("BacktestStrategy", (), {"strategy_name": "event_calendar"})()
+    report = runner.run(
+        strategy=strategy,
+        dataset="event-calendar",
+        execution_model=TopOfBookExecutionModel(),
+        config=BacktestRunConfig(
+            dataset_name="event-calendar",
+            output_dir=str(tmp_path / "out-event-calendar"),
+            dotenv_path=str(dotenv_path),
+            holding_period_ms=60_000,
+        ),
+    )
+
+    assert report.strategy_name == "event_calendar"
+    assert report.total_signals >= 1
+    assert report.filled_trades >= 1
+
+
+def test_backtest_runner_can_run_wallet_alpha_strategy(tmp_path: Path):
+    dataset_dir = tmp_path / "wallet-alpha"
+    dataset_dir.mkdir(parents=True)
+    (dataset_dir / "market_snapshots.jsonl").write_text(
+        (
+            '{"ts_ms":1000,"condition_id":"market","event_id":"e1","question":"Will macro event happen?",'
+            '"yes_token_id":"yes","no_token_id":"no","yes_best_bid":0.46,"yes_best_ask":0.48,'
+            '"yes_bid_size":500,"yes_ask_size":120,"no_best_bid":0.52,"no_best_ask":0.54,'
+            '"no_bid_size":120,"no_ask_size":500,"wallet_address":"0xgood",'
+            '"category":"macro","action":"BUY_YES"}\n'
+            '{"ts_ms":400000,"condition_id":"market","event_id":"e1","question":"Will macro event happen?",'
+            '"yes_token_id":"yes","no_token_id":"no","yes_best_bid":0.52,"yes_best_ask":0.54,'
+            '"yes_bid_size":500,"yes_ask_size":120,"no_best_bid":0.46,"no_best_ask":0.48,'
+            '"no_bid_size":120,"no_ask_size":500}\n'
+        ),
+        encoding="utf-8",
+    )
+    dotenv_path = write_test_env(tmp_path)
+    env_text = dotenv_path.read_text(encoding="utf-8")
+    dotenv_path.write_text(
+        env_text
+        + '\nWALLET_ALPHA_PROFILES_JSON={"0xgood":{"trade_count":40,"realized_roi":0.12,'
+        + '"lagged_follow_roi":0.07,"max_drawdown":0.12,"concentration_score":0.2,'
+        + '"category_edges":{"macro":0.08}}}\n',
+        encoding="utf-8",
+    )
+
+    runner = BacktestRunner(tmp_path)
+    strategy = type("BacktestStrategy", (), {"strategy_name": "wallet_alpha"})()
+    report = runner.run(
+        strategy=strategy,
+        dataset="wallet-alpha",
+        execution_model=TopOfBookExecutionModel(),
+        config=BacktestRunConfig(
+            dataset_name="wallet-alpha",
+            output_dir=str(tmp_path / "out-wallet-alpha"),
+            dotenv_path=str(dotenv_path),
+            holding_period_ms=60_000,
+        ),
+    )
+
+    assert report.strategy_name == "wallet_alpha"
+    assert report.total_signals == 1
+    assert report.filled_trades == 1
+
+
+def test_backtest_runner_can_run_logical_constraint_strategy(tmp_path: Path):
+    dataset_dir = tmp_path / "logical-constraint"
+    dataset_dir.mkdir(parents=True)
+    (dataset_dir / "market_snapshots.jsonl").write_text(
+        (
+            '{"ts_ms":1000,"condition_id":"candidate","event_id":"e1","question":"Will candidate win?",'
+            '"yes_token_id":"candidate-yes","no_token_id":"candidate-no","yes_best_bid":0.62,"yes_best_ask":0.64,'
+            '"yes_bid_size":500,"yes_ask_size":120,"no_best_bid":0.36,"no_best_ask":0.38,'
+            '"no_bid_size":120,"no_ask_size":500}\n'
+            '{"ts_ms":1000,"condition_id":"party","event_id":"e1","question":"Will party win?",'
+            '"yes_token_id":"party-yes","no_token_id":"party-no","yes_best_bid":0.54,"yes_best_ask":0.56,'
+            '"yes_bid_size":500,"yes_ask_size":120,"no_best_bid":0.44,"no_best_ask":0.46,'
+            '"no_bid_size":120,"no_ask_size":500}\n'
+            '{"ts_ms":400000,"condition_id":"party","event_id":"e1","question":"Will party win?",'
+            '"yes_token_id":"party-yes","no_token_id":"party-no","yes_best_bid":0.58,"yes_best_ask":0.60,'
+            '"yes_bid_size":500,"yes_ask_size":120,"no_best_bid":0.40,"no_best_ask":0.42,'
+            '"no_bid_size":120,"no_ask_size":500}\n'
+        ),
+        encoding="utf-8",
+    )
+    dotenv_path = write_test_env(tmp_path)
+    dotenv_path.write_text(
+        dotenv_path.read_text(encoding="utf-8")
+        + '\nLOGICAL_CONSTRAINTS_JSON=[{"subject_market_id":"candidate","bound_market_id":"party",'
+        + '"relation_type":"subject_lte_bound","min_violation_bps":200}]\n',
+        encoding="utf-8",
+    )
+
+    runner = BacktestRunner(tmp_path)
+    strategy = type("BacktestStrategy", (), {"strategy_name": "logical_constraint"})()
+    report = runner.run(
+        strategy=strategy,
+        dataset="logical-constraint",
+        execution_model=TopOfBookExecutionModel(),
+        config=BacktestRunConfig(
+            dataset_name="logical-constraint",
+            output_dir=str(tmp_path / "out-logical-constraint"),
+            dotenv_path=str(dotenv_path),
+            holding_period_ms=60_000,
+        ),
+    )
+
+    assert report.strategy_name == "logical_constraint"
+    assert report.total_signals == 1
+    assert report.filled_trades == 1
 
 
 def test_backtest_runner_marks_profit_factor_infinite_when_no_losses(tmp_path: Path):
