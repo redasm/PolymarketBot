@@ -145,6 +145,11 @@ def create_research_signal_service(config: ArbConfig) -> Optional["ResearchSigna
             feeds_file=config.research_signal_feeds_file,
             http_json_sources=parse_http_json_sources(config.research_signal_http_json_sources),
             crypto_macro_enabled=config.research_signal_crypto_macro_enabled,
+            coingecko_enabled=config.research_signal_coingecko_enabled,
+            funding_rate_enabled=config.research_signal_funding_rate_enabled,
+            econ_calendar_enabled=config.research_signal_econ_calendar_enabled,
+            defillama_enabled=config.research_signal_defillama_enabled,
+            polymarket_activity_enabled=config.research_signal_polymarket_activity_enabled,
         )
     except Exception as e:
         LOG.error("Research Signal 功能已禁用: 初始化失败: %s", e, exc_info=True)

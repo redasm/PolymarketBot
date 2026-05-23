@@ -60,7 +60,6 @@ def test_automated_pipeline_builds_shadow_live_scanner_and_promoter(tmp_path: Pa
     assert specs[0].env["PRIVATE_KEY"] == "test-key"
     assert specs[0].env["WALLET_ALPHA_OBSERVATIONS_FILE"].endswith("wallet_observations.json")
     assert specs[0].env["WALLET_ALPHA_PROFILES_FILE"].endswith("wallet_profiles.json")
-    assert specs[0].env["TELEMETRY_RECORD_ENABLED"] == "true"
     assert "logical-rules-auto" in specs[1].args
     assert "--fetch-gamma" in specs[1].args
     assert specs[1].args[specs[1].args.index("--candidates-output") + 1].endswith("logical_candidates.json")

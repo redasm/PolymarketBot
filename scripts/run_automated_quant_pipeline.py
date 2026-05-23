@@ -90,7 +90,6 @@ def build_process_specs(args: argparse.Namespace) -> list[ProcessSpec]:
             "EVENT_BASELINES_FILE": str(baselines_file),
             "WALLET_ALPHA_PROFILES_FILE": str(profiles_file),
             "WALLET_ALPHA_OBSERVATIONS_FILE": str(observations_file),
-            "TELEMETRY_RECORD_ENABLED": "true",
             "TELEMETRY_RECORD_DIR": str(telemetry_dir),
         },
     )

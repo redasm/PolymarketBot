@@ -17,7 +17,12 @@ from research_signal.collectors.base import (
     PolymarketEventCollector,
     WebSearchCollector,
 )
+from research_signal.collectors.coingecko import CoinGeckoCollector
 from research_signal.collectors.crypto_macro import CryptoMacroCollector
+from research_signal.collectors.defillama import DeFiLlamaCollector
+from research_signal.collectors.econ_calendar import EconCalendarCollector
+from research_signal.collectors.funding_rate import FundingRateCollector
+from research_signal.collectors.polymarket_activity import PolymarketActivityCollector
 from research_signal.normalizers.topic import group_by_topic, normalize_topic, topic_overlap_score
 from research_signal.scorers.source_profile import resolve_source_profile
 from research_signal.summaries.builder import build_signal
@@ -34,6 +39,11 @@ class ResearchSignalService:
         feeds_file: str | None = None,
         http_json_sources: list[dict] | None = None,
         crypto_macro_enabled: bool = False,
+        coingecko_enabled: bool = False,
+        funding_rate_enabled: bool = False,
+        econ_calendar_enabled: bool = False,
+        defillama_enabled: bool = False,
+        polymarket_activity_enabled: bool = False,
     ):
         self._max_items = max_items
         self._cache_ttl_sec = cache_ttl_sec
@@ -45,11 +55,23 @@ class ResearchSignalService:
         self._generic_rss_collector = GenericRSSCollector(self._load_feeds_from_file())
         self._http_json_collector = GenericHTTPJSONCollector(http_json_sources or [])
         self._crypto_macro_collector = CryptoMacroCollector(enabled=crypto_macro_enabled)
-        if crypto_macro_enabled:
-            LOG.info(
-                "Crypto macro collector (Fear & Greed) enabled for research signals; "
-                "contributes a sentiment row per crypto-keyword topic"
-            )
+        self._coingecko_collector = CoinGeckoCollector(enabled=coingecko_enabled)
+        self._funding_rate_collector = FundingRateCollector(enabled=funding_rate_enabled)
+        self._econ_calendar_collector = EconCalendarCollector(enabled=econ_calendar_enabled)
+        self._defillama_collector = DeFiLlamaCollector(enabled=defillama_enabled)
+        self._polymarket_activity_collector = PolymarketActivityCollector(enabled=polymarket_activity_enabled)
+        enabled_sources = [
+            name for name, flag in [
+                ("crypto_macro", crypto_macro_enabled),
+                ("coingecko", coingecko_enabled),
+                ("funding_rate", funding_rate_enabled),
+                ("econ_calendar", econ_calendar_enabled),
+                ("defillama", defillama_enabled),
+                ("polymarket_activity", polymarket_activity_enabled),
+            ] if flag
+        ]
+        if enabled_sources:
+            LOG.info("Research signal collectors enabled: %s", ", ".join(enabled_sources))
         self._cache: dict[tuple[tuple[str, ...], int], tuple[float, ResearchSignalReport]] = {}
 
     def get_signals(self, markets: list[MarketInfo], window_sec: int) -> list[ResearchSignal]:
@@ -81,6 +103,11 @@ class ResearchSignalService:
         collected_rows.extend(self._generic_rss_collector.collect(topics))
         collected_rows.extend(self._http_json_collector.collect(topics))
         collected_rows.extend(self._crypto_macro_collector.collect(topics))
+        collected_rows.extend(self._coingecko_collector.collect(topics))
+        collected_rows.extend(self._funding_rate_collector.collect(topics))
+        collected_rows.extend(self._econ_calendar_collector.collect(topics))
+        collected_rows.extend(self._defillama_collector.collect(topics))
+        collected_rows.extend(self._polymarket_activity_collector.collect(markets))
 
         prepared_rows, dropped_rows = self._prepare_rows(collected_rows, window_sec=window_sec, now=now)
         grouped = group_by_topic(prepared_rows)

@@ -363,6 +363,11 @@ class ArbConfig:
     # the orchestrator decides what to do with it via its resonance
     # scoring. Default on (no cost, low risk).
     research_signal_crypto_macro_enabled: bool
+    research_signal_coingecko_enabled: bool
+    research_signal_funding_rate_enabled: bool
+    research_signal_econ_calendar_enabled: bool
+    research_signal_defillama_enabled: bool
+    research_signal_polymarket_activity_enabled: bool
 
     # Backtest
     backtest_enabled: bool
@@ -879,6 +884,21 @@ class ArbConfig:
             research_signal_feeds_file=_env("RESEARCH_SIGNAL_FEEDS_FILE", "data/quant_inputs/research_feeds.json"),
             research_signal_crypto_macro_enabled=_env_bool(
                 "RESEARCH_SIGNAL_CRYPTO_MACRO_ENABLED", False
+            ),
+            research_signal_coingecko_enabled=_env_bool(
+                "RESEARCH_SIGNAL_COINGECKO_ENABLED", True
+            ),
+            research_signal_funding_rate_enabled=_env_bool(
+                "RESEARCH_SIGNAL_FUNDING_RATE_ENABLED", True
+            ),
+            research_signal_econ_calendar_enabled=_env_bool(
+                "RESEARCH_SIGNAL_ECON_CALENDAR_ENABLED", True
+            ),
+            research_signal_defillama_enabled=_env_bool(
+                "RESEARCH_SIGNAL_DEFILLAMA_ENABLED", True
+            ),
+            research_signal_polymarket_activity_enabled=_env_bool(
+                "RESEARCH_SIGNAL_POLYMARKET_ACTIVITY_ENABLED", True
             ),
             backtest_enabled=_env_bool("BACKTEST_ENABLED", False),
             backtest_data_dir=_env("BACKTEST_DATA_DIR", "data/backtest"),

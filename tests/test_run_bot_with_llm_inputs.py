@@ -49,7 +49,6 @@ def test_bot_with_llm_inputs_builds_bot_and_three_llm_workers(tmp_path: Path) ->
     assert specs[0].env["LOGICAL_CONSTRAINTS_FILE"].endswith("logical_constraints.json")
     assert specs[0].env["EVENT_BASELINES_FILE"].endswith("event_baselines.json")
     assert specs[0].env["RESEARCH_SIGNAL_FEEDS_FILE"].endswith("research_feeds.json")
-    assert specs[0].env["TELEMETRY_RECORD_ENABLED"] == "true"
 
     assert "logical-rules-auto" in specs[1].args
     assert "--fetch-gamma" in specs[1].args

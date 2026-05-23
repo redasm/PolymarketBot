@@ -75,7 +75,6 @@ def build_process_specs(args: argparse.Namespace) -> list[ProcessSpec]:
             "LOGICAL_CONSTRAINTS_FILE": str(logical_file),
             "EVENT_BASELINES_FILE": str(baselines_file),
             "RESEARCH_SIGNAL_FEEDS_FILE": str(research_feeds_file),
-            "TELEMETRY_RECORD_ENABLED": "true",
             "TELEMETRY_RECORD_DIR": str(telemetry_dir),
         },
     )

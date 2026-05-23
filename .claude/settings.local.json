@@ -87,7 +87,12 @@
       "Bash(\"D:/Program Files/Python311/python.exe\" scripts/scan_quant_strategy_inputs.py logical-rules-auto --events-json /nonexistent.json --repeat-interval-sec 0 --repeat-count 1)",
       "Bash(\"D:/Program Files/Python311/python.exe\" scripts/scan_quant_strategy_inputs.py event-baselines-auto --events-json /nonexistent.json --repeat-interval-sec 0 --repeat-count 1)",
       "Bash(\"D:/Program Files/Python311/python.exe\" -m pytest tests/test_run_bot_with_llm_inputs.py tests/test_scan_quant_strategy_inputs.py -q)",
-      "Bash(git status *)"
+      "Bash(git status *)",
+      "Bash(\"D:/Program Files/Python311/python.exe\" -m py_compile \"e:/AppProject/PolymarketBot/research_signal/collectors/coingecko.py\")",
+      "Bash(\"D:/Program Files/Python311/python.exe\" -m py_compile \"e:/AppProject/PolymarketBot/research_signal/collectors/funding_rate.py\")",
+      "Bash(\"D:/Program Files/Python311/python.exe\" -m py_compile \"e:/AppProject/PolymarketBot/research_signal/collectors/econ_calendar.py\")",
+      "Bash(\"D:/Program Files/Python311/python.exe\" -m py_compile \"e:/AppProject/PolymarketBot/research_signal/collectors/defillama.py\")",
+      "Bash(\"D:/Program Files/Python311/python.exe\" -m py_compile \"e:/AppProject/PolymarketBot/research_signal/collectors/polymarket_activity.py\")"
     ],
     "additionalDirectories": [
       "\\tmp"

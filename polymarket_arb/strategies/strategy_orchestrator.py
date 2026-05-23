@@ -770,18 +770,26 @@ class StrategyOrchestrator:
         market = self._find_market(signal.market_id, active_markets)
         text = self._tail_risk_text(signal, market)
         classification = self._tail_risk_classifier.classify(text)
-        # Apply size/confidence haircut even when veto=True so that, if
-        # the caller chose to ignore the veto, the signal would still be
-        # heavily discounted. The caller checks `veto` first.
-        signal.recommended_size_usdc = max(0.0, signal.recommended_size_usdc * classification.size_multiplier)
-        signal.confidence = max(0.0, min(1.0, signal.confidence + classification.confidence_delta))
+        # T3 maker quotes are non-directional (profit from spread, not
+        # resolution direction). Apply a floor on size_multiplier so T3
+        # is never fully zeroed — reduced exposure is enough.
+        _T3_SIZE_FLOOR = 0.30
+        if signal.tier == StrategyTier.MARKET_MAKING and not classification.veto:
+            effective_mult = max(_T3_SIZE_FLOOR, classification.size_multiplier)
+            effective_conf_delta = max(-0.3, classification.confidence_delta)
+        else:
+            effective_mult = classification.size_multiplier
+            effective_conf_delta = classification.confidence_delta
+        signal.recommended_size_usdc = max(0.0, signal.recommended_size_usdc * effective_mult)
+        signal.confidence = max(0.0, min(1.0, signal.confidence + effective_conf_delta))
+        effective_veto = bool(classification.veto)
         return {
             "applied": True,
             "risk_class": classification.risk_class,
-            "size_multiplier": round(classification.size_multiplier, 3),
-            "confidence_delta": round(classification.confidence_delta, 3),
+            "size_multiplier": round(effective_mult, 3),
+            "confidence_delta": round(effective_conf_delta, 3),
             "reasons": classification.reasons,
-            "veto": bool(classification.veto),
+            "veto": effective_veto,
         }
 
     def _apply_barbell_adjustment(

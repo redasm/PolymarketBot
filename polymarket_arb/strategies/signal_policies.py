@@ -40,14 +40,24 @@ DEFAULT_TAIL_RISK_RULES: tuple[TailRiskRule, ...] = (
     TailRiskRule(
         risk_class="high_tail",
         keywords=(
-            "war", "ceasefire", "missile", "invasion", "invade", "iran", "israel", "russia", "ukraine",
-            "china", "taiwan", "geopolit", "hostage", "terror", "coup", "nuclear", "assassination",
-            "supreme court", "resign", "death", "fired", "will trump", "will biden",
+            "war", "ceasefire", "missile", "invasion", "invade",
+            "hostage", "terror", "coup", "nuclear", "assassination",
         ),
-        size_multiplier=0.0,
-        confidence_delta=-1.0,
+        size_multiplier=0.15,
+        confidence_delta=-0.5,
         reasons=("tail_risk_high", "veto_geopolitical_extremistan"),
         veto=True,
+    ),
+    TailRiskRule(
+        risk_class="geopolitical",
+        keywords=(
+            "iran", "israel", "russia", "ukraine", "china", "taiwan",
+            "geopolit", "supreme court", "resign", "death", "fired",
+        ),
+        size_multiplier=0.4,
+        confidence_delta=-0.25,
+        reasons=("tail_risk_geopolitical",),
+        veto=False,
     ),
     TailRiskRule(
         risk_class="medium_tail",
