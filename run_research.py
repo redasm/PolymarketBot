@@ -93,6 +93,7 @@ def main() -> int:
         econ_calendar_enabled=config.research_signal_econ_calendar_enabled,
         defillama_enabled=config.research_signal_defillama_enabled,
         polymarket_activity_enabled=config.research_signal_polymarket_activity_enabled,
+        manifold_enabled=config.research_signal_manifold_enabled,
     )
     report = service.collect_report(
         markets,

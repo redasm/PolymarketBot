@@ -11,6 +11,7 @@ from research_signal.collectors.crypto_macro import CryptoMacroCollector
 from research_signal.collectors.defillama import DeFiLlamaCollector
 from research_signal.collectors.econ_calendar import EconCalendarCollector
 from research_signal.collectors.funding_rate import FundingRateCollector
+from research_signal.collectors.manifold import ManifoldCollector
 from research_signal.collectors.polymarket_activity import PolymarketActivityCollector
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     "FundingRateCollector",
     "GenericHTTPJSONCollector",
     "GenericRSSCollector",
+    "ManifoldCollector",
     "PolymarketActivityCollector",
     "PolymarketEventCollector",
     "WebSearchCollector",

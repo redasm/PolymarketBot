@@ -150,6 +150,15 @@ def main() -> int:
         help="Repeat the scan with this delay; 0 means run once",
     )
     p_research_feeds.add_argument("--repeat-count", type=int, default=1, help="Use 0 to repeat forever")
+    p_research_feeds.add_argument(
+        "--seed-feeds-file",
+        default=None,
+        help=(
+            "Optional JSON file with persistent seed feeds. Same format as the output file: "
+            '{"feeds": [{"name": ..., "url_template": ...}]}. Seeds are validated and merged '
+            "with LLM proposals."
+        ),
+    )
 
     p_llm_healthcheck = sub.add_parser("llm-healthcheck", help="Send one tiny request to the configured LLM")
     p_llm_healthcheck.add_argument("--dotenv-path", default=None)
@@ -383,12 +392,32 @@ def _build_payload(args) -> Any:
         provider = create_provider(config)
         args._last_llm_called = True
         args._last_llm_skip_reason = ""
+        seed_feeds: list[dict[str, str]] = []
+        seed_path_arg = getattr(args, "seed_feeds_file", None)
+        if seed_path_arg:
+            seed_path = Path(seed_path_arg)
+            if seed_path.exists():
+                try:
+                    seed_payload = json.loads(seed_path.read_text(encoding="utf-8"))
+                    raw = (
+                        seed_payload.get("feeds")
+                        if isinstance(seed_payload, dict)
+                        else seed_payload
+                    )
+                    if isinstance(raw, list):
+                        seed_feeds = [s for s in raw if isinstance(s, dict)]
+                except Exception as exc:
+                    print(
+                        f"research-feeds-auto: seed file parse failed path={seed_path} err={exc}",
+                        file=sys.stderr,
+                    )
         feeds = select_research_feeds_with_llm(
             provider,
             focus_keywords=focus_keywords,
             temperature=config.ai_temperature,
             max_feeds=args.max_feeds,
             http_timeout_sec=args.http_timeout_sec,
+            seed_feeds=seed_feeds or None,
         )
         args._last_feed_count = len(feeds)
         generated_at = time.time()

@@ -40,6 +40,14 @@ def main() -> int:
         default=8.0,
         help="Per-template HTTP probe timeout when validating LLM-proposed RSS feeds",
     )
+    parser.add_argument(
+        "--research-feeds-seed-file",
+        default=None,
+        help=(
+            "Optional JSON file with persistent seed RSS feeds; merged with LLM proposals "
+            "and validated through the same RSS probe."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print commands without starting processes")
     args = parser.parse_args()
 
@@ -155,6 +163,11 @@ def build_process_specs(args: argparse.Namespace) -> list[ProcessSpec]:
                 str(research_feeds_status_file),
                 "--output",
                 str(research_feeds_file),
+                *(
+                    ["--seed-feeds-file", str(_resolve_path(args.research_feeds_seed_file))]
+                    if args.research_feeds_seed_file
+                    else []
+                ),
             ],
             critical=False,
         ),

@@ -276,6 +276,7 @@ def make_test_config(**overrides) -> ArbConfig:
         research_signal_econ_calendar_enabled=False,
         research_signal_defillama_enabled=False,
         research_signal_polymarket_activity_enabled=False,
+        research_signal_manifold_enabled=False,
         backtest_enabled=False,
         backtest_data_dir="data/backtest",
         backtest_default_dataset="default",

@@ -5,6 +5,7 @@ import json
 from polymarket_arb.models import EventInfo, MarketInfo, TokenInfo
 from polymarket_arb.quant_input_scanner import (
     DataApiWalletTradeClient,
+    _classify_research_keyword_domains,
     build_wallet_markouts_from_trade_rows,
     build_wallet_observations_from_trades,
     build_wallet_markouts_from_shadow_rows,
@@ -592,3 +593,176 @@ def test_select_research_feeds_with_llm_passes_keyword_domains_to_prompt():
     assert user_payload["focus_keyword_domains"]["crypto"] == ["bitcoin"]
     assert user_payload["focus_keyword_domains"]["macro"] == ["fed"]
     assert user_payload["focus_keyword_domains"]["sports"] == ["nfl"]
+
+
+def test_classify_research_keyword_domains_entertainment():
+    grouped = _classify_research_keyword_domains(["oscar", "grammy", "boxoffice"])
+    assert "entertainment" in grouped
+    assert set(grouped["entertainment"]) == {"oscar", "grammy", "boxoffice"}
+
+
+def test_classify_research_keyword_domains_company_events():
+    grouped = _classify_research_keyword_domains(["earnings", "tesla", "ipo"])
+    assert "company_events" in grouped
+    assert set(grouped["company_events"]) == {"earnings", "tesla", "ipo"}
+
+
+def test_select_research_feeds_includes_entertainment_in_prompt():
+    valid_rss = "<rss><channel><item><title>x</title></item></channel></rss>"
+    session = _FakeRSSSession({"example.com": valid_rss})
+    llm = _FakeFeedLLM(
+        [{"name": "ok", "url_template": "https://example.com/rss?q={query}"}]
+    )
+
+    select_research_feeds_with_llm(
+        llm,
+        focus_keywords=["oscar"],
+        temperature=0.1,
+        max_feeds=3,
+        http_timeout_sec=1.0,
+        http_session=session,
+    )
+
+    system_text = llm.messages[0][0]["content"]
+    assert "entertainment:" in system_text
+    assert "Variety" in system_text
+
+
+def test_select_research_feeds_includes_company_events_in_prompt():
+    valid_rss = "<rss><channel><item><title>x</title></item></channel></rss>"
+    session = _FakeRSSSession({"example.com": valid_rss})
+    llm = _FakeFeedLLM(
+        [{"name": "ok", "url_template": "https://example.com/rss?q={query}"}]
+    )
+
+    select_research_feeds_with_llm(
+        llm,
+        focus_keywords=["earnings", "tesla"],
+        temperature=0.1,
+        max_feeds=3,
+        http_timeout_sec=1.0,
+        http_session=session,
+    )
+
+    system_text = llm.messages[0][0]["content"]
+    assert "company_events:" in system_text
+    assert "SEC EDGAR" in system_text
+
+
+def test_select_research_feeds_includes_seeds_first():
+    valid_rss = "<rss><channel><item><title>x</title></item></channel></rss>"
+    session = _FakeRSSSession({"example": valid_rss})
+    llm = _FakeFeedLLM(
+        [{"name": "llm_feed", "url_template": "https://example.com/llm?q={query}"}]
+    )
+
+    feeds = select_research_feeds_with_llm(
+        llm,
+        focus_keywords=["bitcoin"],
+        temperature=0.1,
+        max_feeds=5,
+        http_timeout_sec=1.0,
+        http_session=session,
+        seed_feeds=[
+            {"name": "seed_feed", "url_template": "https://example.com/seed?q={query}"}
+        ],
+    )
+
+    assert len(feeds) == 2
+    assert feeds[0]["name"] == "seed_feed"
+    assert feeds[1]["name"] == "llm_feed"
+
+
+def test_seed_feeds_filtered_when_invalid():
+    valid_rss = "<rss><channel><item><title>x</title></item></channel></rss>"
+    session = _FakeRSSSession({"example": valid_rss})
+    llm = _FakeFeedLLM(
+        [{"name": "llm_feed", "url_template": "https://example.com/llm?q={query}"}]
+    )
+
+    feeds = select_research_feeds_with_llm(
+        llm,
+        focus_keywords=["bitcoin"],
+        temperature=0.1,
+        max_feeds=5,
+        http_timeout_sec=1.0,
+        http_session=session,
+        seed_feeds=[
+            {"name": "no_placeholder", "url_template": "https://example.com/seed"},
+            {"name": "wrong_scheme", "url_template": "ftp://example.com/seed?q={query}"},
+            "not-a-dict",
+        ],
+    )
+
+    names = {feed["name"] for feed in feeds}
+    assert names == {"llm_feed"}
+
+
+def test_seed_feed_dedupes_against_llm():
+    valid_rss = "<rss><channel><item><title>x</title></item></channel></rss>"
+    session = _FakeRSSSession({"example": valid_rss})
+    shared_template = "https://example.com/shared?q={query}"
+    llm = _FakeFeedLLM(
+        [{"name": "llm_dup", "url_template": shared_template}]
+    )
+
+    feeds = select_research_feeds_with_llm(
+        llm,
+        focus_keywords=["bitcoin"],
+        temperature=0.1,
+        max_feeds=5,
+        http_timeout_sec=1.0,
+        http_session=session,
+        seed_feeds=[
+            {"name": "seed_keeps", "url_template": shared_template}
+        ],
+    )
+
+    assert feeds == [{"name": "seed_keeps", "url_template": shared_template}]
+
+
+def test_seed_feed_validation_runs():
+    """Seed feed whose probe returns plain HTML must be rejected."""
+    session = _FakeRSSSession({})
+    llm = _FakeFeedLLM([])
+
+    feeds = select_research_feeds_with_llm(
+        llm,
+        focus_keywords=["bitcoin"],
+        temperature=0.1,
+        max_feeds=5,
+        http_timeout_sec=1.0,
+        http_session=session,
+        seed_feeds=[
+            {"name": "broken_seed", "url_template": "https://nowhere.example/rss?q={query}"}
+        ],
+    )
+
+    assert feeds == []
+
+
+def test_seed_feeds_count_against_max_feeds():
+    valid_rss = "<rss><channel><item><title>x</title></item></channel></rss>"
+    session = _FakeRSSSession({"example": valid_rss})
+    llm = _FakeFeedLLM(
+        [
+            {"name": f"llm_{idx}", "url_template": f"https://example.com/llm{idx}?q={{query}}"}
+            for idx in range(3)
+        ]
+    )
+
+    feeds = select_research_feeds_with_llm(
+        llm,
+        focus_keywords=["bitcoin"],
+        temperature=0.1,
+        max_feeds=1,
+        http_timeout_sec=1.0,
+        http_session=session,
+        seed_feeds=[
+            {"name": "the_seed", "url_template": "https://example.com/seed?q={query}"}
+        ],
+    )
+
+    assert feeds == [
+        {"name": "the_seed", "url_template": "https://example.com/seed?q={query}"}
+    ]

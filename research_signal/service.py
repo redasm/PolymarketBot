@@ -22,6 +22,7 @@ from research_signal.collectors.crypto_macro import CryptoMacroCollector
 from research_signal.collectors.defillama import DeFiLlamaCollector
 from research_signal.collectors.econ_calendar import EconCalendarCollector
 from research_signal.collectors.funding_rate import FundingRateCollector
+from research_signal.collectors.manifold import ManifoldCollector
 from research_signal.collectors.polymarket_activity import PolymarketActivityCollector
 from research_signal.normalizers.topic import group_by_topic, normalize_topic, topic_overlap_score
 from research_signal.scorers.source_profile import resolve_source_profile
@@ -44,6 +45,7 @@ class ResearchSignalService:
         econ_calendar_enabled: bool = False,
         defillama_enabled: bool = False,
         polymarket_activity_enabled: bool = False,
+        manifold_enabled: bool = False,
     ):
         self._max_items = max_items
         self._cache_ttl_sec = cache_ttl_sec
@@ -60,6 +62,7 @@ class ResearchSignalService:
         self._econ_calendar_collector = EconCalendarCollector(enabled=econ_calendar_enabled)
         self._defillama_collector = DeFiLlamaCollector(enabled=defillama_enabled)
         self._polymarket_activity_collector = PolymarketActivityCollector(enabled=polymarket_activity_enabled)
+        self._manifold_collector = ManifoldCollector(enabled=manifold_enabled)
         enabled_sources = [
             name for name, flag in [
                 ("crypto_macro", crypto_macro_enabled),
@@ -68,6 +71,7 @@ class ResearchSignalService:
                 ("econ_calendar", econ_calendar_enabled),
                 ("defillama", defillama_enabled),
                 ("polymarket_activity", polymarket_activity_enabled),
+                ("manifold", manifold_enabled),
             ] if flag
         ]
         if enabled_sources:
@@ -108,6 +112,7 @@ class ResearchSignalService:
         collected_rows.extend(self._econ_calendar_collector.collect(topics))
         collected_rows.extend(self._defillama_collector.collect(topics))
         collected_rows.extend(self._polymarket_activity_collector.collect(markets))
+        collected_rows.extend(self._manifold_collector.collect(topics))
 
         prepared_rows, dropped_rows = self._prepare_rows(collected_rows, window_sec=window_sec, now=now)
         grouped = group_by_topic(prepared_rows)

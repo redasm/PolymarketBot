@@ -368,6 +368,7 @@ class ArbConfig:
     research_signal_econ_calendar_enabled: bool
     research_signal_defillama_enabled: bool
     research_signal_polymarket_activity_enabled: bool
+    research_signal_manifold_enabled: bool
 
     # Backtest
     backtest_enabled: bool
@@ -899,6 +900,9 @@ class ArbConfig:
             ),
             research_signal_polymarket_activity_enabled=_env_bool(
                 "RESEARCH_SIGNAL_POLYMARKET_ACTIVITY_ENABLED", True
+            ),
+            research_signal_manifold_enabled=_env_bool(
+                "RESEARCH_SIGNAL_MANIFOLD_ENABLED", True
             ),
             backtest_enabled=_env_bool("BACKTEST_ENABLED", False),
             backtest_data_dir=_env("BACKTEST_DATA_DIR", "data/backtest"),

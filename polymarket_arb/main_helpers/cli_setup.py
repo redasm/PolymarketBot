@@ -150,6 +150,7 @@ def create_research_signal_service(config: ArbConfig) -> Optional["ResearchSigna
             econ_calendar_enabled=config.research_signal_econ_calendar_enabled,
             defillama_enabled=config.research_signal_defillama_enabled,
             polymarket_activity_enabled=config.research_signal_polymarket_activity_enabled,
+            manifold_enabled=config.research_signal_manifold_enabled,
         )
     except Exception as e:
         LOG.error("Research Signal 功能已禁用: 初始化失败: %s", e, exc_info=True)

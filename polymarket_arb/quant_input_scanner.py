@@ -292,6 +292,7 @@ def select_research_feeds_with_llm(
     max_feeds: int = 12,
     http_timeout_sec: float = 8.0,
     http_session: Any | None = None,
+    seed_feeds: list[dict[str, str]] | None = None,
 ) -> list[dict[str, str]]:
     """Use an LLM to propose RSS feed URL templates, then validate each."""
     try:
@@ -311,6 +312,7 @@ def select_research_feeds_with_llm(
             max_feeds=max_feeds,
             http_timeout_sec=http_timeout_sec,
             http_session=http_session,
+            seed_feeds=seed_feeds,
         )
     )
 
@@ -357,6 +359,27 @@ _RESEARCH_FEED_DOMAIN_RULES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]],
         ),
         ("Reuters", "Associated Press", "BBC", "Al Jazeera"),
     ),
+    (
+        "entertainment",
+        (
+            "oscar", "oscars", "grammy", "grammys", "emmy", "emmys",
+            "tony", "tonys", "cannes", "golden", "globe", "globes",
+            "box_office", "boxoffice", "album", "movie", "film",
+            "celebrity", "award", "awards", "nominee", "nomination",
+        ),
+        ("Variety", "Hollywood Reporter", "Deadline", "Billboard"),
+    ),
+    (
+        "company_events",
+        (
+            "earnings", "ipo", "spac", "8-k", "10-q", "10-k",
+            "buyback", "merger", "acquisition", "dividend", "guidance",
+            "quarterly", "revenue", "profit", "delisting",
+            "tesla", "apple", "google", "microsoft", "nvidia",
+            "meta", "amazon", "openai", "anthropic",
+        ),
+        ("SEC EDGAR", "Reuters Business", "Bloomberg", "CNBC"),
+    ),
 )
 
 _DOMAIN_PROBE_FALLBACK: dict[str, str] = {
@@ -365,6 +388,8 @@ _DOMAIN_PROBE_FALLBACK: dict[str, str] = {
     "politics": "election",
     "sports": "nfl",
     "geopolitics": "ukraine",
+    "entertainment": "oscar",
+    "company_events": "earnings",
     "general": "election",
 }
 
@@ -396,7 +421,16 @@ def _build_research_feed_probe_set(focus_keywords: list[str]) -> list[str]:
     grouped = _classify_research_keyword_domains(focus_keywords)
     probes: list[str] = []
     seen: set[str] = set()
-    for domain in ("crypto", "macro", "politics", "sports", "geopolitics", "other"):
+    for domain in (
+        "crypto",
+        "macro",
+        "politics",
+        "sports",
+        "geopolitics",
+        "entertainment",
+        "company_events",
+        "other",
+    ):
         candidates = grouped.get(domain) or []
         if not candidates and domain in _DOMAIN_PROBE_FALLBACK:
             continue
@@ -419,6 +453,7 @@ async def select_research_feeds_with_llm_async(
     max_feeds: int,
     http_timeout_sec: float,
     http_session: Any | None,
+    seed_feeds: list[dict[str, str]] | None = None,
 ) -> list[dict[str, str]]:
     grouped = _classify_research_keyword_domains(focus_keywords)
     domain_lines: list[str] = []
@@ -482,6 +517,21 @@ async def select_research_feeds_with_llm_async(
     rows = payload.get("feeds", []) if isinstance(payload, dict) else []
     proposed: list[dict[str, str]] = []
     seen_templates: set[str] = set()
+
+    for idx, seed in enumerate(seed_feeds or [], start=1):
+        if not isinstance(seed, dict):
+            continue
+        template = str(seed.get("url_template") or seed.get("url") or "").strip()
+        if not template or "{query}" not in template:
+            continue
+        if not (template.startswith("https://") or template.startswith("http://")):
+            continue
+        if template in seen_templates:
+            continue
+        seen_templates.add(template)
+        name = str(seed.get("name") or "").strip() or f"seed_feed_{idx}"
+        proposed.append({"name": name, "url_template": template})
+
     for idx, row in enumerate(rows if isinstance(rows, list) else [], start=1):
         if not isinstance(row, dict):
             continue

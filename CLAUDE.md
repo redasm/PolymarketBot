@@ -85,7 +85,7 @@ Before queueing directional signals, `StrategyOrchestrator` applies two adjustme
 - **`ai_advisor.py`** — Optional LLM layer (`AIAdvisor`); market evaluation, execution decisions, dynamic risk adjustments — all still pass through RiskManager
 - **`notifier.py` + `feishu_notifier.py`** — Unified notification routing (trade success/failure, fatal errors, PnL alerts, daily summary) via Feishu app-bot OpenAPI
 - **`portfolio_sync.py`** — Low-frequency real-account sync (positions + daily realized PnL → dashboard/risk state); does not touch the high-frequency scan/execute path
-- **`research_signal/`** — Collectors / normalizers / scorers package feeding the orchestrator's research overlay (RSS feeds curated by the `research-feeds-llm` worker into `data/quant_inputs/research_feeds.json`)
+- **`research_signal/`** — Collectors / normalizers / scorers package feeding the orchestrator's research overlay (RSS feeds curated by the `research-feeds-llm` worker into `data/quant_inputs/research_feeds.json`). The worker supports `--seed-feeds-file` to persist user-supplied seed feeds across cycles; seeds are validated through the same RSS probe as LLM proposals and survive LLM drop-out
 - **`research/backtest/`** — Separate offline backtest runner package (distinct from `research_signal/`); driven by `python -m research.backtest.run`
 
 ### AI Layer

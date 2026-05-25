@@ -32,6 +32,7 @@ _SOURCE_PROFILES: dict[str, dict[str, object]] = {
     "weather": {"label": "Weather Feed", "type": "weather_data", "tier": 1, "weight": 0.84},
     "fear_greed": {"label": "Fear & Greed", "type": "market_sentiment", "tier": 3, "weight": 0.58},
     "coingecko_trending": {"label": "CoinGecko Trending", "type": "market_sentiment", "tier": 3, "weight": 0.57},
+    "manifold": {"label": "Manifold Markets", "type": "prediction_market", "tier": 2, "weight": 0.78},
 }
 
 

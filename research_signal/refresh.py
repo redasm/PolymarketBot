@@ -23,6 +23,13 @@ def main() -> None:
         cache_ttl_sec=config.research_signal_cache_ttl_sec,
         cache_dir=config.research_signal_cache_dir,
         feeds_file=config.research_signal_feeds_file,
+        crypto_macro_enabled=config.research_signal_crypto_macro_enabled,
+        coingecko_enabled=config.research_signal_coingecko_enabled,
+        funding_rate_enabled=config.research_signal_funding_rate_enabled,
+        econ_calendar_enabled=config.research_signal_econ_calendar_enabled,
+        defillama_enabled=config.research_signal_defillama_enabled,
+        polymarket_activity_enabled=config.research_signal_polymarket_activity_enabled,
+        manifold_enabled=config.research_signal_manifold_enabled,
     )
     report = service.collect_report(markets, config.research_signal_window_sec)
     print(json.dumps(report.to_dict(), ensure_ascii=False))

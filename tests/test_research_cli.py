@@ -58,6 +58,7 @@ def test_run_research_outputs_json(monkeypatch, capsys):
                 "research_signal_econ_calendar_enabled": False,
                 "research_signal_defillama_enabled": False,
                 "research_signal_polymarket_activity_enabled": False,
+                "research_signal_manifold_enabled": False,
                 "research_signal_window_sec": 86400,
             },
         )(),
