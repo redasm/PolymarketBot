@@ -62,7 +62,7 @@ Periodic scan (5s)
 StrategyOrchestrator → priority sort → capital allocation → execute
 ```
 
-**Critical**: T0 structural arbitrage bypasses AI and goes directly to RiskManager — millisecond latency required. AI only intervenes in T2/T3 where 1-3s delay is tolerable.
+**Critical**: T0 structural arbitrage goes directly to RiskManager — millisecond latency required. No tier (T0–T3) consults an LLM on the hot path; LLM work happens out-of-process via `scripts/scan_quant_strategy_inputs.py` and lands in the loop as quant-input JSON files.
 
 Before queueing directional signals, `StrategyOrchestrator` applies two adjustments:
 - **Research resonance**: ≥3 same-direction signals from diverse sources with sufficient confidence get extra weight; strong cross-source conflict vetoes the signal. Telemetry tracks `applied / boosted / penalized / vetoed` counts under `strategy_status.meta.research_overlay`.
@@ -82,7 +82,7 @@ Before queueing directional signals, `StrategyOrchestrator` applies two adjustme
 - **`execution_engine.py`** — Multi-leg atomic order submission with rollback on partial failure
 - **`strategies/optimal_stopping.py`** — Finite-horizon Bellman/MDP recursion for exit thresholds and partial take-profit; consumed by T2/AI directional positions to avoid entry-only logic
 - **`strategies/t2_exit_manager.py`** — Tracks every T2 fill and emits SELL orders when stop-loss / take-profit / time-stop / optimal-stopping triggers. Without it directional positions ride to settlement; the manager is what turns positive-EV entries into closed PnL
-- **`ai_advisor.py`** — Optional LLM layer (`AIAdvisor`); market evaluation, execution decisions, dynamic risk adjustments — all still pass through RiskManager
+- **`ai_provider.py`** — `LLMProvider` abstraction (OpenAI / Anthropic / Ollama). **Not wired into the trading loop**; only consumed by the offline `scripts/scan_quant_strategy_inputs.py` worker that generates `data/quant_inputs/*.json` (logical constraints, event baselines, wallet profiles, research feeds). The main loop ingests those JSON files through the orchestrator's research overlay — there is no inline LLM gate on entry/exit decisions.
 - **`notifier.py` + `feishu_notifier.py`** — Unified notification routing (trade success/failure, fatal errors, PnL alerts, daily summary) via Feishu app-bot OpenAPI
 - **`portfolio_sync.py`** — Low-frequency real-account sync (positions + daily realized PnL → dashboard/risk state); does not touch the high-frequency scan/execute path
 - **`research_signal/`** — Collectors / normalizers / scorers package feeding the orchestrator's research overlay (RSS feeds curated by the `research-feeds-llm` worker into `data/quant_inputs/research_feeds.json`). The worker supports `--seed-feeds-file` to persist user-supplied seed feeds across cycles; seeds are validated through the same RSS probe as LLM proposals and survive LLM drop-out
@@ -90,7 +90,7 @@ Before queueing directional signals, `StrategyOrchestrator` applies two adjustme
 
 ### AI Layer
 
-`AI_ENABLED=false` means zero overhead. When enabled, `AIAdvisor` uses a `LLMProvider` abstraction supporting OpenAI, Anthropic, DeepSeek, Gemini, and Ollama. Tracks daily cost via `AI_MAX_DAILY_COST_USD`; auto-degrades to read-only on cost overrun or consecutive losses. See `AI_CONFIGURATION.md` for full provider config.
+There is **no inline AIAdvisor** in this codebase. The `AI_*` env vars (`AI_PROVIDER`, `AI_API_KEY`, `AI_API_BASE`, `AI_MODEL`, `AI_TEMPERATURE`) configure an out-of-process worker — `scripts/scan_quant_strategy_inputs.py` — that consumes the `LLMProvider` abstraction in `polymarket_arb/ai_provider.py` and writes refreshed `data/quant_inputs/*.json` files. The trading loop hot-reloads those files (`LOGICAL_CONSTRAINTS_FILE`, `EVENT_BASELINES_FILE`, `WALLET_ALPHA_*_FILE`, `RESEARCH_SIGNAL_FEEDS_FILE`) and uses them inside `StrategyOrchestrator`'s research overlay. The loop never blocks on an LLM call. Supported providers: OpenAI-compatible (incl. DeepSeek), Anthropic, Ollama. See `AI_CONFIGURATION.md` for provider config.
 
 ### Capital Allocation (default $1000)
 
@@ -163,7 +163,6 @@ Copy `.env.example` (or `polymarket_only_live.env.example` / `polymarket_only_ca
 | `POLYMARKET_SIGNATURE_TYPE` | `2` | Use `3` for deposit wallet / `POLY_1271` |
 | `ARB_MIN_EDGE_USD` | `0.005` | Minimum net profit threshold |
 | `TICK_RECORD_ENABLED` | `false` | Record orderbook ticks for backtesting |
-| `AI_ENABLED` | `false` | Enable LLM decision layer |
 | `RESEARCH_SIGNAL_ENABLED` | `false` | Enable research signal aggregation |
 
 For observation mode (before going live), broaden scanning with `ARB_MARKET_FOCUS_KEYWORDS=`, `ARB_HOT_MARKET_POOL_SIZE=150`, `T2_MIN_DEVIATION=0.01`. Full parameter reference in `CONFIGURATION.md`.
@@ -182,6 +181,61 @@ For observation mode (before going live), broaden scanning with `ARB_MARKET_FOCU
 - `SERVER_OBSERVABILITY.md` — log/telemetry watch recommendations for unattended servers
 - `EXTERNAL_REFERENCES.md` — external research / data source references
 - `PENDING_VALIDATIONS.md` — checklist for graduating shadow-mode features (NearCertaintyRule, dynamic stop, barbell pool, on-chain signals) to live; lists data sources needed and the env flags to flip on each validation
+
+## Working with Claude
+
+### Language and tone
+
+- **Reply in Chinese.** Code, identifiers, log strings stay English; explanations and reports are Chinese.
+- 不要开场白（"好的我来分析…"）。直接给结论，证据放后。分析报告用 markdown 表格而非散文。
+- 不确定时直说"我不确定 X"或"需要看 Y 才能下结论"。**量化领域瞎猜的代价很高，宁可让用户多答一问。**
+
+### Never read full logs raw
+
+`arb_bot.log` and the NDJSON telemetry files run from hundreds of KB to hundreds of MB. Reading them whole burns context and produces shallower analysis. Always:
+
+- Filter / aggregate first with `grep`, `jq`, `pandas`, or one-off scripts in `analysis/` (one-off scripts can live there too — don't gate on a "proper home").
+- Feed Claude **summaries** (error code distribution, hourly aggregates, typical/extreme samples joined by `trace_id`) — not raw lines.
+- Only pull raw lines after a summary points to a specific window or `trace_id`.
+
+Anti-example: `cat data/telemetry/*.cycle_metrics.ndjson | head -2000`. Correct: `python -c "import json…" | summary table → drill into anomaly window`.
+
+### Plan before coding when it's not trivial
+
+Use plan mode and wait for confirmation before any of:
+- Touching signal / sizing / risk / execution core logic
+- Multi-file changes (≥3 files)
+- New dependencies or data-schema changes
+- **Anything affecting order submission** — no exceptions
+
+Trivial bug fixes, typo fixes, single-function edits → just do it.
+
+### Production-grade defaults
+
+This is not a demo. Every change assumes:
+- Exception coverage on network / API / partial-fill / reconnect paths
+- Structured logs on hot paths with `trace_id` continuity
+- Edit → unit tests → backtest (when applicable) → merge
+
+### Default behaviors to AVOID
+
+- 不要主动建议加依赖。新增 package 必须先论证标准库 / 已有依赖为什么不够用。
+- 修 bug 时只动相关代码。**不要顺手重构无关模块。**
+- 没看过实际数据分布就不要给阈值建议。先 `summary`，再调参。
+- 不要假设市场状态。除非用户提供实时数据，不要写出"现在 BTC 在 $XX"这类断言。
+- 不要碰 `production/` 目录下的任何文件，除非用户明确指示。
+- 不要在 dashboard 绑定 `0.0.0.0`（CLAUDE.md 上面已强调，loopback only）。
+
+### Standard analysis flow
+
+当用户说"看一下 X 时段 / X 策略的表现"时，默认按此走：
+
+1. **明确范围** — 时间窗 / 策略 tier / market / token；模糊就反问，**不要瞎猜**。
+2. **跑 summary** — 先看 PnL 曲线、`skip_reason_counts` 分布、`book_stats` 比例、错误码统计的聚合数据。
+3. **找异常点** — 识别尾部时段（PnL 突变、skip 突增、`rest_fallback` 占比飙升、延迟尖峰）。
+4. **深挖样本** — 只针对异常窗口拉具体日志（带 `trace_id` / `run_id` 串联）。
+5. **归因** — 区分**市场原因**（行情结构变化、流动性下降）vs **系统原因**（bug、延迟、API 限流、订阅丢失）。
+6. **给建议** — 参数问题：给具体调整方向 + 预期影响 + 风险；bug：直接定位到 `file_path:line_number`。
 
 ## Testing
 

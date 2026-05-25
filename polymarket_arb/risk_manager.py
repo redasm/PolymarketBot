@@ -73,6 +73,7 @@ class RiskManager:
     @property
     def state(self) -> RiskState:
         with self._lock:
+            self._maybe_reset_daily()
             self._reconcile_pending_reservations()
             self._apply_shadow_snapshot_locked()
             return _snapshot_risk_state(self._state)
@@ -306,6 +307,7 @@ class RiskManager:
         realized_pnl: float | None,
         count_pending_as_failure: bool,
     ) -> None:
+        self._maybe_reset_daily()
         filled_trades = [t for t in trades if t.status == TradeStatus.FILLED]
         partially_filled_trades = [t for t in trades if t.status == TradeStatus.PARTIAL]
         pending_trades = [t for t in trades if t.status == TradeStatus.PENDING]
@@ -407,6 +409,7 @@ class RiskManager:
     def record_settlement(self, condition_id: str, pnl: float) -> None:
         """记录市场结算后的盈亏."""
         with self._lock:
+            self._maybe_reset_daily()
             self._state.daily_pnl += pnl
             self._state.total_pnl = self._state.daily_pnl + self._state.unrealized_pnl
             exposure = self._market_exposure.pop(condition_id, 0.0)
@@ -515,7 +518,20 @@ class RiskManager:
     ) -> None:
         """用账户真实状态刷新持仓和已实现日盈亏."""
         with self._lock:
+            self._maybe_reset_daily()
             self._reconcile_pending_reservations()
+            # P1-3: 同步会直接覆盖 daily_pnl。如果与内存累计差距过大，
+            # 说明本地 record_execution / record_settlement 跟链上结算之间
+            # 有遗漏（漏记或重复记），先告警再覆盖，便于事后追源。
+            prior_daily_pnl = float(self._state.daily_pnl)
+            divergence = float(realized_daily_pnl) - prior_daily_pnl
+            if abs(divergence) > 1.0:
+                LOG.warning(
+                    "账户同步: daily_pnl 内存值 $%.4f 与账户值 $%.4f 分歧 $%+.4f，以账户为准",
+                    prior_daily_pnl,
+                    float(realized_daily_pnl),
+                    divergence,
+                )
 
             actual_market_exposure: dict[str, float] = {}
             normalized_positions: list[PositionSnapshot] = []

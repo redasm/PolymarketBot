@@ -848,11 +848,15 @@ class T2ExitManager:
             LOG.warning("post-exit cooldown 写入失败: %s", exc)
 
     def _release_exit_exposure(self, pos: T2OpenPosition, fill_price: float, fill_size: float) -> None:
+        # 释放敞口必须按 entry_price 折算 —— RiskManager 入仓时
+        # 记账的就是 entry_price * size。若用 fill_price，止损（fill < entry）
+        # 会少释放、止盈（fill > entry）会多释放，导致 _market_exposure 漂移。
+        booked_release = max(0.0, pos.entry_price * fill_size)
         if self._risk_manager is None:
-            self._release_orchestrator_exposure(max(0.0, pos.entry_price * fill_size))
+            self._release_orchestrator_exposure(booked_release)
             return
-        self._risk_manager.release_market_exposure(pos.condition_id, max(0.0, fill_price * fill_size))
-        self._release_orchestrator_exposure(max(0.0, pos.entry_price * fill_size))
+        self._risk_manager.release_market_exposure(pos.condition_id, booked_release)
+        self._release_orchestrator_exposure(booked_release)
 
     def _release_orchestrator_exposure(self, amount: float) -> None:
         if self._orchestrator is None or amount <= 0:
