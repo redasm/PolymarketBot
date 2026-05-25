@@ -21,6 +21,7 @@ from polymarket_arb.main_helpers.cycle_runners import (
     find_pending_signal,
     find_pending_signal_overlay,
     refresh_market_universe,
+    refresh_ws_subscription,
     scan_cycle,
     start_ws_feed,
 )
@@ -310,6 +311,244 @@ def test_start_ws_feed_omits_trade_callback_when_no_flow_ingest(monkeypatch) -> 
     start_ws_feed([_market()], _FakeBookStore())
 
     assert captured_kwargs.get("trade_callback") is None
+
+
+# ---------- refresh_ws_subscription ------------------------------------------
+
+
+@dataclass
+class _FakeDynamicFeed:
+    """Stand-in for WebSocketFeed exposing the surface refresh_ws_subscription needs."""
+
+    subscribed: set = field(default_factory=set)
+    add_calls: list = field(default_factory=list)
+    remove_calls: list = field(default_factory=list)
+    stop_called: bool = False
+    trade_callback: object | None = None
+    add_returns: bool = True
+    remove_returns: bool = True
+
+    def subscribed_tokens(self) -> set:
+        return set(self.subscribed)
+
+    def add_tokens(self, token_ids) -> bool:
+        snapshot = set(token_ids)
+        self.add_calls.append(snapshot)
+        if self.add_returns:
+            self.subscribed.update(snapshot)
+        return self.add_returns
+
+    def remove_tokens(self, token_ids) -> bool:
+        snapshot = set(token_ids)
+        self.remove_calls.append(snapshot)
+        if self.remove_returns:
+            self.subscribed.difference_update(snapshot)
+        return self.remove_returns
+
+    def stop(self) -> None:
+        self.stop_called = True
+
+    def set_trade_callback(self, cb) -> None:
+        self.trade_callback = cb
+
+    def subscribe(self, token_ids) -> None:
+        self.subscribed.update(token_ids)
+
+    def start(self) -> None:
+        pass
+
+
+def test_refresh_ws_subscription_first_call_delegates_to_start_ws_feed(monkeypatch):
+    """When feed/mirror are None refresh_ws_subscription must build a new feed."""
+    fake_feed = _FakeFeed()
+    monkeypatch.setattr(
+        "polymarket_arb.main_helpers.cycle_runners.WebSocketFeed",
+        lambda **_: fake_feed,
+    )
+    monkeypatch.setattr(
+        "polymarket_arb.main_helpers.cycle_runners.OrderBookMirror",
+        _FakeMirror,
+    )
+
+    feed, mirror = refresh_ws_subscription(
+        feed=None,
+        mirror=None,
+        targets=[_market("0xprimary")],
+        enhanced_store=_FakeBookStore(),
+    )
+
+    assert feed is fake_feed
+    assert isinstance(mirror, _FakeMirror)
+    assert fake_feed.started is True
+
+
+def test_refresh_ws_subscription_diffs_add_and_remove():
+    """Same feed, different targets → diff goes through add/remove_tokens."""
+    feed = _FakeDynamicFeed(subscribed={"tok-yes", "tok-no"})
+    mirror = _FakeMirror()
+    store = _FakeBookStore()
+
+    new_market = _market("0xnew")
+    new_market.tokens = [
+        TokenInfo(token_id="new-yes", outcome="Yes", price=0.5),
+        TokenInfo(token_id="new-no", outcome="No", price=0.5),
+    ]
+
+    out_feed, out_mirror = refresh_ws_subscription(
+        feed=feed,
+        mirror=mirror,
+        targets=[new_market],
+        enhanced_store=store,
+    )
+
+    assert out_feed is feed
+    assert out_mirror is mirror
+    assert feed.add_calls == [{"new-yes", "new-no"}]
+    assert feed.remove_calls == [{"tok-yes", "tok-no"}]
+    assert store.bound == ("0xnew", "new-yes", "new-no")
+    assert feed.stop_called is False
+
+
+def test_refresh_ws_subscription_no_diff_is_idempotent():
+    """If new targets match the current subscription set, no WS calls fire."""
+    feed = _FakeDynamicFeed(subscribed={"tok-yes", "tok-no"})
+    mirror = _FakeMirror()
+
+    out_feed, out_mirror = refresh_ws_subscription(
+        feed=feed,
+        mirror=mirror,
+        targets=[_market("0xprimary")],
+        enhanced_store=_FakeBookStore(),
+    )
+
+    assert out_feed is feed
+    assert out_mirror is mirror
+    assert feed.add_calls == []
+    assert feed.remove_calls == []
+
+
+def test_refresh_ws_subscription_falls_back_to_stop_restart_on_dynamic_failure(monkeypatch):
+    """If add_tokens returns False (no live connection), the helper must
+    stop the old feed and start a fresh one so we never silently run
+    on a stale subscription set.
+    """
+    feed = _FakeDynamicFeed(subscribed={"tok-yes", "tok-no"}, add_returns=False)
+    mirror = _FakeMirror()
+
+    new_feed = _FakeFeed()
+    monkeypatch.setattr(
+        "polymarket_arb.main_helpers.cycle_runners.WebSocketFeed",
+        lambda **_: new_feed,
+    )
+    monkeypatch.setattr(
+        "polymarket_arb.main_helpers.cycle_runners.OrderBookMirror",
+        _FakeMirror,
+    )
+
+    new_market = _market("0xnew")
+    new_market.tokens = [
+        TokenInfo(token_id="new-yes", outcome="Yes", price=0.5),
+        TokenInfo(token_id="new-no", outcome="No", price=0.5),
+    ]
+
+    out_feed, _out_mirror = refresh_ws_subscription(
+        feed=feed,
+        mirror=mirror,
+        targets=[new_market],
+        enhanced_store=_FakeBookStore(),
+    )
+
+    assert feed.stop_called is True
+    assert out_feed is new_feed
+    assert new_feed.started is True
+
+
+def test_refresh_ws_subscription_rebuilds_dependent_lookups():
+    """flow_ingest / dirty_tracker / tick_recorder lookups must be
+    refreshed in place on every refresh so token→condition_id
+    mappings can't go stale across cycles.
+    """
+    feed = _FakeDynamicFeed(subscribed={"old-yes", "old-no"})
+    mirror = _FakeMirror()
+
+    @dataclass
+    class _Ingest:
+        registered: list = field(default_factory=list)
+
+        def register_markets(self, markets) -> None:
+            self.registered.append([m.condition_id for m in markets])
+
+        def on_trade(self, ev) -> None:
+            pass
+
+    @dataclass
+    class _DirtyTracker:
+        token_map: dict | None = None
+
+        def register_token_map(self, token_map) -> None:
+            self.token_map = token_map
+
+    @dataclass
+    class _TickRec:
+        is_enabled: bool = True
+        registered: list = field(default_factory=list)
+
+        def register_markets(self, markets) -> None:
+            self.registered.append([m.condition_id for m in markets])
+
+    ingest = _Ingest()
+    dirty = _DirtyTracker()
+    ticks = _TickRec()
+
+    new_market = _market("0xnew")
+    new_market.tokens = [
+        TokenInfo(token_id="new-yes", outcome="Yes", price=0.5),
+        TokenInfo(token_id="new-no", outcome="No", price=0.5),
+    ]
+
+    refresh_ws_subscription(
+        feed=feed,
+        mirror=mirror,
+        targets=[new_market],
+        enhanced_store=_FakeBookStore(),
+        tick_recorder=ticks,
+        flow_ingest=ingest,
+        dirty_tracker=dirty,
+    )
+
+    assert ingest.registered == [["0xnew"]]
+    assert ticks.registered == [["0xnew"]]
+    assert dirty.token_map == {"new-yes": "0xnew", "new-no": "0xnew"}
+    assert feed.trade_callback == ingest.on_trade
+
+
+def test_refresh_ws_subscription_empty_targets_keeps_existing_feed():
+    """Empty targets on a refresh cycle should leave the existing feed alone."""
+    feed = _FakeDynamicFeed(subscribed={"tok-a"})
+    mirror = _FakeMirror()
+
+    out_feed, out_mirror = refresh_ws_subscription(
+        feed=feed,
+        mirror=mirror,
+        targets=[],
+        enhanced_store=_FakeBookStore(),
+    )
+
+    assert out_feed is feed
+    assert out_mirror is mirror
+    assert feed.add_calls == []
+    assert feed.remove_calls == []
+
+
+def test_refresh_ws_subscription_empty_targets_first_call_raises():
+    """Empty targets on a cold start has no recoverable behavior."""
+    with pytest.raises(ValueError):
+        refresh_ws_subscription(
+            feed=None,
+            mirror=None,
+            targets=[],
+            enhanced_store=_FakeBookStore(),
+        )
 
 
 # ---------- scan_cycle --------------------------------------------------------

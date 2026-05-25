@@ -33,7 +33,9 @@ def test_build_trading_client_uses_create_or_derive_api_creds(monkeypatch):
     fake_module.ClobClient = _FakeClobClient
     monkeypatch.setitem(sys.modules, "py_clob_client.client", fake_module)
 
-    cfg = make_test_config(dry_run=False, signature_type=2, funder_address="0xabc123456789")
+    # dry_run=True 仍走完整 trading client path（shadow / readonly 也会调用）。
+    # 实盘必须 v2 已由 test_build_trading_client_rejects_v1_in_live_mode 覆盖。
+    cfg = make_test_config(dry_run=True, signature_type=2, funder_address="0xabc123456789")
     client = build_trading_client(cfg)
 
     assert client is not None
@@ -135,7 +137,7 @@ def test_build_trading_client_raises_when_creds_missing(monkeypatch):
     fake_module.ClobClient = _FakeClobClient
     monkeypatch.setitem(sys.modules, "py_clob_client.client", fake_module)
 
-    cfg = make_test_config(dry_run=False, signature_type=2, funder_address="0xabc123456789")
+    cfg = make_test_config(dry_run=True, signature_type=2, funder_address="0xabc123456789")
 
     with pytest.raises(ValueError, match="无法创建或派生 CLOB API 凭证"):
         build_trading_client(cfg)
@@ -183,11 +185,37 @@ def test_build_trading_client_retries_with_http1_after_request_exception(monkeyp
 
     monkeypatch.setattr(httpx, "Client", _FakeNewClient)
 
-    cfg = make_test_config(dry_run=False, signature_type=2, funder_address="0xabc123456789")
+    cfg = make_test_config(dry_run=True, signature_type=2, funder_address="0xabc123456789")
     client = build_trading_client(cfg)
 
     assert client is not None
     assert "http2=False" in calls
+
+
+def test_build_trading_client_rejects_v1_in_live_mode(monkeypatch):
+    """Live mode 必须使用 py-clob-client-v2（CLOB V2 已于 2026-04-28 上线）。
+
+    如果 py_clob_client_v2 缺失而 client_factory 静默回退到 v1，实盘下单会
+    因 EIP-712 domain version / Order struct mismatch 全数失败。该测试锁住
+    "live + v1 必须 raise" 的契约，防止回归。
+    """
+    class _FakeV1ClobClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def create_or_derive_api_creds(self):
+            return {"api_key": "k", "api_secret": "s", "api_passphrase": "p"}
+
+    # 显式让 v2 不可导入，触发 client_factory 的 auto → v1 fallback。
+    monkeypatch.setitem(sys.modules, "py_clob_client_v2", None)
+    fake_v1 = types.ModuleType("py_clob_client.client")
+    fake_v1.ClobClient = _FakeV1ClobClient
+    monkeypatch.setitem(sys.modules, "py_clob_client.client", fake_v1)
+
+    cfg = make_test_config(dry_run=False, signature_type=2, funder_address="0xabc123456789")
+
+    with pytest.raises(RuntimeError, match="py-clob-client-v2"):
+        build_trading_client(cfg)
 
 
 def test_force_py_clob_http1_contract_attribute_present(monkeypatch):

@@ -143,6 +143,106 @@ def start_ws_feed(
     return feed, mirror
 
 
+def refresh_ws_subscription(
+    *,
+    feed: WebSocketFeed | None,
+    mirror: OrderBookMirror | None,
+    targets: list[MarketInfo],
+    enhanced_store: EnhancedBookStore,
+    tick_recorder: TickRecorder | None = None,
+    flow_ingest: FlowIngest | None = None,
+    dirty_tracker: "DirtyMarketTracker | None" = None,
+) -> tuple[WebSocketFeed, OrderBookMirror]:
+    """Refresh WS subscription targets without bouncing the connection.
+
+    On first call (``feed is None``) this is equivalent to
+    ``start_ws_feed``. On subsequent calls the dependent lookups
+    (``tick_recorder.register_markets``, ``flow_ingest.register_markets``,
+    ``dirty_tracker.register_token_map``, ``enhanced_store.set_market``)
+    are rebuilt in place and the WS-level diff is shipped via
+    ``feed.add_tokens`` / ``feed.remove_tokens`` (Dynamic Subscription).
+
+    If Dynamic Subscription fails (e.g. the feed is mid-reconnect and
+    ``_ws_handle`` is None) we fall back to a clean ``feed.stop()`` +
+    ``start_ws_feed`` so the system never silently runs on a stale
+    subscription set. Returns the (possibly new) ``(feed, mirror)``
+    tuple the caller should keep for the next refresh.
+
+    Callback registration on ``mirror`` (tick_recorder hook,
+    dirty_tracker closure) is NOT repeated when reusing the mirror —
+    those closures already hold the live tracker references and pick
+    up new token→condition mappings via ``register_token_map``.
+    """
+    if not targets:
+        if feed is not None and mirror is not None:
+            return feed, mirror
+        raise ValueError("refresh_ws_subscription: targets is empty on first call")
+
+    if feed is None or mirror is None:
+        return start_ws_feed(
+            targets,
+            enhanced_store,
+            tick_recorder=tick_recorder,
+            flow_ingest=flow_ingest,
+            dirty_tracker=dirty_tracker,
+        )
+
+    new_token_ids: set[str] = set()
+    for m in targets:
+        for t in m.tokens:
+            new_token_ids.add(t.token_id)
+
+    if tick_recorder is not None and tick_recorder.is_enabled:
+        tick_recorder.register_markets(targets)
+    if flow_ingest is not None:
+        flow_ingest.register_markets(targets)
+        feed.set_trade_callback(flow_ingest.on_trade)
+    if dirty_tracker is not None:
+        token_to_cond: dict[str, str] = {}
+        for m in targets:
+            for t in m.tokens:
+                token_to_cond[t.token_id] = m.condition_id
+        dirty_tracker.register_token_map(token_to_cond)
+
+    primary = targets[0]
+    yes_token = next((t for t in primary.tokens if t.outcome.lower() == "yes"), primary.tokens[0])
+    no_token = next((t for t in primary.tokens if t.outcome.lower() == "no"), primary.tokens[-1])
+    enhanced_store.set_market(primary.condition_id, yes_token.token_id, no_token.token_id)
+
+    current = feed.subscribed_tokens()
+    to_add = new_token_ids - current
+    to_remove = current - new_token_ids
+
+    if not to_add and not to_remove:
+        return feed, mirror
+
+    add_ok = feed.add_tokens(to_add) if to_add else True
+    remove_ok = feed.remove_tokens(to_remove) if to_remove else True
+
+    if add_ok and remove_ok:
+        LOG.info(
+            "Dynamic Subscription 已应用: +%d / -%d, 现订阅 %d 个 token",
+            len(to_add),
+            len(to_remove),
+            len(feed.subscribed_tokens()),
+        )
+        return feed, mirror
+
+    LOG.warning(
+        "Dynamic Subscription 失败 (add_ok=%s remove_ok=%s)，回退到 stop+restart",
+        add_ok,
+        remove_ok,
+    )
+    feed.stop()
+    return start_ws_feed(
+        targets,
+        enhanced_store,
+        tick_recorder=tick_recorder,
+        flow_ingest=flow_ingest,
+        dirty_tracker=dirty_tracker,
+    )
+
+
 def scan_cycle(
     detector: ArbitrageDetector,
     config: ArbConfig,

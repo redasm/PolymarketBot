@@ -38,8 +38,8 @@ from polymarket_arb.main_helpers.cycle_runners import (
     find_pending_signal as _find_pending_signal,
     find_pending_signal_overlay as _find_pending_signal_overlay,
     refresh_market_universe as _refresh_market_universe,
+    refresh_ws_subscription as _refresh_ws_subscription,
     scan_cycle as _scan_cycle,
-    start_ws_feed as _start_ws_feed,
 )
 from polymarket_arb.main_helpers.flow_aggregator import FlowAggregator, FlowIngest
 from polymarket_arb.main_helpers.order_sync import (
@@ -819,13 +819,12 @@ def main(dotenv_path: str | None = None) -> None:
                     if targets:
                         new_ids = sorted(t.token_id for m in targets for t in m.tokens)
                         if new_ids != ws_target_ids:
-                            if ws_feed is not None:
-                                ws_feed.stop()
-                                LOG.info("旧 WebSocket feed 已停止，切换到新目标市场")
-                            ws_feed, ws_mirror = _start_ws_feed(
-                                targets,
-                                enhanced_store,
-                                tick_recorder,
+                            ws_feed, ws_mirror = _refresh_ws_subscription(
+                                feed=ws_feed,
+                                mirror=ws_mirror,
+                                targets=targets,
+                                enhanced_store=enhanced_store,
+                                tick_recorder=tick_recorder,
                                 flow_ingest=flow_ingest,
                                 dirty_tracker=dirty_market_tracker,
                             )

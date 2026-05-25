@@ -350,6 +350,243 @@ def test_callback_queue_drops_oldest_snapshot_when_backlogged():
     assert "latest-token" in tokens
 
 
+def test_handle_tick_size_change_updates_tick_size_map():
+    """tick_size_change pushes update self._tick_sizes so callers can
+    round prices correctly for live orders. See client-side
+    `polymarket_arb/websocket_feed.py::_handle_tick_size_change`.
+    """
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror)
+
+    feed._handle_message(json.dumps({
+        "event_type": "tick_size_change",
+        "asset_id": "tok-a",
+        "new_tick_size": "0.001",
+    }))
+
+    assert feed.get_tick_size("tok-a") == pytest.approx(0.001, abs=1e-9)
+
+
+def test_handle_tick_size_change_ignores_bad_payload():
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror)
+
+    feed._handle_message(json.dumps({
+        "event_type": "tick_size_change",
+        "asset_id": "tok-a",
+        "new_tick_size": "not-a-number",
+    }))
+    feed._handle_message(json.dumps({
+        "event_type": "tick_size_change",
+        "asset_id": "",
+        "new_tick_size": "0.01",
+    }))
+    feed._handle_message(json.dumps({
+        "event_type": "tick_size_change",
+        "asset_id": "tok-a",
+        "new_tick_size": "-0.1",
+    }))
+
+    assert feed.get_tick_size("tok-a") is None
+
+
+def test_market_resolved_auto_unsubscribes_resolved_tokens():
+    """market_resolved must mark tokens resolved AND attempt to remove
+    them from the live subscription, so a settled market doesn't keep
+    burning a subscription slot.
+    """
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror)
+    feed.subscribe(["tok-yes", "tok-no", "tok-other"])
+
+    feed._handle_message(json.dumps({
+        "event_type": "market_resolved",
+        "id": "0xresolved",
+        "winning_asset_id": "tok-yes",
+        "clob_token_ids": ["tok-yes", "tok-no"],
+    }))
+
+    assert feed.get_resolved_tokens() == {"tok-yes", "tok-no"}
+    # remove_tokens called with ws_handle=None returns False but still
+    # updates the local subscribed set so reconnect picks up the new set.
+    assert "tok-yes" not in feed.subscribed_tokens()
+    assert "tok-no" not in feed.subscribed_tokens()
+    assert "tok-other" in feed.subscribed_tokens()
+
+
+def test_market_resolved_supports_assets_ids_alias():
+    """Server has historically used both `clob_token_ids` and
+    `assets_ids` — both must be accepted.
+    """
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror)
+    feed.subscribe(["tok-a"])
+
+    feed._handle_message(json.dumps({
+        "event_type": "market_resolved",
+        "id": "0xresolved",
+        "winning_asset_id": "tok-a",
+        "assets_ids": ["tok-a"],
+    }))
+
+    assert feed.get_resolved_tokens() == {"tok-a"}
+    assert feed.subscribed_tokens() == set()
+
+
+def test_new_market_handler_logs_without_modifying_subscription(caplog):
+    """new_market is informational only — REST market discovery is the
+    source of truth. We must NOT auto-subscribe new tokens from WS.
+    """
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror)
+    feed.subscribe(["tok-existing"])
+
+    with caplog.at_level("INFO"):
+        feed._handle_message(json.dumps({
+            "event_type": "new_market",
+            "id": "0xnew",
+            "question": "Will Z?",
+            "clob_token_ids": ["new-yes", "new-no"],
+        }))
+
+    assert feed.subscribed_tokens() == {"tok-existing"}
+
+
+def test_best_bid_ask_event_does_not_raise():
+    """`best_bid_ask` is silent-absorbed because price_change already
+    maintains best levels — confirm we don't crash on it.
+    """
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror)
+
+    feed._handle_message(json.dumps({
+        "event_type": "best_bid_ask",
+        "asset_id": "tok-a",
+        "best_bid": "0.40",
+        "best_ask": "0.42",
+    }))
+
+
+def test_add_tokens_returns_false_when_not_connected():
+    """`add_tokens` must return False when ws_handle is None so the
+    caller knows to fall back to stop+restart.
+    """
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror)
+
+    ok = feed.add_tokens(["new-1", "new-2"])
+
+    assert ok is False
+    # Local subscription set must still be updated so the next reconnect
+    # picks up the new tokens.
+    assert feed.subscribed_tokens() == {"new-1", "new-2"}
+
+
+def test_remove_tokens_returns_false_when_not_connected():
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror)
+    feed.subscribe(["existing-1", "existing-2"])
+
+    ok = feed.remove_tokens(["existing-1"])
+
+    assert ok is False
+    assert feed.subscribed_tokens() == {"existing-2"}
+
+
+def test_add_tokens_noop_when_already_subscribed():
+    """No-op adds short-circuit to True without touching the WS handle
+    so we don't pay a JSON-encode cost on idle refresh cycles.
+    """
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror)
+    feed.subscribe(["tok-a"])
+
+    assert feed.add_tokens(["tok-a"]) is True
+
+
+def test_add_tokens_sends_dynamic_subscription_payload_when_connected():
+    """Lock the wire-format contract: subscribe payload uses sorted
+    `assets_ids`, `operation=subscribe`, and `custom_feature_enabled=true`.
+    """
+    sent: list[str] = []
+
+    class _SpyWs:
+        def send(self, payload):
+            sent.append(payload)
+
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror)
+    feed._ws_handle = _SpyWs()
+
+    ok = feed.add_tokens(["tok-b", "tok-a"])
+
+    assert ok is True
+    assert len(sent) == 1
+    payload = json.loads(sent[0])
+    assert payload["assets_ids"] == ["tok-a", "tok-b"]
+    assert payload["operation"] == "subscribe"
+    assert payload["custom_feature_enabled"] is True
+
+
+def test_remove_tokens_sends_unsubscribe_without_custom_feature():
+    """`unsubscribe` does not require custom_feature_enabled — keep the
+    payload minimal so the server doesn't reject the diff.
+    """
+    sent: list[str] = []
+
+    class _SpyWs:
+        def send(self, payload):
+            sent.append(payload)
+
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror)
+    feed.subscribe(["tok-a", "tok-b"])
+    feed._ws_handle = _SpyWs()
+
+    ok = feed.remove_tokens(["tok-a"])
+
+    assert ok is True
+    payload = json.loads(sent[0])
+    assert payload["operation"] == "unsubscribe"
+    assert payload["assets_ids"] == ["tok-a"]
+    assert "custom_feature_enabled" not in payload
+
+
+def test_send_dynamic_subscription_falls_back_on_send_exception():
+    """If ws.send raises (broken pipe, etc.), `add_tokens` must return
+    False so the caller can fall back. The local subscription set
+    should still reflect the desired state for the next reconnect.
+    """
+    class _BrokenWs:
+        def send(self, payload):
+            raise OSError("broken pipe")
+
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror)
+    feed._ws_handle = _BrokenWs()
+
+    ok = feed.add_tokens(["tok-x"])
+
+    assert ok is False
+    assert feed.subscribed_tokens() == {"tok-x"}
+
+
+def test_subscription_payload_sets_initial_dump_true():
+    """Subscription payload must explicitly request initial_dump=true so
+    the server behaviour stays stable if the default ever flips.
+    See `_run_loop` subscription block in websocket_feed.py.
+    """
+    # This test does not start the connection thread; it asserts the
+    # contract by inspecting the source code (we keep this defensive
+    # because there's no public surface to test the inline payload).
+    import inspect
+    from polymarket_arb import websocket_feed
+
+    src = inspect.getsource(websocket_feed.WebSocketFeed._run_loop)
+    assert "\"initial_dump\": True" in src
+    assert "\"custom_feature_enabled\": True" in src
+
+
 def test_stop_can_progress_even_when_callback_queue_is_full(monkeypatch):
     mirror = OrderBookMirror()
     with mirror._callbacks_lock:

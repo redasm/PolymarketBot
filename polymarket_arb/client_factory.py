@@ -74,6 +74,16 @@ def build_trading_client(config: ArbConfig) -> Any:
     except ImportError:  # py-clob-client-v2 only installs a different package.
         PolyApiException = RuntimeError  # type: ignore[assignment]
     clob_client, version = _load_clob_client_class(config)
+    # CLOB V2 已于 2026-04-28 在生产环境上线；V1 SDK 和 V1-signed orders
+    # 已不再受支持（changelog 2026-04-17/28）。实盘必须确保解析到 v2，
+    # 否则下单会因 EIP-712 domain version / Order struct mismatch 全数失败。
+    # dry_run / readonly 仍允许 v1，以便 backtest / research 工具继续可用。
+    if not config.dry_run and version != "v2":
+        raise RuntimeError(
+            "实盘模式必须使用 py-clob-client-v2（CLOB V2 自 2026-04-28 上线，"
+            "V1 SDK 不再受支持）。当前解析到 client=%s，请 `pip install py-clob-client-v2` "
+            "并确认 POLYMARKET_CLOB_CLIENT_VERSION=auto 或 v2。" % version
+        )
     if version == "v2":
         _force_py_clob_http1()
     signature_type = _resolve_signature_type(config, version)

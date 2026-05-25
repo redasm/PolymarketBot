@@ -44,8 +44,8 @@ from polymarket_arb.main_loop import (
     _TELEMETRY_HEARTBEAT_SEC,
     _serialize_opportunity_event,
     _serialize_trade_execution,
-    _start_ws_feed,
 )
+from polymarket_arb.main_helpers.cycle_runners import start_ws_feed as _start_ws_feed
 from polymarket_arb.book_store import EnhancedBookStore
 from polymarket_arb.models import EventInfo, MarketInfo, OrderBookLevel, OrderSide, ResearchSignal, ResearchSignalReport, TokenInfo, TradeRecord, TradeStatus
 from polymarket_arb.strategies.cross_platform import CrossPlatformOpportunity, CrossPlatformPair
