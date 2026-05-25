@@ -602,6 +602,8 @@ class ExecutionEngine:
         实盘模式下每次 pre-trade 都会调用；为避免在余额不足时每条信号都打一次 API，
         默认走短 TTL 缓存。真实下单前或余额可能变化时调用 `invalidate_balance_cache()`。
         """
+        if self._config.dry_run:
+            return None
         if use_cache and self._balance_cache is not None:
             if time.time() - self._balance_cache_ts < self._BALANCE_CACHE_TTL_SEC:
                 return self._balance_cache

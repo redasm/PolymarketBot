@@ -120,6 +120,8 @@ class ShadowPositionLifecycle:
         open_cost = 0.0
         open_lots = 0
         open_size = 0.0
+        unmarked_open_lots = 0
+        unmarked_open_cost = 0.0
         for token_id, lots in self._lots_by_token.items():
             mark = self._mark_price(token_id)
             for lot in lots:
@@ -131,6 +133,10 @@ class ShadowPositionLifecycle:
                 cost = lot.open_price * lot.remaining_size
                 open_cost += cost + fee_alloc
                 if mark is None:
+                    unmarked_open_lots += 1
+                    unmarked_open_cost += cost + fee_alloc
+                    current_value += cost
+                    unrealized -= fee_alloc
                     continue
                 value = mark * lot.remaining_size
                 current_value += value
@@ -144,6 +150,8 @@ class ShadowPositionLifecycle:
             "open_lots": open_lots,
             "open_size": round(open_size, 6),
             "fees": round(self._fees, 6),
+            "unmarked_open_lots": unmarked_open_lots,
+            "unmarked_open_cost": round(unmarked_open_cost, 6),
         }
 
     def _open_lot(

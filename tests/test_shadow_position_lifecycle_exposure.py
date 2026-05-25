@@ -106,3 +106,17 @@ def test_missing_condition_id_is_skipped(tmp_path: Path) -> None:
     led = _ledger(tmp_path)
     led.record_fill(_buy("t1", "", price=0.50, size=4.0))
     assert led.exposure_by_market_usdc() == {}
+
+
+def test_snapshot_values_open_lot_at_cost_when_mark_is_missing(tmp_path: Path) -> None:
+    led = _ledger(tmp_path)
+    led.record_fill(_buy("t1", "c1", price=0.75, size=20.0), fee=0.12)
+
+    snap = led.snapshot()
+
+    assert snap["open_lots"] == 1
+    assert snap["open_cost"] == pytest.approx(15.12)
+    assert snap["current_position_value"] == pytest.approx(15.0)
+    assert snap["unrealized_pnl"] == pytest.approx(-0.12)
+    assert snap["unmarked_open_lots"] == 1
+    assert snap["unmarked_open_cost"] == pytest.approx(15.12)

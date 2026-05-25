@@ -35,6 +35,11 @@ from polymarket_arb.main_helpers.signal_helpers import (
     build_t2_related_market_context,
     evaluate_t2_market_quality,
 )
+from polymarket_arb.main_helpers.quant_timing import (
+    apply_event_baseline_timing,
+    event_baseline_for_market,
+    parse_event_baselines as parse_timing_event_baselines,
+)
 from polymarket_arb.models import MarketInfo
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
 from polymarket_arb.strategies.event_calendar_model import EventCalendarModel, EventPricingInput
@@ -347,6 +352,7 @@ def collect_statistical_strategy_signals(
     candidate_markets: list[MarketInfo],
     ob_analyzer: OrderBookAnalyzer,
     detector: StatisticalMispricingDetector,
+    event_baselines: dict[str, dict[str, Any]] | str | None = None,
 ) -> list[StrategySignal]:
     """T2 directional signals from statistical mispricing detector.
 
@@ -369,6 +375,7 @@ def collect_statistical_strategy_signals(
     # Top-K by expected_edge keeps the strongest while preserving the
     # rate-cap and dedup behaviour for the rest. 0 = no cap.
     max_signals_per_cycle = max(0, int(getattr(config, "t2_max_signals_per_cycle", 30)))
+    event_baseline_map = parse_timing_event_baselines(event_baselines)
     for market in candidate_markets:
         if len(market.tokens) != 2 or market.closed or not market.active:
             _record_skip(skip_reasons, skip_by_market, market.condition_id, "non_binary_or_inactive")
@@ -406,32 +413,68 @@ def collect_statistical_strategy_signals(
             _record_skip(skip_reasons, skip_by_market, market.condition_id, "model_no_estimate")
             continue
 
-        action = "buy_yes" if estimate.is_underpriced else "buy_no"
+        model_prob = float(estimate.model_prob)
+        market_prob = float(estimate.market_prob)
+        confidence = float(estimate.confidence)
+        recommended_size_usdc = float(config.default_order_size_usdc)
+        quant_timing: dict[str, Any] | None = None
+        raw_baseline = event_baseline_for_market(market, event_baseline_map)
+        if raw_baseline is not None:
+            timing = apply_event_baseline_timing(
+                model_prob=model_prob,
+                market_prob=market_prob,
+                baseline_probability=raw_baseline["baseline_probability"],
+                confidence=raw_baseline["confidence"],
+                time_to_event_sec=raw_baseline["time_to_event_sec"],
+            )
+            quant_timing = timing.payload
+            if timing.veto:
+                _record_skip(
+                    skip_reasons,
+                    skip_by_market,
+                    market.condition_id,
+                    str(quant_timing.get("reason") or "event_baseline_veto"),
+                    quant_timing=quant_timing,
+                )
+                continue
+            model_prob = timing.model_prob
+            confidence = max(0.0, min(1.0, confidence + timing.confidence_delta))
+            recommended_size_usdc = max(0.0, recommended_size_usdc * timing.size_multiplier)
+
+        deviation = model_prob - market_prob
+        if quant_timing is not None and abs(deviation) < 1e-6:
+            _record_skip(skip_reasons, skip_by_market, market.condition_id, "event_baseline_compressed_edge")
+            continue
+
+        action = "buy_yes" if deviation > 0 else "buy_no"
         if not _statistical_should_emit(
-            market.condition_id, action, float(estimate.deviation)
+            market.condition_id, action, float(deviation)
         ):
             _record_skip(skip_reasons, skip_by_market, market.condition_id, "collector_reemit_throttle")
             continue
+        payload = {
+            "outcome": estimate.outcome,
+            "model_prob": model_prob,
+            "market_prob": market_prob,
+            "deviation": deviation,
+            "deviation_pct": deviation / market_prob if market_prob else 0.0,
+            "signals": dict(estimate.signals),
+            "quality": quality,
+            "related_context_count": len(related_market_context.get(market.condition_id, {})),
+        }
+        if quant_timing is not None:
+            payload["quant_timing"] = quant_timing
         signals.append(
             StrategySignal(
                 tier=StrategyTier.STATISTICAL_ARB,
                 signal_type=f"statistical_{action}",
                 market_id=market.condition_id,
-                description=f"{market.question[:80]} | deviation={estimate.deviation:+.4f}",
-                expected_edge=estimate.abs_edge * 10_000.0,
-                confidence=estimate.confidence,
-                recommended_size_usdc=config.default_order_size_usdc,
-                urgency=min(1.0, 0.5 + estimate.confidence * 0.4),
-                payload={
-                    "outcome": estimate.outcome,
-                    "model_prob": estimate.model_prob,
-                    "market_prob": estimate.market_prob,
-                    "deviation": estimate.deviation,
-                    "deviation_pct": estimate.deviation_pct,
-                    "signals": dict(estimate.signals),
-                    "quality": quality,
-                    "related_context_count": len(related_market_context.get(market.condition_id, {})),
-                },
+                description=f"{market.question[:80]} | deviation={deviation:+.4f}",
+                expected_edge=abs(deviation) * 10_000.0,
+                confidence=confidence,
+                recommended_size_usdc=recommended_size_usdc,
+                urgency=min(1.0, 0.5 + confidence * 0.4),
+                payload=payload,
             )
         )
     if max_signals_per_cycle > 0 and len(signals) > max_signals_per_cycle:

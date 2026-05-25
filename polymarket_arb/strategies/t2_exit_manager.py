@@ -759,6 +759,14 @@ class T2ExitManager:
                 opp,
                 size_to_sell,
                 order_type_name="FAK",
+                virtual_fill_tier="T2_STATISTICAL",
+                virtual_fill_context={
+                    "tier": "STATISTICAL_ARB",
+                    "phase": "exit",
+                    "market_id": pos.condition_id,
+                    "event_title": market.question,
+                    "exit_reason": getattr(pos, "last_decision_reason", "") or "",
+                },
             )
         except Exception as exc:  # pragma: no cover - depends on live client
             LOG.warning(

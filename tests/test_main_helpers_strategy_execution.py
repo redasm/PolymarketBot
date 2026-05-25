@@ -491,6 +491,78 @@ def test_maker_buy_post_only_rejects_crossing_snapshot() -> None:
     assert delta == ExecutionDelta()
 
 
+def test_maker_inventory_sell_does_not_duplicate_pending_exit_order() -> None:
+    class _Executor:
+        def __init__(self):
+            self.calls = 0
+
+        def ensure_sufficient_collateral(self, _amount):
+            raise AssertionError("sell inventory should not require collateral")
+
+        def submit_limit_order(self, **kwargs):
+            self.calls += 1
+            return TradeRecord(
+                trade_id=f"trade-{self.calls}",
+                arb_id=f"arb-{self.calls}",
+                token_id=kwargs["token_id"],
+                condition_id=kwargs["condition_id"],
+                side=kwargs["side"],
+                price=kwargs["price"],
+                size=kwargs["size"],
+                status=TradeStatus.PENDING,
+                simulated=True,
+                post_only=True,
+                order_type_name="GTC",
+                economic_cost=kwargs["price"],
+            )
+
+    class _Risk:
+        def pre_trade_check(self, *_args, **_kwargs):
+            raise AssertionError("sell inventory should not open new risk")
+
+        def record_execution(self, *_args, **_kwargs):
+            raise AssertionError("sell inventory should not increase exposure")
+
+    maker_strategy = MakerStrategy(default_size=1.0)
+    maker_strategy.update_inventory("yes-1", "BUY", 1.0)
+    executor = _Executor()
+    sig = _signal(
+        tier=StrategyTier.MARKET_MAKING,
+        payload={
+            "quote": {
+                "fair_value": 0.50,
+                "bid_price": None,
+                "ask_price": 0.60,
+                "bid_size": 0.0,
+                "ask_size": 1.0,
+            }
+        },
+    )
+    common = dict(
+        signal=sig,
+        config=_config(dry_run=True),
+        active_markets=[_binary_market()],
+        ob_analyzer=SimpleNamespace(get_snapshot=lambda _token_id: SimpleNamespace(tick_size=0.01)),
+        executor=executor,
+        risk_mgr=_Risk(),
+        orchestrator=StrategyOrchestrator(total_bankroll=10.0),
+        dash_state=DashboardState(),
+        event_recorder=_Recorder(),
+        maker_strategy=maker_strategy,
+        notifier=_Notifier(),
+    )
+
+    first_success, first_reason, _ = execute_strategy_signal(**common)
+    second_success, second_reason, second_delta = execute_strategy_signal(**common)
+
+    assert first_success is True
+    assert first_reason == ""
+    assert second_success is False
+    assert second_reason == "maker_no_executable_side"
+    assert second_delta == ExecutionDelta()
+    assert executor.calls == 1
+
+
 # ---------- ExecutionDelta dataclass shape -----------------------------------
 
 

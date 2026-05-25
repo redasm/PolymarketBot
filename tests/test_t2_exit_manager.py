@@ -73,7 +73,7 @@ class _StubExecutor:
         self.calls: list[ArbOpportunity] = []
         self.order_type_names: list[str | None] = []
 
-    def execute_arbitrage(self, opp: ArbOpportunity, size: float, *, order_type_name: str | None = None) -> list[TradeRecord]:
+    def execute_arbitrage(self, opp: ArbOpportunity, size: float, *, order_type_name: str | None = None, **_kwargs: Any) -> list[TradeRecord]:
         self.calls.append(opp)
         self.order_type_names.append(order_type_name)
         leg = opp.legs[0]
@@ -97,7 +97,7 @@ class _FailedExitExecutor:
     def __init__(self):
         self.calls: list[ArbOpportunity] = []
 
-    def execute_arbitrage(self, opp: ArbOpportunity, size: float, *, order_type_name: str | None = None) -> list[TradeRecord]:
+    def execute_arbitrage(self, opp: ArbOpportunity, size: float, *, order_type_name: str | None = None, **_kwargs: Any) -> list[TradeRecord]:
         self.calls.append(opp)
         leg = opp.legs[0]
         return [
@@ -122,7 +122,7 @@ class _PartialExitExecutor:
     def __init__(self):
         self.calls: list[ArbOpportunity] = []
 
-    def execute_arbitrage(self, opp: ArbOpportunity, size: float, *, order_type_name: str | None = None) -> list[TradeRecord]:
+    def execute_arbitrage(self, opp: ArbOpportunity, size: float, *, order_type_name: str | None = None, **_kwargs: Any) -> list[TradeRecord]:
         self.calls.append(opp)
         leg = opp.legs[0]
         return [
@@ -148,7 +148,7 @@ class _CancelledFilledExitExecutor:
     def __init__(self):
         self.calls: list[ArbOpportunity] = []
 
-    def execute_arbitrage(self, opp: ArbOpportunity, size: float, *, order_type_name: str | None = None) -> list[TradeRecord]:
+    def execute_arbitrage(self, opp: ArbOpportunity, size: float, *, order_type_name: str | None = None, **_kwargs: Any) -> list[TradeRecord]:
         self.calls.append(opp)
         leg = opp.legs[0]
         return [
@@ -741,7 +741,7 @@ class _SizeTrackingExecutor:
         self.calls: list[float] = []
         self.order_type_names: list[str | None] = []
 
-    def execute_arbitrage(self, opp: ArbOpportunity, size: float, *, order_type_name: str | None = None) -> list[TradeRecord]:
+    def execute_arbitrage(self, opp: ArbOpportunity, size: float, *, order_type_name: str | None = None, **_kwargs: Any) -> list[TradeRecord]:
         self.calls.append(float(size))
         self.order_type_names.append(order_type_name)
         leg = opp.legs[0]

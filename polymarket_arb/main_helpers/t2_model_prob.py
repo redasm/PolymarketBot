@@ -26,8 +26,13 @@ the legacy behaviour.
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Any, Callable
 
+from polymarket_arb.main_helpers.quant_timing import (
+    apply_event_baseline_timing,
+    event_baseline_for_market,
+    parse_event_baselines,
+)
 from polymarket_arb.models import MarketInfo
 from polymarket_arb.orderbook_analyzer import OrderBookAnalyzer
 from polymarket_arb.strategies.statistical_model import (
@@ -41,6 +46,7 @@ def build_t2_model_prob_provider(
     *,
     statistical_detector: StatisticalMispricingDetector,
     ob_analyzer: OrderBookAnalyzer,
+    event_baselines_provider: Callable[[], dict[str, dict[str, Any]] | str | None] | None = None,
 ) -> Callable[[MarketInfo, str], float | None]:
     """Return a callable suitable for `T2ExitManager(model_prob_provider=...)`.
 
@@ -78,6 +84,12 @@ def build_t2_model_prob_provider(
             return None
 
         yes_prob = max(0.0, min(1.0, float(estimate.model_prob)))
+        yes_prob = _calibrate_with_event_baseline(
+            market=market,
+            yes_prob=yes_prob,
+            market_prob=float(yes_snap.mid),
+            event_baselines_provider=event_baselines_provider,
+        )
         # Convert to TOKEN-space: if the held token is NO, the position
         # pays out P(NO) = 1 - P(YES). The Bellman policy expects
         # terminal_prob in the same space as the held token's price.
@@ -87,6 +99,35 @@ def build_t2_model_prob_provider(
         return yes_prob
 
     return _provider
+
+
+def _calibrate_with_event_baseline(
+    *,
+    market: MarketInfo,
+    yes_prob: float,
+    market_prob: float,
+    event_baselines_provider: Callable[[], dict[str, dict[str, Any]] | str | None] | None,
+) -> float:
+    if event_baselines_provider is None:
+        return yes_prob
+    try:
+        baseline_map = parse_event_baselines(event_baselines_provider())
+    except Exception as exc:  # pragma: no cover - defensive
+        LOG.debug("event baseline provider failed for %s: %s", market.condition_id[:12], exc)
+        return yes_prob
+    raw_baseline = event_baseline_for_market(market, baseline_map)
+    if raw_baseline is None:
+        return yes_prob
+    timing = apply_event_baseline_timing(
+        model_prob=yes_prob,
+        market_prob=market_prob,
+        baseline_probability=raw_baseline["baseline_probability"],
+        confidence=raw_baseline["confidence"],
+        time_to_event_sec=raw_baseline["time_to_event_sec"],
+    )
+    if not timing.payload.get("applied"):
+        return yes_prob
+    return timing.model_prob
 
 
 def _find_yes_token(market: MarketInfo):

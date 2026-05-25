@@ -156,6 +156,7 @@ class MakerStrategy:
         # the same amount as having a fully-loaded inventory book.
         self._flow_inventory_weight = max(0.0, float(flow_inventory_weight))
         self._inventory: dict[str, float] = {}
+        self._reserved_exit_inventory: dict[str, float] = {}
 
     def compute_quote(
         self,
@@ -281,9 +282,38 @@ class MakerStrategy:
             self._inventory[token_id] = current + size
         else:
             self._inventory[token_id] = current - size
+            self.release_exit_inventory(token_id, size)
 
     def get_inventory(self, token_id: str) -> float:
         return self._inventory.get(token_id, 0.0)
+
+    def get_available_inventory(self, token_id: str) -> float:
+        inventory = max(0.0, self.get_inventory(token_id))
+        reserved = max(0.0, self._reserved_exit_inventory.get(token_id, 0.0))
+        return max(0.0, inventory - reserved)
+
+    def reserve_exit_inventory(self, token_id: str, size: float) -> float:
+        amount = max(0.0, float(size))
+        if amount <= 0:
+            return 0.0
+        available = self.get_available_inventory(token_id)
+        reserved = min(amount, available)
+        if reserved <= 0:
+            return 0.0
+        self._reserved_exit_inventory[token_id] = (
+            self._reserved_exit_inventory.get(token_id, 0.0) + reserved
+        )
+        return reserved
+
+    def release_exit_inventory(self, token_id: str, size: float) -> None:
+        current = self._reserved_exit_inventory.get(token_id, 0.0)
+        if current <= 0:
+            return
+        remaining = max(0.0, current - max(0.0, float(size)))
+        if remaining > 1e-9:
+            self._reserved_exit_inventory[token_id] = remaining
+        else:
+            self._reserved_exit_inventory.pop(token_id, None)
 
     @staticmethod
     def _align_to_tick(price: float, tick: float, round_down: bool = True) -> float:

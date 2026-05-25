@@ -63,6 +63,7 @@ class _StubExecutor:
         size: float,
         *,
         order_type_name: str | None = None,
+        **_kwargs: Any,
     ) -> list[TradeRecord]:
         self.calls.append(opp)
         self.order_type_names.append(order_type_name)
@@ -93,6 +94,7 @@ class _FailedExitExecutor:
         size: float,
         *,
         order_type_name: str | None = None,
+        **_kwargs: Any,
     ) -> list[TradeRecord]:
         self.calls.append(opp)
         leg = opp.legs[0]

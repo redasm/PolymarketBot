@@ -305,6 +305,13 @@ class T3MakerExitManager:
                 opp,
                 size_to_sell,
                 order_type_name="FAK",
+                virtual_fill_tier="T3_MAKER",
+                virtual_fill_context={
+                    "tier": "MARKET_MAKING",
+                    "phase": "exit",
+                    "market_id": pos.condition_id,
+                    "exit_reason": getattr(pos, "last_decision_reason", "") or "",
+                },
             )
         except Exception as exc:  # pragma: no cover - depends on live client
             LOG.warning(

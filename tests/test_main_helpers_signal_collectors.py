@@ -546,6 +546,64 @@ def test_collect_statistical_emits_buy_no_when_overpriced():
     assert out[0].signal_type == "statistical_buy_no"
 
 
+def test_collect_statistical_uses_event_baseline_as_entry_timing_gate():
+    cfg = make_test_config()
+    snapshots = {
+        "llm-yes": _balanced_snapshot("llm-yes", mid=0.40),
+        "llm-no": _balanced_snapshot("llm-no", mid=0.60),
+    }
+    detector = _StubDetector(model_prob=0.55)
+
+    out = collect_statistical_strategy_signals(
+        config=cfg,
+        candidate_markets=[_binary_market("llm", yes_price=0.40)],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        detector=detector,
+        event_baselines={
+            "llm": {
+                "baseline_probability": 0.20,
+                "confidence": 0.92,
+                "time_to_event_sec": 86_400,
+            }
+        },
+    )
+
+    assert out == []
+    summary = collect_statistical_strategy_signals.last_skip_summary
+    assert summary["reasons"]["event_baseline_conflict"] == 1
+
+
+def test_collect_statistical_boosts_aligned_event_baseline_signal():
+    cfg = make_test_config(default_order_size_usdc=20.0)
+    snapshots = {
+        "llm-yes": _balanced_snapshot("llm-yes", mid=0.40),
+        "llm-no": _balanced_snapshot("llm-no", mid=0.60),
+    }
+    detector = _StubDetector(model_prob=0.55)
+
+    out = collect_statistical_strategy_signals(
+        config=cfg,
+        candidate_markets=[_binary_market("llm", yes_price=0.40)],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        detector=detector,
+        event_baselines={
+            "llm": {
+                "baseline_probability": 0.70,
+                "confidence": 0.90,
+                "time_to_event_sec": 86_400,
+            }
+        },
+    )
+
+    assert len(out) == 1
+    sig = out[0]
+    assert sig.signal_type == "statistical_buy_yes"
+    assert sig.payload["model_prob"] > 0.55
+    assert sig.payload["quant_timing"]["source"] == "event_baselines"
+    assert sig.payload["quant_timing"]["reason"] == "event_baseline_aligned"
+    assert sig.recommended_size_usdc > 20.0
+
+
 # --------- T3: maker ----------
 
 

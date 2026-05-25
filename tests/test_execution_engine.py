@@ -451,6 +451,21 @@ def test_ensure_sufficient_collateral_uses_balance_allowance(monkeypatch):
     assert available == 20.0
 
 
+def test_dry_run_balance_observation_does_not_call_private_endpoint():
+    class _Client:
+        called = False
+
+        def get_balance_allowance(self, *_args, **_kwargs):
+            self.called = True
+            raise AssertionError("dry-run must not call private balance endpoint")
+
+    client = _Client()
+    engine = ExecutionEngine(make_test_config(dry_run=True), client)
+
+    assert engine.get_available_collateral_balance() is None
+    assert client.called is False
+
+
 def test_ensure_sufficient_collateral_rejects_when_balance_too_low(monkeypatch):
     _install_fake_clob_modules(monkeypatch)
     client = _FakeClient()

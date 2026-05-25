@@ -327,8 +327,19 @@ def execute_strategy_signal(
 
         yes_inventory = max(0.0, float(maker_strategy.get_inventory(yes_token.token_id)))
         no_inventory = max(0.0, float(maker_strategy.get_inventory(no_token.token_id)))
+        get_available_inventory = getattr(maker_strategy, "get_available_inventory", None)
+        yes_available_inventory = (
+            max(0.0, float(get_available_inventory(yes_token.token_id)))
+            if callable(get_available_inventory)
+            else yes_inventory
+        )
+        no_available_inventory = (
+            max(0.0, float(get_available_inventory(no_token.token_id)))
+            if callable(get_available_inventory)
+            else no_inventory
+        )
         candidates: list[dict[str, Any]] = []
-        if yes_inventory > 0 and ask_edge > 0 and ask_price > 0 and ask_size > 0:
+        if yes_available_inventory > 0 and ask_edge > 0 and ask_price > 0 and ask_size > 0:
             candidates.append({
                 "is_exit": True,
                 "maker_side": "sell_yes_inventory",
@@ -336,10 +347,10 @@ def execute_strategy_signal(
                 "outcome": "Yes",
                 "side": OrderSide.SELL,
                 "price": ask_price,
-                "size": min(ask_size, yes_inventory),
+                "size": min(ask_size, yes_available_inventory),
                 "edge": ask_edge,
             })
-        if no_inventory > 0 and bid_edge > 0 and bid_price > 0 and bid_size > 0:
+        if no_available_inventory > 0 and bid_edge > 0 and bid_price > 0 and bid_size > 0:
             candidates.append({
                 "is_exit": True,
                 "maker_side": "sell_no_inventory",
@@ -347,10 +358,11 @@ def execute_strategy_signal(
                 "outcome": "No",
                 "side": OrderSide.SELL,
                 "price": 1.0 - bid_price,
-                "size": min(bid_size, no_inventory),
+                "size": min(bid_size, no_available_inventory),
                 "edge": bid_edge,
             })
-        if bid_edge > 0 and bid_price > 0 and bid_size > 0:
+        has_inventory = yes_inventory > 0 or no_inventory > 0
+        if not has_inventory and bid_edge > 0 and bid_price > 0 and bid_size > 0:
             candidates.append({
                 "is_exit": False,
                 "maker_side": "buy_yes",
@@ -361,7 +373,7 @@ def execute_strategy_signal(
                 "size": bid_size,
                 "edge": bid_edge,
             })
-        if ask_edge > 0 and ask_price > 0 and ask_size > 0:
+        if not has_inventory and ask_edge > 0 and ask_price > 0 and ask_size > 0:
             candidates.append({
                 "is_exit": False,
                 "maker_side": "buy_no_from_yes_ask",
@@ -487,6 +499,11 @@ def execute_strategy_signal(
                     max(0.0, target_price * inventory_delta),
                     0.0,
                 )
+        if target_order_side == OrderSide.SELL and submission_success:
+            reserve_exit_inventory = getattr(maker_strategy, "reserve_exit_inventory", None)
+            if callable(reserve_exit_inventory):
+                filled_size = float(trade.fill_size or 0.0)
+                reserve_exit_inventory(target_token.token_id, max(0.0, float(trade.size) - filled_size))
         dash_state.append_trade({
             "trade_id": trade.trade_id,
             "arb_id": trade.arb_id,

@@ -56,7 +56,7 @@ class _AlwaysFailExecutor:
     def __init__(self):
         self.calls: list[tuple[float, float]] = []  # (price, size)
 
-    def execute_arbitrage(self, opp: ArbOpportunity, size: float, *, order_type_name: str | None = None) -> list[TradeRecord]:
+    def execute_arbitrage(self, opp: ArbOpportunity, size: float, *, order_type_name: str | None = None, **_kwargs: Any) -> list[TradeRecord]:
         leg = opp.legs[0]
         self.calls.append((float(leg.price), float(size)))
         return [

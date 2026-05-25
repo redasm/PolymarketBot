@@ -152,3 +152,41 @@ def test_provider_clamps_extreme_yes_prob_to_unit_interval():
     )
 
     assert provider(_market(), "t-yes") == 1.0
+
+
+def test_provider_calibrates_exit_probability_with_aligned_event_baseline():
+    detector = _StubDetector(yes_prob=0.58)
+    ob = _StubOB({"t-yes": _snap("t-yes", best_bid=0.50)})
+    provider = build_t2_model_prob_provider(
+        statistical_detector=detector,
+        ob_analyzer=ob,
+        event_baselines_provider=lambda: {
+            "c1": {
+                "baseline_probability": 0.72,
+                "confidence": 0.90,
+                "time_to_event_sec": 86_400,
+            }
+        },
+    )
+
+    assert provider(_market(), "t-yes") > 0.58
+
+
+def test_provider_conservatizes_exit_probability_on_event_baseline_conflict():
+    detector = _StubDetector(yes_prob=0.62)
+    ob = _StubOB({"t-yes": _snap("t-yes", best_bid=0.50)})
+    provider = build_t2_model_prob_provider(
+        statistical_detector=detector,
+        ob_analyzer=ob,
+        event_baselines_provider=lambda: {
+            "c1": {
+                "baseline_probability": 0.30,
+                "confidence": 0.92,
+                "time_to_event_sec": 86_400,
+            }
+        },
+    )
+
+    prob = provider(_market(), "t-yes")
+
+    assert 0.50 < prob < 0.62

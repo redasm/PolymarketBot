@@ -571,6 +571,7 @@ def main(dotenv_path: str | None = None) -> None:
     t2_model_prob_provider = build_t2_model_prob_provider(
         statistical_detector=statistical_detector,
         ob_analyzer=ob_analyzer,
+        event_baselines_provider=lambda: quant_input_store.snapshot().event_baselines_json,
     )
     t2_exit_manager = T2ExitManager(
         config=config,
@@ -1063,14 +1064,15 @@ def main(dotenv_path: str | None = None) -> None:
             config=config,
             scanner=cross_platform_scanner,
         )
+        quant_inputs = quant_input_store.snapshot()
         statistical_signals = _collect_statistical_strategy_signals(
             config=config,
             candidate_markets=scanned_markets,
             ob_analyzer=ob_analyzer,
             detector=statistical_detector,
+            event_baselines=quant_inputs.event_baselines_json,
         )
         strategy_signals.extend(statistical_signals)
-        quant_inputs = quant_input_store.snapshot()
         strategy_signals.extend(
             _collect_logical_constraint_strategy_signals(
                 config=config,
