@@ -13,6 +13,7 @@ from polymarket_arb.main_helpers.scan_focus import (
     event_focus_text,
     event_priority_score,
     focus_keywords,
+    is_updown_market,
     market_focus_text,
     market_priority_score,
     matches_focus,
@@ -35,11 +36,21 @@ def _make_market(
     active: bool = True,
     tokens: int = 2,
     event_title: str = "",
+    event_slug: str = "",
+    outcomes: tuple[str, ...] | None = None,
 ) -> MarketInfo:
-    token_list = [
-        TokenInfo(token_id=f"{cid}-tk{i}", outcome=str(i), price=0.0)
-        for i in range(tokens)
-    ]
+    if outcomes is not None:
+        token_list = [
+            TokenInfo(token_id=f"{cid}-tk{i}", outcome=o, price=0.0)
+            for i, o in enumerate(outcomes)
+        ]
+        outcome_list = list(outcomes)
+    else:
+        token_list = [
+            TokenInfo(token_id=f"{cid}-tk{i}", outcome=str(i), price=0.0)
+            for i in range(tokens)
+        ]
+        outcome_list = []
     return MarketInfo(
         condition_id=cid,
         question=question,
@@ -50,6 +61,8 @@ def _make_market(
         volume_24h=volume,
         liquidity=liquidity,
         event_title=event_title,
+        event_slug=event_slug,
+        outcomes=outcome_list,
     )
 
 
@@ -200,3 +213,76 @@ def test_merge_focus_event_markets_focus_filter_drops_event_children():
     # Only the flat BTC market survives the focus filter — `event_market` is
     # filtered out because `election` doesn't match `btc`.
     assert [m.condition_id for m in merged] == ["cFromFlat"]
+
+
+# --- UPDOWN detection + horizon-aware boost (Phase 1) ---
+#
+# T2's fair_value_model can only price short-horizon spot-anchored UP/DOWN
+# markets (e.g. btc-updown-15m). They carry small per-window volume and were
+# squeezed out of the hot pool / WS budget by high-volume long-horizon
+# markets. The `updown_boost` lever (gated by T2_UPDOWN_ENABLED) lifts them to
+# the top of selection without disturbing the default (boost=0) ordering.
+
+
+def test_is_updown_detected_by_slug_prefix():
+    m = _make_market(slug="btc-updown-15m-1769590800", outcomes=("Up", "Down"))
+    assert is_updown_market(m) is True
+
+
+def test_is_updown_detected_by_event_slug():
+    m = _make_market(slug="will-btc-be-higher", event_slug="btc-updown-15m", outcomes=("Yes", "No"))
+    assert is_updown_market(m) is True
+
+
+def test_is_updown_detected_by_up_down_outcomes_without_slug():
+    m = _make_market(slug="some-directional-market", outcomes=("Up", "Down"))
+    assert is_updown_market(m) is True
+
+
+def test_ordinary_yes_no_binary_is_not_updown():
+    m = _make_market(slug="will-trump-win-2028", outcomes=("Yes", "No"))
+    assert is_updown_market(m) is False
+
+
+def test_multi_outcome_event_is_not_updown():
+    m = _make_market(slug="nba-champion-2026", tokens=4)
+    assert is_updown_market(m) is False
+
+
+def test_priority_score_no_boost_matches_legacy_order():
+    """boost=0 -> leading term constant, ordering = binary>volume>liquidity."""
+    updown = _make_market(cid="u1", slug="btc-updown-15m-1", outcomes=("Up", "Down"), volume=10.0, liquidity=10.0)
+    big = _make_market(cid="c2", slug="big-event", volume=1_000_000.0, liquidity=5_000.0)
+    ranked = sorted([updown, big], key=lambda m: market_priority_score(m, 0.0), reverse=True)
+    assert ranked[0].condition_id == "c2"
+
+
+def test_priority_score_boost_lifts_updown_above_high_volume():
+    updown = _make_market(cid="u1", slug="btc-updown-15m-1", outcomes=("Up", "Down"), volume=10.0, liquidity=10.0)
+    big = _make_market(cid="c2", slug="big-event", volume=1_000_000.0, liquidity=5_000.0)
+    ranked = sorted([updown, big], key=lambda m: market_priority_score(m, 5.0), reverse=True)
+    assert ranked[0].slug == "btc-updown-15m-1"
+
+
+def test_select_scan_candidates_keeps_low_volume_updown_when_boosted():
+    updown = _make_market(cid="u1", slug="btc-updown-15m-1", outcomes=("Up", "Down"), volume=5.0, liquidity=5.0)
+    fillers = [
+        _make_market(cid=f"f{i}", slug=f"event-{i}", volume=1000.0 + i, liquidity=100.0)
+        for i in range(10)
+    ]
+    pool = fillers + [updown]
+    # Tight pool of 3: without boost the low-volume UPDOWN market is dropped.
+    no_boost = select_scan_candidates(pool, 3, updown_boost=0.0)
+    assert updown not in no_boost
+    # With boost it survives at the top.
+    boosted = select_scan_candidates(pool, 3, updown_boost=5.0)
+    assert boosted[0].slug == "btc-updown-15m-1"
+
+
+def test_select_ws_targets_prioritizes_updown_when_boosted():
+    updown = _make_market(cid="u1", slug="btc-updown-15m-1", outcomes=("Up", "Down"), volume=5.0, liquidity=5.0)
+    big = _make_market(cid="c2", slug="big", volume=1_000_000.0, liquidity=5_000.0)
+    # No boost -> volume*liquidity wins.
+    assert select_ws_targets([updown, big], 1, updown_boost=0.0)[0].condition_id == "c2"
+    # Boost -> UPDOWN secures the slot.
+    assert select_ws_targets([updown, big], 1, updown_boost=5.0)[0].slug == "btc-updown-15m-1"

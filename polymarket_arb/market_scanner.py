@@ -365,6 +365,83 @@ class MarketScanner:
     def get_cached_event(self, event_id: str) -> Optional[EventInfo]:
         return self._event_cache.get(event_id)
 
+    def fetch_updown_markets(
+        self,
+        *,
+        symbols: list[str],
+        window_minutes: list[int],
+        slots_ahead: int,
+        max_total_sec: float = 20.0,
+        per_request_timeout: float = 8.0,
+    ) -> list[MarketInfo]:
+        """Slug-direct probe for short-horizon UP/DOWN markets, bypassing the
+        volume filter/sort of `fetch_active_markets`.
+
+        UPDOWN markets rotate every N minutes and carry ~0 24h volume per
+        window, so the volume-sorted universe fetch drops them entirely. Here
+        we resolve them directly by their deterministic slug convention
+        `{symbol}-updown-{w}m-{slot}` where `slot = floor(now/window)*window`
+        (UTC-aligned), for the current window plus `slots_ahead` future ones.
+
+        Returns parsed `MarketInfo` (deduped by condition_id). Network/parse
+        failures are swallowed per-slug — this is an additive enrichment path
+        and must never break the main universe refresh. A hard `max_total_sec`
+        wall-clock budget caps the combined probe time so a slow gamma can't
+        stall the refresh cycle regardless of how many symbols/windows/slots
+        are configured.
+        """
+        if not symbols or not window_minutes or slots_ahead < 0:
+            return []
+        session = _get_session()
+        now = int(time.time())
+        deadline = time.monotonic() + max(0.0, max_total_sec)
+        out: dict[str, MarketInfo] = {}
+        budget_hit = False
+        for w_min in window_minutes:
+            if budget_hit:
+                break
+            window_sec = max(1, int(w_min)) * 60
+            cur_slot = (now // window_sec) * window_sec
+            for i in range(slots_ahead + 1):
+                if budget_hit:
+                    break
+                slot = cur_slot + i * window_sec
+                for sym in symbols:
+                    if time.monotonic() >= deadline:
+                        LOG.warning(
+                            "UPDOWN slug 探测超出总预算 %.1fs，提前结束（已命中 %d 个）",
+                            max_total_sec, len(out),
+                        )
+                        budget_hit = True
+                        break
+                    sym = sym.strip().lower()
+                    if not sym:
+                        continue
+                    slug = f"{sym}-updown-{int(w_min)}m-{slot}"
+                    try:
+                        resp = session.get(
+                            f"{self._gamma_host}/events",
+                            params={"slug": slug},
+                            timeout=per_request_timeout,
+                        )
+                        resp.raise_for_status()
+                        rows = _load_json_payload(resp, expected_type=list, endpoint="Gamma /events?slug=updown")
+                    except (requests.RequestException, APIResponseValidationError) as e:
+                        LOG.debug("UPDOWN slug 探测失败 slug=%s: %s", slug, e)
+                        continue
+                    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+                        continue
+                    event = _parse_event(rows[0])
+                    if event is None:
+                        continue
+                    for market in event.markets:
+                        if market.condition_id and market.condition_id not in out:
+                            self._market_cache[market.condition_id] = market
+                            out[market.condition_id] = market
+        if out:
+            LOG.info("UPDOWN slug 直查命中 %d 个市场（绕过 volume 过滤）", len(out))
+        return list(out.values())
+
     def enrich_markets_with_research(
         self,
         markets: list[MarketInfo],

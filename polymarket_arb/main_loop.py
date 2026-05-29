@@ -729,6 +729,9 @@ def main(dotenv_path: str | None = None) -> None:
             today_seen_theoretical_keys.clear()
             today_seen_t0_keys.clear()
             today_seen_directional_keys.clear()
+            # NOTE: shadow_lifecycle 的日内已实现盈亏由其自身 UTC 日切时钟
+            # (_maybe_roll_daily, 挂在每 cycle 必经的 snapshot()) 归零,
+            # 这里无需也不应调用 reset()——那会清掉累计 realized 与开仓敞口。
         cycle_timing: dict[str, float] = {
             "universe_refresh_sec": 0.0,
             "candidate_select_sec": 0.0,
@@ -784,11 +787,15 @@ def main(dotenv_path: str | None = None) -> None:
             cycle_timing["universe_refresh_sec"] += time.perf_counter() - phase_start
 
             phase_start = time.perf_counter()
+            updown_boost = (
+                config.t2_updown_priority_boost if config.t2_updown_enabled else 0.0
+            )
             if universe_refreshed or not cached_scanned_markets:
                 scanned_markets = _select_scan_candidates(
                     cached_universe_markets,
                     config.hot_market_pool_size,
                     focus_keywords=focus_keywords,
+                    updown_boost=updown_boost,
                 )
                 event_candidates = _select_event_candidates(
                     cached_universe_events,
@@ -800,6 +807,7 @@ def main(dotenv_path: str | None = None) -> None:
                     event_candidates,
                     config.hot_market_pool_size,
                     focus_keywords=focus_keywords,
+                    updown_boost=updown_boost,
                 )
                 cached_scanned_markets = scanned_markets
                 cached_event_candidates = event_candidates
@@ -815,7 +823,11 @@ def main(dotenv_path: str | None = None) -> None:
                     or cycle % config.ws_refresh_cycles == 0
                 )
                 if need_refresh:
-                    targets = _select_ws_targets(scanned_markets, config.ws_max_markets)
+                    targets = _select_ws_targets(
+                        scanned_markets,
+                        config.ws_max_markets,
+                        updown_boost=updown_boost,
+                    )
                     if targets:
                         new_ids = sorted(t.token_id for m in targets for t in m.tokens)
                         if new_ids != ws_target_ids:

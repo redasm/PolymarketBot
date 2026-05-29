@@ -181,3 +181,121 @@ def test_fetch_active_events_handles_request_exception(monkeypatch):
     scanner = MarketScanner(make_test_config())
 
     assert scanner.fetch_active_events(limit=10) == []
+
+
+# --- fetch_updown_markets: slug-direct probe (Phase 1 fix) ---
+#
+# UPDOWN markets carry ~0 24h volume and are dropped by the volume-filtered
+# fetch_active_markets. This probe resolves them by their deterministic slug
+# `{sym}-updown-{w}m-{slot}` so the scan-pool boost has something to promote.
+
+def _updown_event_payload(slug: str) -> list:
+    """One gamma /events row shaped like a btc-updown-15m event."""
+    return [{
+        "id": f"evt-{slug}",
+        "slug": slug,
+        "title": slug,
+        "active": True,
+        "closed": False,
+        "markets": [{
+            "conditionId": f"cond-{slug}",
+            "question": slug,
+            "slug": slug,
+            "active": True,
+            "closed": False,
+            "outcomes": ["Up", "Down"],
+            "clobTokenIds": [f"{slug}-up", f"{slug}-down"],
+            "liquidity": "23000",
+            "volume24hr": "0",
+        }],
+    }]
+
+
+def test_fetch_updown_markets_resolves_by_slug(monkeypatch):
+    captured_slugs = []
+
+    class _Resp:
+        def __init__(self, slug):
+            self._slug = slug
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return _updown_event_payload(self._slug)
+
+    class _Session:
+        def get(self, url, params=None, **kwargs):
+            slug = (params or {}).get("slug", "")
+            captured_slugs.append(slug)
+            return _Resp(slug)
+
+    monkeypatch.setattr("polymarket_arb.market_scanner._get_session", lambda: _Session())
+
+    scanner = MarketScanner(make_test_config())
+    out = scanner.fetch_updown_markets(symbols=["btc", "eth"], window_minutes=[15], slots_ahead=2)
+
+    # 2 symbols * (slots_ahead + 1) windows = 6 slug probes
+    assert len(captured_slugs) == 6
+    # slug convention + UTC-aligned slot
+    assert all(s.startswith(("btc-updown-15m-", "eth-updown-15m-")) for s in captured_slugs)
+    # parsed into MarketInfo with Up/Down tokens
+    assert len(out) == 6
+    sample = out[0]
+    assert is_updown_outcomes(sample)
+
+
+def is_updown_outcomes(market) -> bool:
+    return {(t.outcome or "").lower() for t in market.tokens} == {"up", "down"}
+
+
+def test_fetch_updown_markets_dedups_repeated_condition_id(monkeypatch):
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            # Always the same condition_id regardless of slug
+            return [{
+                "id": "evt-x",
+                "slug": "btc-updown-15m-x",
+                "markets": [{
+                    "conditionId": "same-cond",
+                    "question": "q",
+                    "slug": "btc-updown-15m-x",
+                    "outcomes": ["Up", "Down"],
+                    "clobTokenIds": ["a", "b"],
+                }],
+            }]
+
+    class _Session:
+        def get(self, *args, **kwargs):
+            return _Resp()
+
+    monkeypatch.setattr("polymarket_arb.market_scanner._get_session", lambda: _Session())
+
+    scanner = MarketScanner(make_test_config())
+    out = scanner.fetch_updown_markets(symbols=["btc"], window_minutes=[15], slots_ahead=3)
+    assert len(out) == 1  # deduped by condition_id
+
+
+def test_fetch_updown_markets_swallows_request_exception(monkeypatch):
+    class _Session:
+        def get(self, *args, **kwargs):
+            raise requests.RequestException("boom")
+
+    monkeypatch.setattr("polymarket_arb.market_scanner._get_session", lambda: _Session())
+
+    scanner = MarketScanner(make_test_config())
+    # Must not raise — additive path, failures are per-slug best-effort.
+    assert scanner.fetch_updown_markets(symbols=["btc"], window_minutes=[15], slots_ahead=2) == []
+
+
+def test_fetch_updown_markets_empty_inputs_noop(monkeypatch):
+    def _boom():
+        raise AssertionError("should not open a session for empty inputs")
+
+    monkeypatch.setattr("polymarket_arb.market_scanner._get_session", _boom)
+    scanner = MarketScanner(make_test_config())
+    assert scanner.fetch_updown_markets(symbols=[], window_minutes=[15], slots_ahead=2) == []
+    assert scanner.fetch_updown_markets(symbols=["btc"], window_minutes=[], slots_ahead=2) == []

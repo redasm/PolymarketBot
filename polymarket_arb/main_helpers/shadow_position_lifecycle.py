@@ -7,6 +7,7 @@ fees, exits, and mark-to-market?
 
 from __future__ import annotations
 
+import datetime
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -16,6 +17,20 @@ from polymarket_arb.models import OrderBookSnapshot, OrderSide, TradeRecord
 
 
 BookSnapshotProvider = Callable[[str], OrderBookSnapshot | None]
+
+
+def _utc_day_start(now_ts: float | None = None) -> float:
+    """当天 00:00 UTC 的时间戳.
+
+    与 ``risk_manager._start_of_day`` 使用完全相同的 UTC-midnight 定义,
+    避免 lifecycle 与 risk_manager 两套日切时钟漂移。
+    """
+    if now_ts is None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+    else:
+        now = datetime.datetime.fromtimestamp(now_ts, datetime.timezone.utc)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.timestamp()
 
 
 @dataclass
@@ -49,6 +64,8 @@ class ShadowPositionLifecycle:
         self._lots_by_token: dict[str, list[ShadowLot]] = {}
         self._seq = 0
         self._realized_pnl = 0.0
+        self._daily_realized_pnl = 0.0
+        self._daily_reset_ts = _utc_day_start()
         self._fees = 0.0
 
     @property
@@ -56,8 +73,25 @@ class ShadowPositionLifecycle:
         return self._realized_pnl
 
     @property
+    def daily_realized_pnl(self) -> float:
+        self._maybe_roll_daily()
+        return self._daily_realized_pnl
+
+    @property
     def fees(self) -> float:
         return self._fees
+
+    def _maybe_roll_daily(self, now_ts: float | None = None) -> None:
+        """UTC 日切时把日内已实现盈亏归零.
+
+        累计 ``_realized_pnl`` 不动 (total_pnl 语义保留),只重置日内桶。
+        归零驱动点挂在每 cycle 必经的 ``snapshot()`` 上,因此即便当天
+        没有任何新成交,跨过 UTC 午夜后日内值也会正确归零。
+        """
+        today = _utc_day_start(now_ts)
+        if today > self._daily_reset_ts:
+            self._daily_realized_pnl = 0.0
+            self._daily_reset_ts = today
 
     def record_fill(
         self,
@@ -70,6 +104,7 @@ class ShadowPositionLifecycle:
         filled_size = float(trade.fill_size or 0.0)
         if filled_size <= 0:
             return
+        self._maybe_roll_daily()
         fill_price = float(trade.fill_price if trade.fill_price is not None else trade.price)
         side = str(getattr(trade.side, "value", trade.side)).upper()
         self._fees += max(0.0, float(fee))
@@ -115,6 +150,9 @@ class ShadowPositionLifecycle:
         return out
 
     def snapshot(self) -> dict[str, Any]:
+        # 关键: 日切归零挂在每 cycle 必经的 snapshot() 上,保证即便当天
+        # 没有新成交,跨过 UTC 午夜后日内已实现盈亏也会归零。
+        self._maybe_roll_daily()
         unrealized = 0.0
         current_value = 0.0
         open_cost = 0.0
@@ -143,6 +181,7 @@ class ShadowPositionLifecycle:
                 unrealized += value - cost - fee_alloc
         return {
             "realized_pnl": round(self._realized_pnl, 6),
+            "daily_realized_pnl": round(self._daily_realized_pnl, 6),
             "unrealized_pnl": round(unrealized, 6),
             "total_pnl": round(self._realized_pnl + unrealized, 6),
             "current_position_value": round(current_value, 6),
@@ -231,6 +270,7 @@ class ShadowPositionLifecycle:
             total_closed += close_size
             total_realized += realized
             self._realized_pnl += realized
+            self._daily_realized_pnl += realized
             if self._event_recorder.is_enabled:
                 self._event_recorder.write_event("positions_lifecycle", {
                     "event": "position_closed" if lot.remaining_size <= 1e-9 else "position_partially_closed",

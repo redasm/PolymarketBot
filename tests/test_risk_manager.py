@@ -572,3 +572,79 @@ def test_pre_trade_check_uses_leg_exposure_per_market_in_multi_outcome():
 
     assert can_trade is True, reason
     assert adj_size == 25.0
+
+
+# --- shadow-mode daily_pnl mapping (regression: UTC day-rollover freeze) ---
+#
+# In dry_run, `_apply_shadow_snapshot_locked` maps the shadow ledger snapshot
+# onto risk state. The fix maps the day-resetting `daily_realized_pnl` onto
+# `daily_pnl` (NOT the cumulative `realized_pnl`), so `_maybe_reset_daily`'s
+# zeroing is not clobbered by a cumulative value and the daily-loss breaker
+# reads today's loss, not the all-time loss.
+
+def test_shadow_snapshot_maps_daily_realized_to_daily_pnl():
+    mgr = RiskManager(make_test_config())  # dry_run=True
+    # Cumulative realized is large; today's realized is flat.
+    mgr.update_shadow_snapshot({
+        "realized_pnl": 2.3297,
+        "daily_realized_pnl": 0.0,
+        "unrealized_pnl": 0.5,
+        "total_pnl": 2.8297,
+    })
+    state = mgr.state
+    assert state.daily_pnl == pytest.approx(0.0)          # day value, not cumulative
+    assert state.total_pnl == pytest.approx(2.8297)       # cumulative preserved
+    assert state.unrealized_pnl == pytest.approx(0.5)
+
+
+def test_shadow_snapshot_daily_pnl_is_not_frozen_cumulative():
+    """Directly pins the observed bug value: daily_pnl must be 0, not 2.3297."""
+    mgr = RiskManager(make_test_config())
+    mgr.update_shadow_snapshot({
+        "realized_pnl": 2.3297,
+        "daily_realized_pnl": 0.0,
+        "unrealized_pnl": 0.0,
+        "total_pnl": 2.3297,
+    })
+    assert mgr.state.daily_pnl != pytest.approx(2.3297)
+    assert mgr.state.daily_pnl == pytest.approx(0.0)
+
+
+def test_shadow_snapshot_without_daily_key_falls_back_to_cumulative():
+    """Defensive fallback: malformed snapshot lacking the day key reverts to
+    the prior (cumulative) behaviour rather than crashing."""
+    mgr = RiskManager(make_test_config())
+    mgr.update_shadow_snapshot({
+        "realized_pnl": 1.5,
+        "unrealized_pnl": 0.0,
+        "total_pnl": 1.5,
+    })
+    assert mgr.state.daily_pnl == pytest.approx(1.5)
+
+
+def test_shadow_daily_loss_breaker_uses_daily_not_cumulative():
+    """The risk-relevant payoff of the fix: a big intraday loss must trip the
+    daily-loss breaker even when cumulative realized is comfortably positive.
+
+    Pre-fix, daily_pnl was overwritten with the (positive) cumulative realized,
+    so the breaker never saw today's loss. `check_can_trade` gates on
+    min(daily_pnl, total_pnl), so total_pnl must reflect the same intraday
+    drawdown for the breaker to engage."""
+    mgr = RiskManager(make_test_config(max_daily_loss=5.0))
+    mgr.update_shadow_snapshot({
+        "realized_pnl": -8.0,        # cumulative incl. today
+        "daily_realized_pnl": -8.0,  # today's loss exceeds the $5 line
+        "unrealized_pnl": 0.0,
+        "total_pnl": -8.0,
+    })
+    state = mgr.state
+    assert state.daily_pnl == pytest.approx(-8.0)
+    can, reason = state.check_can_trade(
+        max_positions=10,
+        max_total_exposure=1000.0,
+        max_daily_loss=5.0,
+        max_failures=5,
+    )
+    assert can is False
+    assert "止损线" in reason
+

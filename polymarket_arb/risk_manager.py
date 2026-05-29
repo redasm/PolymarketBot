@@ -653,7 +653,13 @@ class RiskManager:
         if not self._config.dry_run or not self._shadow_snapshot:
             return
         snap = self._shadow_snapshot
-        self._state.daily_pnl = _safe_float(snap.get("realized_pnl"), self._state.daily_pnl)
+        # daily_pnl 必须用日内已实现 (随 UTC 日切归零),不能用累计 realized_pnl,
+        # 否则 _maybe_reset_daily 刚归零的 daily_pnl 会被累计值覆盖,导致
+        # RISK_MAX_DAILY_LOSS 日亏损熔断拿累计值误判。缺键时回退累计 (防御性)。
+        self._state.daily_pnl = _safe_float(
+            snap.get("daily_realized_pnl"),
+            _safe_float(snap.get("realized_pnl"), self._state.daily_pnl),
+        )
         self._state.unrealized_pnl = _safe_float(snap.get("unrealized_pnl"), self._state.unrealized_pnl)
         self._state.total_pnl = _safe_float(
             snap.get("total_pnl"),

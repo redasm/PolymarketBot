@@ -64,6 +64,24 @@ def refresh_market_universe(
         min_liquidity=config.min_liquidity,
         min_volume_24h=config.min_volume_24h,
     )
+    # UPDOWN markets carry ~0 24h volume so the volume-filtered fetch above
+    # drops them. When enabled, pull them via a dedicated slug-direct probe
+    # and merge (dedup by condition_id) so the scan-pool boost has something
+    # to promote. Additive + best-effort — never breaks the main refresh.
+    if getattr(config, "t2_updown_enabled", False):
+        try:
+            symbols = [s.strip() for s in config.t2_updown_symbols.split(",") if s.strip()]
+            windows = [int(w.strip()) for w in config.t2_updown_window_minutes.split(",") if w.strip()]
+            updown = scanner.fetch_updown_markets(
+                symbols=symbols,
+                window_minutes=windows,
+                slots_ahead=config.t2_updown_slots_ahead,
+            )
+            if updown:
+                seen = {m.condition_id for m in markets}
+                markets = markets + [m for m in updown if m.condition_id not in seen]
+        except Exception:  # noqa: BLE001 - additive path, must not break refresh
+            LOG.exception("UPDOWN 市场合并失败（忽略，不影响主 universe）")
     events = scanner.fetch_active_events(limit=max(50, config.hot_event_pool_size * 2))
     return markets, events, now, True
 

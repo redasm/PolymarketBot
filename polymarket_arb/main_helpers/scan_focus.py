@@ -54,6 +54,35 @@ def market_focus_text(market: MarketInfo) -> str:
     return " ".join(part for part in parts if part).lower()
 
 
+def is_updown_market(market: MarketInfo) -> bool:
+    """True for short-horizon spot-anchored UP/DOWN markets (e.g. btc-updown-15m).
+
+    These are the only markets `fair_value_model.compute_fair_updown` can price,
+    because ref_px is fixed at the window start and the question is purely
+    directional ("will price be higher at window end?").
+
+    Detection is deliberately two-pronged and conservative:
+    - Primary: the slug contains an `updown` token (Polymarket uses
+      `btc-updown-15m-{slot}` style slugs). Slug is far more stable than the
+      free-text question, which varies across event families.
+    - Secondary: the two token outcomes are exactly {up, down}. This catches
+      any UP/DOWN market whose slug convention differs, without false-firing on
+      ordinary Yes/No binaries.
+    """
+    slug = (market.slug or "").lower()
+    event_slug = (getattr(market, "event_slug", "") or "").lower()
+    if "updown" in slug or "up-down" in slug or "updown" in event_slug or "up-down" in event_slug:
+        return True
+    outcomes = {
+        (token.outcome or "").strip().lower()
+        for token in market.tokens
+        if (token.outcome or "").strip()
+    }
+    if not outcomes:
+        outcomes = {str(o).strip().lower() for o in (market.outcomes or []) if str(o).strip()}
+    return outcomes == {"up", "down"}
+
+
 def event_focus_text(event: Any) -> str:
     parts = [getattr(event, "title", ""), getattr(event, "slug", "")]
     for market in getattr(event, "markets", []) or []:
@@ -92,10 +121,21 @@ def matches_focus(text: str, keywords: list[str]) -> bool:
     return False
 
 
-def market_priority_score(market: MarketInfo) -> tuple[float, float, float]:
-    """Sort key: binary > multi-outcome, then by 24h volume, then liquidity."""
+def market_priority_score(
+    market: MarketInfo,
+    updown_boost: float = 0.0,
+) -> tuple[float, float, float, float]:
+    """Sort key: UPDOWN boost > binary > multi-outcome, then 24h volume, then liquidity.
+
+    `updown_boost` (>0 only when `T2_UPDOWN_ENABLED`) lifts short-horizon
+    spot-anchored UP/DOWN markets above high-volume long-horizon markets so
+    they aren't squeezed out of the hot pool / WS budget. When 0 the leading
+    term is constant and the ordering is identical to the pre-UPDOWN behaviour.
+    """
+    updown_term = updown_boost if (updown_boost > 0.0 and is_updown_market(market)) else 0.0
     binary_boost = 1.0 if len(market.tokens) == 2 else 0.0
     return (
+        updown_term,
         binary_boost,
         float(market.volume_24h or 0.0),
         float(market.liquidity or 0.0),
@@ -118,12 +158,13 @@ def select_scan_candidates(
     max_count: int,
     *,
     focus_keywords: list[str] | None = None,
+    updown_boost: float = 0.0,
 ) -> list[MarketInfo]:
     active = [
         market for market in markets
         if market.active and not market.closed and matches_focus(market_focus_text(market), focus_keywords or [])
     ]
-    active.sort(key=market_priority_score, reverse=True)
+    active.sort(key=lambda m: market_priority_score(m, updown_boost), reverse=True)
     return active[:max_count]
 
 
@@ -149,6 +190,7 @@ def merge_focus_event_markets(
     max_count: int,
     *,
     focus_keywords: list[str] | None = None,
+    updown_boost: float = 0.0,
 ) -> list[MarketInfo]:
     """Merge per-event markets into the flat market list.
 
@@ -179,22 +221,36 @@ def merge_focus_event_markets(
             merged.setdefault(market.condition_id, market)
 
     ranked = list(merged.values())
-    ranked.sort(key=market_priority_score, reverse=True)
+    ranked.sort(key=lambda m: market_priority_score(m, updown_boost), reverse=True)
     return ranked[:max_count]
 
 
 def select_ws_targets(
     markets: list[MarketInfo],
     max_count: int,
+    *,
+    updown_boost: float = 0.0,
 ) -> list[MarketInfo]:
     """Pick the top-N binary markets to mirror over WebSocket.
 
     Ranked by `volume * liquidity` because both dimensions matter: high
     volume with thin liquidity gets eaten quickly, while deep books with
     no flow waste the WS subscription budget.
+
+    When `updown_boost > 0` (T2_UPDOWN_ENABLED), short-horizon UP/DOWN
+    markets are placed ahead of the volume*liquidity ranking so they always
+    secure a WS slot — their per-market 24h volume is small and they would
+    otherwise never make the WS budget despite being the T2 substrate.
     """
     binary = [m for m in markets if len(m.tokens) == 2 and not m.closed]
-    binary.sort(key=lambda m: m.volume_24h * m.liquidity, reverse=True)
+    use_updown = updown_boost > 0.0
+    binary.sort(
+        key=lambda m: (
+            1.0 if (use_updown and is_updown_market(m)) else 0.0,
+            m.volume_24h * m.liquidity,
+        ),
+        reverse=True,
+    )
     return binary[:max_count]
 
 

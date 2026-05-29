@@ -215,6 +215,22 @@ class ArbConfig:
     # candidate market and the orchestrator skips 80+/cycle with
     # `tier_budget_below_min_order`. 0 = no cap.
     t2_max_signals_per_cycle: int
+    # T2 UPDOWN substrate (Phase 1): when enabled, short-horizon spot-anchored
+    # UP/DOWN markets (e.g. btc-updown-15m) get a priority boost in scan-pool
+    # and WS-subscription selection so they aren't squeezed out by high-volume
+    # long-horizon markets. Default off — gated until shadow confirms these
+    # markets pass the T2 quality gate (spread/depth).
+    t2_updown_enabled: bool
+    t2_updown_priority_boost: float
+    # UPDOWN markets carry ~0 24h volume per rotating window, so the
+    # volume-sorted `fetch_active_markets` drops them before they ever reach
+    # the scan pool. When `t2_updown_enabled`, the universe refresh issues a
+    # dedicated slug-direct probe (`/events?slug={sym}-updown-{w}m-{slot}`) for
+    # the current + next N windows, bypassing the volume filter. These params
+    # control which assets / window lengths / look-ahead the probe covers.
+    t2_updown_symbols: str
+    t2_updown_window_minutes: str
+    t2_updown_slots_ahead: int
     # T2 extreme-price gate: reject directional entries at the tails of
     # [0, 1]. Empirical Polymarket data (Becker 2025, 72M trades) shows
     # BUY YES at price < 0.10 averaged -41% EV (longshot tax); the
@@ -585,6 +601,10 @@ class ArbConfig:
             raise ValueError("T2_MAX_HORIZON_DAYS 不能为负数")
         if self.t2_max_signals_per_cycle < 0:
             raise ValueError("T2_MAX_SIGNALS_PER_CYCLE 不能为负数")
+        if self.t2_updown_priority_boost < 0:
+            raise ValueError("T2_UPDOWN_PRIORITY_BOOST 不能为负数")
+        if self.t2_updown_slots_ahead < 0:
+            raise ValueError("T2_UPDOWN_SLOTS_AHEAD 不能为负数")
         if not (0.0 <= self.t2_reject_price_below <= 0.5):
             raise ValueError("T2_REJECT_PRICE_BELOW 必须在 [0, 0.5]")
         if not (0.5 <= self.t2_reject_price_above <= 1.0):
@@ -791,6 +811,11 @@ class ArbConfig:
             t2_long_horizon_min_net_edge_bps=_env_float("T2_LONG_HORIZON_MIN_NET_EDGE_BPS", 200.0),
             t2_max_horizon_days=_env_float("T2_MAX_HORIZON_DAYS", 90.0),
             t2_max_signals_per_cycle=_env_int("T2_MAX_SIGNALS_PER_CYCLE", 30),
+            t2_updown_enabled=_env_bool("T2_UPDOWN_ENABLED", False),
+            t2_updown_priority_boost=_env_float("T2_UPDOWN_PRIORITY_BOOST", 1.0),
+            t2_updown_symbols=_env("T2_UPDOWN_SYMBOLS", "btc,eth"),
+            t2_updown_window_minutes=_env("T2_UPDOWN_WINDOW_MINUTES", "15"),
+            t2_updown_slots_ahead=_env_int("T2_UPDOWN_SLOTS_AHEAD", 4),
             t2_reject_price_below=_env_float("T2_REJECT_PRICE_BELOW", 0.10),
             t2_reject_price_above=_env_float("T2_REJECT_PRICE_ABOVE", 0.90),
             t2_near_efficient_min_net_edge_bps=_env_float(

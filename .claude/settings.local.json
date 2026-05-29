@@ -92,7 +92,14 @@
       "Bash(\"D:/Program Files/Python311/python.exe\" -m py_compile \"e:/AppProject/PolymarketBot/research_signal/collectors/funding_rate.py\")",
       "Bash(\"D:/Program Files/Python311/python.exe\" -m py_compile \"e:/AppProject/PolymarketBot/research_signal/collectors/econ_calendar.py\")",
       "Bash(\"D:/Program Files/Python311/python.exe\" -m py_compile \"e:/AppProject/PolymarketBot/research_signal/collectors/defillama.py\")",
-      "Bash(\"D:/Program Files/Python311/python.exe\" -m py_compile \"e:/AppProject/PolymarketBot/research_signal/collectors/polymarket_activity.py\")"
+      "Bash(\"D:/Program Files/Python311/python.exe\" -m py_compile \"e:/AppProject/PolymarketBot/research_signal/collectors/polymarket_activity.py\")",
+      "Read(//e/PolymarketData//**)",
+      "Read(//e/PolymarketData/**)",
+      "Bash(cmd.exe //c \"dir E:\\\\PolymarketData\")",
+      "Bash(cmd.exe //c \"py -3 --version\")",
+      "Bash(cmd.exe //c \"where python\")",
+      "Bash(/d/Program Files/Python311/python.exe *)",
+      "Bash('/d/Program Files/Python311/python.exe' -)"
     ],
     "additionalDirectories": [
       "\\tmp"
