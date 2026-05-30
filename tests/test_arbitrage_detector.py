@@ -448,3 +448,80 @@ class TestMultiOutcomeArbDetection:
 
         detector = ArbitrageDetector(make_test_config(), MockOrderBookAnalyzer(snapshots))
         assert detector.scan_multi_outcome_event(event) is None
+
+
+class TestCrossedBookGuard:
+    """交叉簿(best_bid >= best_ask)= stale 快照, 必须拒绝, 否则产生不可成交的假套利.
+
+    复刻 2026-05-26 ev=34584: Yes bid=0.71 > ask=0.58, No bid=0.42 > ask=0.29,
+    asks 和 0.87 < 1 看似 12.9% 套利, 但 bid>ask 物理不可成交。
+    """
+
+    def _market(self):
+        return MarketInfo(
+            condition_id="c-cross",
+            question="Crossed?",
+            slug="crossed",
+            tokens=[
+                TokenInfo(token_id="0xyes", outcome="Yes"),
+                TokenInfo(token_id="0xno", outcome="No"),
+            ],
+            active=True,
+            closed=False,
+            event_id="e-cross",
+        )
+
+    def test_is_crossed_book_helper(self, make_snapshot):
+        from polymarket_arb.arbitrage_detector import _is_crossed_book
+        assert _is_crossed_book(make_snapshot(best_bid=0.71, best_ask=0.58)) is True
+        assert _is_crossed_book(make_snapshot(best_bid=0.58, best_ask=0.58)) is True  # locked
+        assert _is_crossed_book(make_snapshot(best_bid=0.44, best_ask=0.45)) is False
+        assert _is_crossed_book(None) is False
+
+    def test_binary_crossed_book_rejected(self, make_snapshot):
+        # 复刻 ev=34584 的交叉簿
+        snapshots = {
+            "0xyes": make_snapshot(token_id="0xyes", best_bid=0.71, best_ask=0.58),
+            "0xno": make_snapshot(token_id="0xno", best_bid=0.42, best_ask=0.29),
+        }
+        detector = ArbitrageDetector(make_test_config(), MockOrderBookAnalyzer(snapshots))
+        # asks 和 = 0.87 < 1, 旧逻辑会报 12.9% 假套利; 加防护后应拒绝
+        assert detector.scan_binary_market(self._market()) is None
+
+    def test_binary_one_leg_crossed_rejected(self, make_snapshot):
+        # 只有 Yes 腿交叉, No 正常 -> 仍应拒绝(任一腿 stale 即不可成交)
+        snapshots = {
+            "0xyes": make_snapshot(token_id="0xyes", best_bid=0.71, best_ask=0.58),
+            "0xno": make_snapshot(token_id="0xno", best_bid=0.28, best_ask=0.29),
+        }
+        detector = ArbitrageDetector(make_test_config(), MockOrderBookAnalyzer(snapshots))
+        assert detector.scan_binary_market(self._market()) is None
+
+    def test_normal_book_real_edge_not_killed(self, make_snapshot):
+        # 正常盘口(bid<ask) + 真实 edge: 不能被误杀
+        snapshots = {
+            "0xyes": make_snapshot(token_id="0xyes", best_bid=0.44, best_ask=0.45),
+            "0xno": make_snapshot(token_id="0xno", best_bid=0.49, best_ask=0.50),
+        }
+        detector = ArbitrageDetector(make_test_config(), MockOrderBookAnalyzer(snapshots))
+        opp = detector.scan_binary_market(self._market())
+        assert opp is not None
+        assert opp.net_edge > 0
+
+    def test_verify_opportunity_rejects_crossed_book(self, make_snapshot):
+        # 先用正常盘口检出机会, 再用交叉簿验证 -> 最后一道闸应拒绝
+        normal = {
+            "0xyes": make_snapshot(token_id="0xyes", best_bid=0.44, best_ask=0.45),
+            "0xno": make_snapshot(token_id="0xno", best_bid=0.49, best_ask=0.50),
+        }
+        detector_normal = ArbitrageDetector(make_test_config(), MockOrderBookAnalyzer(normal))
+        opp = detector_normal.scan_binary_market(self._market())
+        assert opp is not None
+
+        crossed = {
+            "0xyes": make_snapshot(token_id="0xyes", best_bid=0.71, best_ask=0.58),
+            "0xno": make_snapshot(token_id="0xno", best_bid=0.42, best_ask=0.29),
+        }
+        detector_crossed = ArbitrageDetector(make_test_config(), MockOrderBookAnalyzer(crossed))
+        assert detector_crossed.verify_opportunity_with_depth(opp, 10.0) is None
+

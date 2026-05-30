@@ -54,6 +54,24 @@ def _find_token_by_outcome(market: MarketInfo, outcome: str) -> Any | None:
     )
 
 
+def _is_crossed_book(snap: Any) -> bool:
+    """True if the snapshot's book is crossed/locked (best_bid >= best_ask).
+
+    A crossed book (bid >= ask) is physically impossible in a clean market and
+    signals a stale/inconsistent snapshot — typically a resting quote that was
+    already pulled, or bid/ask sides captured from different WS updates. The
+    `best_ask` in that state is NOT a fillable price: treating it as one
+    produces phantom "arbs" (e.g. ev=34584 showed Yes bid=0.71 > ask=0.58,
+    yielding a fake 12.9% edge that never filled). Callers must skip any leg
+    priced off a crossed book.
+    """
+    if snap is None:
+        return False
+    bid = getattr(snap, "best_bid", None)
+    ask = getattr(snap, "best_ask", None)
+    return bid is not None and ask is not None and bid >= ask
+
+
 class ArbitrageDetector:
     """检测 Polymarket 上的套利机会."""
 
@@ -80,6 +98,10 @@ class ArbitrageDetector:
         if snap_yes is None or snap_no is None:
             return None
         if snap_yes.best_ask is None or snap_no.best_ask is None:
+            return None
+        # Crossed/locked book (bid >= ask) => best_ask is stale, not fillable.
+        # Skip rather than emit a phantom arb off an impossible quote.
+        if _is_crossed_book(snap_yes) or _is_crossed_book(snap_no):
             return None
 
         ask_yes = snap_yes.best_ask
@@ -260,6 +282,8 @@ class ArbitrageDetector:
         snap = self._ob.get_snapshot(yes_token.token_id)
         if snap is None or snap.best_ask is None:
             return None
+        if _is_crossed_book(snap):
+            return None
 
         return ArbLeg(
             token_id=yes_token.token_id,
@@ -287,8 +311,14 @@ class ArbitrageDetector:
         snap_yes = self._ob.get_snapshot(yes_token.token_id)
         snap_no = self._ob.get_snapshot(no_token.token_id)
 
-        effective_ask_via_yes = snap_yes.best_ask if (snap_yes and snap_yes.best_ask is not None) else None
-        no_bid = snap_no.best_bid if (snap_no and snap_no.best_bid is not None) else None
+        # Crossed/locked book => the relevant top-of-book price is stale and not
+        # fillable. Null out each side independently so the selection below
+        # naturally falls back to the other; if both are crossed, the
+        # both-None guard returns None.
+        yes_ok = snap_yes is not None and snap_yes.best_ask is not None and not _is_crossed_book(snap_yes)
+        no_ok = snap_no is not None and snap_no.best_bid is not None and not _is_crossed_book(snap_no)
+        effective_ask_via_yes = snap_yes.best_ask if yes_ok else None
+        no_bid = snap_no.best_bid if no_ok else None
         effective_ask_via_no = (1.0 - no_bid) if no_bid is not None else None
 
         if effective_ask_via_yes is None and effective_ask_via_no is None:
@@ -342,6 +372,14 @@ class ArbitrageDetector:
         actual_min_size = float("inf")
 
         for leg in opp.legs:
+            # Last gate before live submission: a crossed/locked book means the
+            # top-of-book price walked by VWAP is stale and not fillable. The
+            # stale level still sits in the snapshot with size, so the depth
+            # walk alone would pass it — reject explicitly here.
+            leg_snap = self._ob.get_snapshot(leg.token_id)
+            if _is_crossed_book(leg_snap):
+                LOG.debug("深度验证拒绝交叉簿: token=%s…", leg.token_id[:20])
+                return None
             if leg.side == OrderSide.BUY:
                 result = self._ob.get_executable_ask_price(leg.token_id, target_size)
             else:
