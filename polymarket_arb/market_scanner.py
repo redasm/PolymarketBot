@@ -242,6 +242,7 @@ def _parse_event(raw: dict) -> Optional[EventInfo]:
         markets=markets,
         active=bool(raw.get("active", True)),
         closed=bool(raw.get("closed", False)),
+        raw=raw if isinstance(raw, dict) else {},
     )
 
 

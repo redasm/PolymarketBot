@@ -35,6 +35,8 @@ from polymarket_arb.main_helpers.signal_helpers import (
     build_t2_related_market_context,
     evaluate_t2_market_quality,
 )
+from polymarket_arb.main_helpers.scan_focus import is_updown_market
+from polymarket_arb.main_helpers.signal_helpers import spread_bps_from_snapshot
 from polymarket_arb.main_helpers.quant_timing import (
     apply_event_baseline_timing,
     event_baseline_for_market,
@@ -353,6 +355,7 @@ def collect_statistical_strategy_signals(
     ob_analyzer: OrderBookAnalyzer,
     detector: StatisticalMispricingDetector,
     event_baselines: dict[str, dict[str, Any]] | str | None = None,
+    updown_pricer: Any | None = None,
 ) -> list[StrategySignal]:
     """T2 directional signals from statistical mispricing detector.
 
@@ -380,6 +383,30 @@ def collect_statistical_strategy_signals(
         if len(market.tokens) != 2 or market.closed or not market.active:
             _record_skip(skip_reasons, skip_by_market, market.condition_id, "non_binary_or_inactive")
             continue
+
+        # T2 UPDOWN Phase 2: spot-anchored 独立分支。
+        # UPDOWN 市场用 GBM 现货定价 (compute_fair_updown),不走为普通市场设计的
+        # OBI/动量贝叶斯 detector —— 后者在 15m 薄簿上把噪声当信号,且 spread 门
+        # (120bps) 会把实测 250-408bps 的 UPDOWN 全部挡掉。这里改用 UPDOWN 专用
+        # 宽 spread 门 + 模型直出 model_prob/confidence。
+        if (
+            updown_pricer is not None
+            and getattr(config, "t2_updown_enabled", False)
+            and is_updown_market(market)
+        ):
+            ud_signal = _collect_updown_signal(
+                config=config,
+                market=market,
+                ob_analyzer=ob_analyzer,
+                updown_pricer=updown_pricer,
+                skip_reasons=skip_reasons,
+                skip_by_market=skip_by_market,
+            )
+            if ud_signal is not None:
+                signals.append(ud_signal)
+            # UPDOWN 市场无论定价成功与否都不再走通用 T2 路径 (slug 已确认是 UPDOWN)。
+            continue
+
         horizon_days = _market_horizon_days(market)
         if horizon_max_days > 0 and horizon_days is not None and horizon_days > horizon_max_days:
             _record_skip(skip_reasons, skip_by_market, market.condition_id, "horizon_gt_max", horizon_days=horizon_days)
@@ -492,6 +519,116 @@ def collect_statistical_strategy_signals(
         )[:10],
     }
     return signals
+
+
+def _updown_tokens(market: MarketInfo):
+    """显式按 outcome 映射 (up_token, down_token);失败返回 (None, None).
+
+    绝不用位置默认 —— Polymarket 的 token 顺序不保证,错配会让 fair_up 套到
+    DOWN token 上、方向完全反掉 (与 t2_exit_manager 的 outcome-from-trade 教训同源)。
+    """
+    up_token = next((t for t in market.tokens if (t.outcome or "").strip().lower() == "up"), None)
+    down_token = next((t for t in market.tokens if (t.outcome or "").strip().lower() == "down"), None)
+    return up_token, down_token
+
+
+def _collect_updown_signal(
+    *,
+    config: ArbConfig,
+    market: MarketInfo,
+    ob_analyzer: OrderBookAnalyzer,
+    updown_pricer: Any,
+    skip_reasons: dict[str, int],
+    skip_by_market: dict[str, dict[str, Any]],
+) -> StrategySignal | None:
+    """对单个 UPDOWN 市场用 spot-anchored GBM 产出 T2 directional 信号."""
+    up_token, down_token = _updown_tokens(market)
+    if up_token is None or down_token is None:
+        _record_skip(skip_reasons, skip_by_market, market.condition_id, "updown_outcome_unmapped")
+        return None
+
+    fv = updown_pricer.price(
+        slug=market.slug or "",
+        event_slug=getattr(market, "event_slug", "") or "",
+    )
+    if not fv.ok:
+        _record_skip(skip_reasons, skip_by_market, market.condition_id, fv.reason)
+        return None
+
+    up_snap = ob_analyzer.get_snapshot(up_token.token_id)
+    down_snap = ob_analyzer.get_snapshot(down_token.token_id)
+    if up_snap is None or down_snap is None or up_snap.mid is None or down_snap.mid is None:
+        _record_skip(skip_reasons, skip_by_market, market.condition_id, "missing_t2_snapshot")
+        return None
+
+    # UPDOWN 专用 spread 门: 上限放宽到 t2_updown_max_spread_bps (默认 500),
+    # 深度门仍用通用 t2_min_top_depth。spot 锚定定价不靠盘口中点,宽 spread≠无 edge。
+    up_spread = spread_bps_from_snapshot(up_snap)
+    down_spread = spread_bps_from_snapshot(down_snap)
+    max_spread = float(getattr(config, "t2_updown_max_spread_bps", 500.0))
+    if up_spread is None or down_spread is None:
+        _record_skip(skip_reasons, skip_by_market, market.condition_id, "updown_missing_spread")
+        return None
+    if max(float(up_spread), float(down_spread)) > max_spread:
+        _record_skip(
+            skip_reasons, skip_by_market, market.condition_id,
+            "updown_spread_too_wide",
+            up_spread_bps=round(float(up_spread), 1), down_spread_bps=round(float(down_spread), 1),
+        )
+        return None
+    up_depth = float(getattr(up_snap, "best_ask_size", 0.0) or 0.0)
+    down_depth = float(getattr(down_snap, "best_ask_size", 0.0) or 0.0)
+    if min(up_depth, down_depth) < config.t2_min_top_depth:
+        _record_skip(skip_reasons, skip_by_market, market.condition_id, "updown_top_depth_too_low")
+        return None
+
+    # 选 fair 与市场价偏离更大的一侧买入 (买被低估的方向)。
+    up_dev = float(fv.fair_up) - float(up_snap.mid)
+    down_dev = float(fv.fair_down) - float(down_snap.mid)
+    if abs(up_dev) >= abs(down_dev):
+        side_token, side_mid, fair, dev, action, role = up_token, float(up_snap.mid), float(fv.fair_up), up_dev, "BUY_UP", "up"
+    else:
+        side_token, side_mid, fair, dev, action, role = down_token, float(down_snap.mid), float(fv.fair_down), down_dev, "BUY_DOWN", "down"
+
+    if dev < config.t2_min_deviation:
+        # 只在"市场低估该侧" (fair>market, dev>0) 且超阈值时买入。
+        _record_skip(
+            skip_reasons, skip_by_market, market.condition_id, "updown_deviation_below_min",
+            deviation=round(dev, 4),
+        )
+        return None
+
+    return StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type=action.lower(),
+        market_id=market.condition_id,
+        description=f"{market.question[:80]} | updown fair={fair:.3f} mkt={side_mid:.3f} dev={dev:+.4f}",
+        expected_edge=abs(dev) * 10_000.0,
+        confidence=float(fv.confidence),
+        recommended_size_usdc=float(config.default_order_size_usdc),
+        urgency=min(1.0, 0.5 + float(fv.confidence) * 0.4),
+        payload={
+            "action": action,
+            "outcome_role": role,
+            "token_id": side_token.token_id,
+            "model_prob": fair,
+            "market_prob": side_mid,
+            "deviation": dev,
+            "deviation_pct": dev / side_mid if side_mid else 0.0,
+            "updown": {
+                "symbol": fv.symbol,
+                "window_sec": fv.window_sec,
+                "slot": fv.slot,
+                "tau_sec": round(float(fv.tau_sec), 1) if fv.tau_sec is not None else None,
+                "ref_px": fv.ref_px,
+                "s_now": fv.s_now,
+                "sigma_15m": fv.sigma_15m,
+                "z_score": fv.z_score,
+                "fair_up": fv.fair_up,
+                "fair_down": fv.fair_down,
+            },
+        },
+    )
 
 
 def _yes_token(market: MarketInfo):

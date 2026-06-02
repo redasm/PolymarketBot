@@ -86,7 +86,12 @@ def build_directional_opportunity_from_signal(
     *why* a signal was filtered without re-running the math.
     """
     action = resolve_strategy_signal_action(signal)
-    if action not in {"BUY_YES", "BUY_NO"}:
+    # UPDOWN markets (T2 Phase 2) use up/down outcomes instead of yes/no and
+    # carry an explicit token_id in the payload. Accept BUY_UP/BUY_DOWN and
+    # resolve the target token by id, falling back to outcome label. All other
+    # tiers keep the BUY_YES/BUY_NO contract untouched.
+    is_updown_action = action in {"BUY_UP", "BUY_DOWN"}
+    if action not in {"BUY_YES", "BUY_NO"} and not is_updown_action:
         set_signal_execution_check(signal, reason="unsupported_direction", action=action)
         return None, 0.0, "unsupported_direction"
 
@@ -109,8 +114,24 @@ def build_directional_opportunity_from_signal(
 
     yes_token = next((t for t in market.tokens if (t.outcome or "").lower() == "yes"), market.tokens[0])
     no_token = next((t for t in market.tokens if (t.outcome or "").lower() == "no"), market.tokens[-1])
-    target_token = yes_token if action == "BUY_YES" else no_token
-    outcome_label = "Yes" if action == "BUY_YES" else "No"
+    if is_updown_action:
+        # Resolve by explicit token_id (set by the UPDOWN collector); fall back
+        # to up/down outcome label. Never use positional default — a mis-mapped
+        # token would buy the opposite direction of the model's call.
+        want_role = "up" if action == "BUY_UP" else "down"
+        payload_token_id = str((signal.payload or {}).get("token_id") or "")
+        target_token = None
+        if payload_token_id:
+            target_token = next((t for t in market.tokens if t.token_id == payload_token_id), None)
+        if target_token is None:
+            target_token = next((t for t in market.tokens if (t.outcome or "").strip().lower() == want_role), None)
+        if target_token is None:
+            set_signal_execution_check(signal, reason="updown_token_unresolved", action=action)
+            return None, 0.0, "updown_token_unresolved"
+        outcome_label = "Up" if action == "BUY_UP" else "Down"
+    else:
+        target_token = yes_token if action == "BUY_YES" else no_token
+        outcome_label = "Yes" if action == "BUY_YES" else "No"
 
     if not config.dry_run and hasattr(ob_analyzer, "feed_health"):
         # Scope the staleness check to *this signal's* tokens. Without

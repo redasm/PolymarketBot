@@ -42,6 +42,38 @@ LOG = logging.getLogger(__name__)
 PAYOUT_PER_SHARE = 1.0
 
 
+def _declared_active_leg_count(event: EventInfo) -> Optional[int]:
+    """从 Gamma 原始 event JSON 数"声明的 active & not-closed 结果腿数".
+
+    多结果套利要求买入事件的**全部**存活互斥结果。universe 会因 volume 过滤丢掉
+    volume≈0 的兜底腿 (如 "any other team"),使检测器只看到部分 active 腿。这里
+    回到权威来源 (event.raw 的完整 markets 数组) 数真实的 active 腿数,用于校验
+    检测器手里的腿是否构成完整划分。
+
+    返回 None 表示原始数据缺失/不可信 (无 raw、无 markets 数组),调用方据此决定
+    是放行还是保守拒绝。
+    """
+    raw = getattr(event, "raw", None)
+    if not isinstance(raw, dict):
+        return None
+    markets = raw.get("markets")
+    if not isinstance(markets, list) or not markets:
+        return None
+    count = 0
+    for m in markets:
+        if not isinstance(m, dict):
+            return None  # 结构异常,不可信
+        active = m.get("active", True)
+        closed = m.get("closed", False)
+        if isinstance(active, str):
+            active = active.lower() in ("true", "1")
+        if isinstance(closed, str):
+            closed = closed.lower() in ("true", "1")
+        if bool(active) and not bool(closed):
+            count += 1
+    return count
+
+
 def _find_token_by_outcome(market: MarketInfo, outcome: str) -> Any | None:
     expected = outcome.strip().lower()
     return next(
@@ -194,6 +226,24 @@ class ArbitrageDetector:
             return None
 
         is_neg_risk = any(m.neg_risk for m in active_markets)
+
+        # 完整性校验 (防漏腿伪套利)。仅对 neg_risk 多结果事件生效:它们的"买全部
+        # 结果<1"套利前提是手里的腿覆盖了**所有**存活互斥结果。universe 的 volume
+        # 过滤会丢掉 volume≈0 的兜底腿 (如 "any other team"),使 active_markets 比
+        # 事件真实 active 腿少一条——漏掉的腿一旦 YES>0,"套利"会在该结果发生时血亏。
+        # 用 event.raw 的权威 active 腿数比对;不等则拒绝。raw 缺失 (None) 时:
+        # neg_risk 事件保守拒绝 (拿不到权威数就不赌),非 neg_risk 不受影响。
+        if is_neg_risk and getattr(self._config, "t0_require_complete_partition", True):
+            declared = _declared_active_leg_count(event)
+            if declared is None or declared != len(active_markets):
+                LOG.debug(
+                    "跳过不完整划分的多结果套利: %s, 实际腿=%d vs 声明active腿=%s",
+                    event.title,
+                    len(active_markets),
+                    declared,
+                )
+                return None
+
         legs: list[ArbLeg] = []
         total_ask_cost = 0.0
         min_available = float("inf")

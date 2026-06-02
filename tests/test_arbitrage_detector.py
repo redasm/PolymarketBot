@@ -8,6 +8,14 @@ from polymarket_arb.models import EventInfo, FeeStructure, MarketInfo, TokenInfo
 from tests.conftest import MockOrderBookAnalyzer, make_test_config
 
 
+def _complete_raw(n_active: int, n_closed: int = 0) -> dict:
+    """Build a raw Gamma event JSON declaring n_active active + n_closed closed
+    markets, so the completeness guard sees a full partition."""
+    markets = [{"active": True, "closed": False} for _ in range(n_active)]
+    markets += [{"active": True, "closed": True} for _ in range(n_closed)]
+    return {"markets": markets, "negRisk": True}
+
+
 def test_fee_structure_uses_clob_price_shape():
     fees = FeeStructure(taker_fee_rate=0.072)
 
@@ -378,6 +386,7 @@ class TestMultiOutcomeArbDetection:
                     neg_risk=True,
                 ),
             ],
+            raw=_complete_raw(2),
         )
 
         detector = ArbitrageDetector(make_test_config(), MockOrderBookAnalyzer(snapshots))
@@ -448,6 +457,87 @@ class TestMultiOutcomeArbDetection:
 
         detector = ArbitrageDetector(make_test_config(), MockOrderBookAnalyzer(snapshots))
         assert detector.scan_multi_outcome_event(event) is None
+
+
+class TestMultiOutcomeCompletenessGuard:
+    """漏腿伪套利防护: neg_risk 多结果套利必须覆盖事件全部 active 结果腿.
+
+    真实案例 (2026-05-31 西冠): 事件有 3 个 active 腿 (SAS / OKC / "any other
+    team"),但兜底腿 volume≈0 没进 universe,检测器只拿到 2 腿就误判完整套利。
+    """
+
+    def _two_neg_risk_markets(self, make_snapshot):
+        # neg_risk legs are taken via the complementary NO bid; each market needs
+        # both yes+no tokens. Buy-A-equiv cost ~0.05 (no-A bid 0.95), buy-B ~0.935.
+        snapshots = {
+            "a-yes": make_snapshot(token_id="a-yes", best_bid=0.04, best_ask=0.06, bids=[(0.04, 500)], asks=[(0.06, 500)]),
+            "a-no": make_snapshot(token_id="a-no", best_bid=0.95, best_ask=0.97, bids=[(0.95, 500)], asks=[(0.97, 500)]),
+            "b-yes": make_snapshot(token_id="b-yes", best_bid=0.93, best_ask=0.95, bids=[(0.93, 500)], asks=[(0.95, 500)]),
+            "b-no": make_snapshot(token_id="b-no", best_bid=0.07, best_ask=0.09, bids=[(0.07, 500)], asks=[(0.09, 500)]),
+        }
+        markets = [
+            MarketInfo(condition_id="a", question="Will A win?", slug="a",
+                       tokens=[TokenInfo(token_id="a-yes", outcome="Yes"), TokenInfo(token_id="a-no", outcome="No")],
+                       active=True, closed=False, event_id="e1", neg_risk=True),
+            MarketInfo(condition_id="b", question="Will B win?", slug="b",
+                       tokens=[TokenInfo(token_id="b-yes", outcome="Yes"), TokenInfo(token_id="b-no", outcome="No")],
+                       active=True, closed=False, event_id="e1", neg_risk=True),
+        ]
+        return snapshots, markets
+
+    def test_missing_backstop_leg_rejected(self, make_snapshot):
+        """检测器有 2 腿,但事件声明 3 个 active 腿 -> 漏腿,拒绝。"""
+        snapshots, markets = self._two_neg_risk_markets(make_snapshot)
+        event = EventInfo(event_id="e1", slug="wc", title="Western Conference Champion",
+                          markets=markets, raw=_complete_raw(n_active=3, n_closed=13))
+        detector = ArbitrageDetector(make_test_config(), MockOrderBookAnalyzer(snapshots))
+        assert detector.scan_multi_outcome_event(event) is None
+
+    def test_complete_partition_allowed(self, make_snapshot):
+        """检测器 2 腿 == 声明 2 active 腿 -> 完整,放行 (其余 closed 不需买)。"""
+        snapshots, markets = self._two_neg_risk_markets(make_snapshot)
+        event = EventInfo(event_id="e1", slug="wc", title="Western Conference Champion",
+                          markets=markets, raw=_complete_raw(n_active=2, n_closed=14))
+        detector = ArbitrageDetector(make_test_config(), MockOrderBookAnalyzer(snapshots))
+        opp = detector.scan_multi_outcome_event(event)
+        assert opp is not None
+        assert opp.total_cost == pytest.approx(0.98, abs=1e-6)
+
+    def test_missing_raw_rejects_neg_risk(self, make_snapshot):
+        """neg_risk 事件无 raw (拿不到权威腿数) -> 保守拒绝,不赌。"""
+        snapshots, markets = self._two_neg_risk_markets(make_snapshot)
+        event = EventInfo(event_id="e1", slug="wc", title="WC", markets=markets)  # raw={}
+        detector = ArbitrageDetector(make_test_config(), MockOrderBookAnalyzer(snapshots))
+        assert detector.scan_multi_outcome_event(event) is None
+
+    def test_guard_disabled_allows_incomplete(self, make_snapshot):
+        """关闭开关后回到旧行为 (不校验完整性)。"""
+        snapshots, markets = self._two_neg_risk_markets(make_snapshot)
+        event = EventInfo(event_id="e1", slug="wc", title="WC",
+                          markets=markets, raw=_complete_raw(n_active=3, n_closed=13))
+        cfg = make_test_config(t0_require_complete_partition=False)
+        detector = ArbitrageDetector(cfg, MockOrderBookAnalyzer(snapshots))
+        assert detector.scan_multi_outcome_event(event) is not None
+
+    def test_non_neg_risk_unaffected_by_guard(self, make_snapshot):
+        """非 neg_risk 多结果事件不受完整性门影响 (无兜底腿语义)。"""
+        snapshots = {
+            f"0xt{i}": make_snapshot(token_id=f"0xt{i}", best_ask=0.30, best_bid=0.29)
+            for i in range(3)
+        }
+        markets = [
+            MarketInfo(condition_id=f"c{i}", question=f"Cand {i}?", slug=f"cand-{i}",
+                       tokens=[TokenInfo(token_id=f"0xt{i}", outcome=f"Cand {i}")],
+                       active=True, closed=False, event_id="e1")
+            for i in range(3)
+        ]
+        # raw declares more active legs, but non-neg_risk -> guard skipped
+        event = EventInfo(event_id="e1", slug="election", title="Who wins?",
+                          markets=markets, raw={"markets": [{"active": True, "closed": False}] * 9})
+        detector = ArbitrageDetector(make_test_config(), MockOrderBookAnalyzer(snapshots))
+        opp = detector.scan_multi_outcome_event(event)
+        assert opp is not None
+        assert len(opp.legs) == 3
 
 
 class TestCrossedBookGuard:

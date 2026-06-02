@@ -12,6 +12,7 @@ from polymarket_arb.models import (
     MarketInfo,
     OrderSide,
     PositionSnapshot,
+    RiskState,
     TokenInfo,
     TradeRecord,
     TradeStatus,
@@ -627,9 +628,9 @@ def test_shadow_daily_loss_breaker_uses_daily_not_cumulative():
     daily-loss breaker even when cumulative realized is comfortably positive.
 
     Pre-fix, daily_pnl was overwritten with the (positive) cumulative realized,
-    so the breaker never saw today's loss. `check_can_trade` gates on
-    min(daily_pnl, total_pnl), so total_pnl must reflect the same intraday
-    drawdown for the breaker to engage."""
+    so the breaker never saw today's loss. The breaker gates on
+    daily_pnl + min(0, unrealized_pnl), so today's realized loss alone must
+    engage it."""
     mgr = RiskManager(make_test_config(max_daily_loss=5.0))
     mgr.update_shadow_snapshot({
         "realized_pnl": -8.0,        # cumulative incl. today
@@ -647,4 +648,49 @@ def test_shadow_daily_loss_breaker_uses_daily_not_cumulative():
     )
     assert can is False
     assert "止损线" in reason
+
+
+def test_daily_loss_breaker_resets_after_utc_rollover():
+    """Regression (5.30->5.31/6.01 freeze): once daily_pnl is zeroed at the UTC
+    rollover, a prior day's cumulative loss carried in total_pnl must NOT keep
+    the daily-loss breaker tripped. Pre-fix `min(daily_pnl, total_pnl)` read the
+    never-resetting cumulative value and froze trading indefinitely."""
+    state = RiskState(
+        daily_pnl=0.0,        # already zeroed by _maybe_reset_daily at midnight
+        unrealized_pnl=0.0,
+        total_pnl=-33.18,     # yesterday's cumulative loss, never day-reset
+    )
+    can, reason = state.check_can_trade(
+        max_positions=10,
+        max_total_exposure=1000.0,
+        max_daily_loss=30.0,
+        max_failures=5,
+    )
+    assert can is True, f"breaker should clear after rollover, got: {reason}"
+
+
+def test_daily_loss_breaker_counts_unrealized_drawdown():
+    """A live-mode open position bleeding unrealized PnL must count toward the
+    daily-loss line even before it is closed (daily_pnl + min(0, unrealized))."""
+    state = RiskState(daily_pnl=-2.0, unrealized_pnl=-4.0, total_pnl=-6.0)
+    can, _ = state.check_can_trade(
+        max_positions=10,
+        max_total_exposure=1000.0,
+        max_daily_loss=5.0,
+        max_failures=5,
+    )
+    assert can is False  # -2 + min(0,-4) = -6 <= -5
+
+
+def test_daily_loss_breaker_ignores_unrealized_gains():
+    """Unrealized GAINS must not offset a realized daily loss (min(0, unreal)),
+    so a paper profit can't mask a blown daily budget."""
+    state = RiskState(daily_pnl=-6.0, unrealized_pnl=+10.0, total_pnl=+4.0)
+    can, _ = state.check_can_trade(
+        max_positions=10,
+        max_total_exposure=1000.0,
+        max_daily_loss=5.0,
+        max_failures=5,
+    )
+    assert can is False  # -6 + min(0,+10) = -6 <= -5
 

@@ -103,6 +103,11 @@ class ArbConfig:
     kalshi_taker_fee_rate: float
     max_multi_outcome_legs: int
     t0_min_multi_outcome_median_leg_price: float
+    # 多结果套利完整性校验 (防漏腿伪套利)。检测器把 active 腿子集当成完整互斥集
+    # 用 1.0-Σcost 算套利;若某条 active 腿 (典型是 volume≈0 的兜底腿) 没进 universe,
+    # 漏腿会让"买全部结果<1"在数学上不成立。开启后要求实际腿数 == 事件声明的
+    # active 腿总数 (来自 EventInfo.raw),不等则丢弃。
+    t0_require_complete_partition: bool
 
     # 风险管理
     max_open_positions: int
@@ -231,6 +236,21 @@ class ArbConfig:
     t2_updown_symbols: str
     t2_updown_window_minutes: str
     t2_updown_slots_ahead: int
+    # T2 UPDOWN substrate (Phase 2): spot-anchored GBM pricing.
+    # UPDOWN markets quote a much wider spread than the generic T2 gate allows
+    # (empirically 250-408bps vs t2_max_spread_bps=120), but their fair value is
+    # anchored on the underlying spot price (compute_fair_updown), NOT on the
+    # orderbook mid — so a wide book spread does not mean "no edge". A dedicated,
+    # looser spread ceiling is applied only to UPDOWN markets; the depth and
+    # complement-error gates are unchanged. `t2_updown_spot_feed_enabled` toggles
+    # the Binance spot WS feed that supplies s_now / ref_px / sigma; it defaults
+    # to following `t2_updown_enabled` (no feed → no spot_fair → UPDOWN priced
+    # like a generic binary, which is the Phase 1 behaviour).
+    t2_updown_max_spread_bps: float
+    t2_updown_spot_feed_enabled: bool
+    # Comma-separated `symbol:binance_pair` overrides, e.g. "btc:BTCUSDT,eth:ETHUSDT".
+    # Empty → built-in default mapping in spot_feed.py.
+    t2_updown_spot_pairs: str
     # T2 extreme-price gate: reject directional entries at the tails of
     # [0, 1]. Empirical Polymarket data (Becker 2025, 72M trades) shows
     # BUY YES at price < 0.10 averaged -41% EV (longshot tax); the
@@ -605,6 +625,8 @@ class ArbConfig:
             raise ValueError("T2_UPDOWN_PRIORITY_BOOST 不能为负数")
         if self.t2_updown_slots_ahead < 0:
             raise ValueError("T2_UPDOWN_SLOTS_AHEAD 不能为负数")
+        if self.t2_updown_max_spread_bps < 0:
+            raise ValueError("T2_UPDOWN_MAX_SPREAD_BPS 不能为负数")
         if not (0.0 <= self.t2_reject_price_below <= 0.5):
             raise ValueError("T2_REJECT_PRICE_BELOW 必须在 [0, 0.5]")
         if not (0.5 <= self.t2_reject_price_above <= 1.0):
@@ -746,6 +768,7 @@ class ArbConfig:
             kalshi_taker_fee_rate=_env_float("KALSHI_TAKER_FEE_RATE", 0.003),
             max_multi_outcome_legs=_env_int("ARB_MAX_MULTI_OUTCOME_LEGS", 20),
             t0_min_multi_outcome_median_leg_price=_env_float("T0_MIN_MULTI_OUTCOME_MEDIAN_LEG_PRICE", 0.05),
+            t0_require_complete_partition=_env_bool("T0_REQUIRE_COMPLETE_PARTITION", True),
             max_open_positions=_env_int("RISK_MAX_OPEN_POSITIONS", 10),
             max_exposure_per_market=_env_float("RISK_MAX_EXPOSURE_PER_MARKET", 100.0),
             max_total_exposure=_env_float("RISK_MAX_TOTAL_EXPOSURE", 500.0),
@@ -816,6 +839,12 @@ class ArbConfig:
             t2_updown_symbols=_env("T2_UPDOWN_SYMBOLS", "btc,eth"),
             t2_updown_window_minutes=_env("T2_UPDOWN_WINDOW_MINUTES", "15"),
             t2_updown_slots_ahead=_env_int("T2_UPDOWN_SLOTS_AHEAD", 4),
+            t2_updown_max_spread_bps=_env_float("T2_UPDOWN_MAX_SPREAD_BPS", 500.0),
+            t2_updown_spot_feed_enabled=_env_bool(
+                "T2_UPDOWN_SPOT_FEED_ENABLED",
+                _env_bool("T2_UPDOWN_ENABLED", False),
+            ),
+            t2_updown_spot_pairs=_env("T2_UPDOWN_SPOT_PAIRS", ""),
             t2_reject_price_below=_env_float("T2_REJECT_PRICE_BELOW", 0.10),
             t2_reject_price_above=_env_float("T2_REJECT_PRICE_ABOVE", 0.90),
             t2_near_efficient_min_net_edge_bps=_env_float(

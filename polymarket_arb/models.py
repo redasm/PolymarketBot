@@ -118,6 +118,10 @@ class EventInfo:
     markets: list[MarketInfo] = field(default_factory=list)
     active: bool = True
     closed: bool = False
+    # 原始 Gamma event JSON。多结果套利的完整性校验需要它来取"事件声明的
+    # 完整 active 结果腿数"——universe 会因 volume 过滤丢掉 volume≈0 的兜底腿
+    # (如 "any other team")，导致检测器只看到部分腿就误判为完整互斥集。
+    raw: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -247,7 +251,14 @@ class RiskState:
             return False, f"持仓数 {self.open_positions} 已达上限 {max_positions}"
         if self.total_exposure >= max_total_exposure:
             return False, f"总敞口 ${self.total_exposure:.2f} 已达上限 ${max_total_exposure:.2f}"
-        effective_daily_pnl = min(self.daily_pnl, self.total_pnl)
+        # 日亏损熔断必须只看"当日"口径,且在 UTC 日切后归零。
+        # 历史写法 min(daily_pnl, total_pnl) 在 live 下等价于
+        # daily_pnl + min(0, unrealized_pnl) (因 total_pnl=daily_pnl+unrealized_pnl),
+        # 但在 dry_run/影子盘下 total_pnl 被 shadow 快照覆盖成"累计 all-time"值、
+        # 永不随日切归零,导致某天爆亏后熔断跨日粘死、后续永不开仓 (5.30->5.31/6.01 实测)。
+        # 这里改用 daily_pnl + min(0, unrealized_pnl): live 行为不变,影子盘用当前
+        # 浮亏 (随持仓清空/日切自然归零) 而非累计值。累计回撤保护属另一独立阈值,不复用日线。
+        effective_daily_pnl = self.daily_pnl + min(0.0, self.unrealized_pnl)
         if effective_daily_pnl <= -max_daily_loss:
             return False, f"日亏损 ${abs(effective_daily_pnl):.2f} 已触发止损线 ${max_daily_loss:.2f}"
         if self.consecutive_failures >= max_failures > 0:

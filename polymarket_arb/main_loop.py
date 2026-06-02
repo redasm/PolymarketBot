@@ -169,6 +169,8 @@ from polymarket_arb.strategies.strategy_orchestrator import (
 from polymarket_arb.tick_recorder import TickRecorder
 from polymarket_arb.volatility_estimator import VolEstimator
 from polymarket_arb.websocket_feed import OrderBookMirror, WebSocketFeed
+from polymarket_arb.spot_feed import BinanceSpotFeed, parse_spot_pairs
+from polymarket_arb.strategies.updown_pricer import UpdownPricer
 
 if TYPE_CHECKING:
     from research_signal.service import ResearchSignalService
@@ -398,6 +400,30 @@ def main(dotenv_path: str | None = None) -> None:
         min_deviation=config.t2_min_deviation,
         min_confidence=config.edge_min_confidence,
     )
+    # T2 UPDOWN Phase 2: Binance 现货 feed + spot-anchored pricer。
+    # 仅 t2_updown_enabled 且 spot_feed_enabled 时启动;否则 pricer=None,
+    # UPDOWN 分支不触发 (退化为 Phase 1 行为)。feed 是 daemon 线程,绝不阻塞主循环。
+    spot_feed: Optional[BinanceSpotFeed] = None
+    updown_pricer: Optional[UpdownPricer] = None
+    if getattr(config, "t2_updown_enabled", False) and getattr(config, "t2_updown_spot_feed_enabled", False):
+        try:
+            _ud_symbols = [s.strip() for s in (config.t2_updown_symbols or "").split(",") if s.strip()]
+            _ud_windows = [int(w.strip()) * 60 for w in (config.t2_updown_window_minutes or "15").split(",") if w.strip()]
+            _ud_pairs = parse_spot_pairs(_ud_symbols, config.t2_updown_spot_pairs)
+            spot_feed = BinanceSpotFeed(
+                pairs=_ud_pairs,
+                window_secs=_ud_windows or [900],
+                fast_minutes=config.vol_fast_minutes,
+                slow_minutes=config.vol_slow_minutes,
+                min_bars=config.vol_min_bars,
+            )
+            spot_feed.start()
+            updown_pricer = UpdownPricer(spot_feed)
+            LOG.info("T2 UPDOWN Phase 2 已启用: 现货源 %s", ",".join(sorted(_ud_pairs.values())))
+        except Exception as e:  # noqa: BLE001 - feed 启动失败不能拖垮主循环
+            LOG.warning("T2 UPDOWN 现货 feed 启动失败,回退 Phase 1: %s", e)
+            spot_feed = None
+            updown_pricer = None
     maker_strategy = MakerStrategy(
         spread_calc=DynamicSpreadCalculator(vol_estimator=vol_estimator),
         default_size=config.default_order_size_usdc,
@@ -1082,6 +1108,7 @@ def main(dotenv_path: str | None = None) -> None:
             ob_analyzer=ob_analyzer,
             detector=statistical_detector,
             event_baselines=quant_inputs.event_baselines_json,
+            updown_pricer=updown_pricer,
         )
         strategy_signals.extend(statistical_signals)
         strategy_signals.extend(
@@ -1805,6 +1832,9 @@ def main(dotenv_path: str | None = None) -> None:
     if ws_feed is not None:
         ws_feed.stop()
         LOG.info("WebSocket feed 已停止")
+    if spot_feed is not None:
+        spot_feed.stop()
+        LOG.info("Binance 现货 feed 已停止")
     if research_refresh_state.pending_future is not None:
         research_refresh_state.pending_future.cancel()
     if research_executor is not None:

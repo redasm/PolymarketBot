@@ -250,3 +250,83 @@ def test_happy_path_buy_no_picks_no_token() -> None:
     assert opp is not None
     assert opp.legs[0].outcome == "No"
     assert opp.legs[0].token_id == "no-1"
+
+
+# ---------- UPDOWN (T2 Phase 2) directions ----------------------------------
+
+
+def _make_updown_market() -> MarketInfo:
+    return MarketInfo(
+        condition_id="cond-1",
+        question="Bitcoin Up or Down - 8:00PM-8:15PM ET",
+        slug="btc-updown-15m-1780272000",
+        tokens=[TokenInfo("up-1", "Up"), TokenInfo("down-1", "Down")],
+    )
+
+
+def _make_updown_signal(action: str, token_id: str, deviation: float = 0.30) -> StrategySignal:
+    return StrategySignal(
+        tier=StrategyTier.STATISTICAL_ARB,
+        signal_type=action.lower(),
+        market_id="cond-1",
+        description="updown test",
+        expected_edge=deviation * 10_000.0,
+        confidence=0.62,
+        recommended_size_usdc=1.0,
+        payload={"action": action, "token_id": token_id, "deviation": deviation},
+    )
+
+
+def test_updown_buy_up_resolves_up_token_by_id() -> None:
+    signal = _make_updown_signal("BUY_UP", "up-1")
+    opp, size, reason = build_directional_opportunity_from_signal(
+        config=_make_config(polymarket_taker_fee_rate=0.02),
+        signal=signal,
+        market=_make_updown_market(),
+        ob_analyzer=_ob_analyzer(),
+    )
+    assert reason == "" and opp is not None
+    assert opp.legs[0].outcome == "Up"
+    assert opp.legs[0].token_id == "up-1"
+
+
+def test_updown_buy_down_resolves_down_token_by_id() -> None:
+    signal = _make_updown_signal("BUY_DOWN", "down-1")
+    opp, _, reason = build_directional_opportunity_from_signal(
+        config=_make_config(polymarket_taker_fee_rate=0.02),
+        signal=signal,
+        market=_make_updown_market(),
+        ob_analyzer=_ob_analyzer(),
+    )
+    assert reason == "" and opp is not None
+    assert opp.legs[0].outcome == "Down"
+    assert opp.legs[0].token_id == "down-1"
+
+
+def test_updown_falls_back_to_outcome_label_when_token_id_absent() -> None:
+    signal = _make_updown_signal("BUY_UP", token_id="")  # no explicit id
+    opp, _, reason = build_directional_opportunity_from_signal(
+        config=_make_config(polymarket_taker_fee_rate=0.02),
+        signal=signal,
+        market=_make_updown_market(),
+        ob_analyzer=_ob_analyzer(),
+    )
+    assert reason == "" and opp is not None
+    assert opp.legs[0].token_id == "up-1"  # resolved by "up" outcome label
+
+
+def test_updown_token_unresolved_when_no_match() -> None:
+    signal = _make_updown_signal("BUY_UP", token_id="ghost")
+    # market has no "up" outcome token to fall back to
+    market = MarketInfo(
+        condition_id="cond-1", question="q", slug="btc-updown-15m-1",
+        tokens=[TokenInfo("a", "Foo"), TokenInfo("b", "Bar")],
+    )
+    opp, _, reason = build_directional_opportunity_from_signal(
+        config=_make_config(),
+        signal=signal,
+        market=market,
+        ob_analyzer=_ob_analyzer(),
+    )
+    assert opp is None and reason == "updown_token_unresolved"
+

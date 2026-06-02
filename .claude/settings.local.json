@@ -99,7 +99,27 @@
       "Bash(cmd.exe //c \"py -3 --version\")",
       "Bash(cmd.exe //c \"where python\")",
       "Bash(/d/Program Files/Python311/python.exe *)",
-      "Bash('/d/Program Files/Python311/python.exe' -)"
+      "Bash('/d/Program Files/Python311/python.exe' -)",
+      "Bash('/d/Program Files/Python311/python.exe' /tmp/agg5.py)",
+      "Bash(ls -la \"E:\\\\\\\\PolymarketData\\\\\\\\5.30-6.01\\\\\\\\\")",
+      "Bash(ls .venv/Scripts/python*)",
+      "Bash(ls venv/Scripts/python*)",
+      "Bash(py -3 --version)",
+      "Bash(py -3 -)",
+      "Bash(py -3 -m pytest tests/test_risk_manager.py -q)",
+      "Bash(py -3 -m pytest tests/test_shadow_position_lifecycle_daily_pnl.py tests/test_shadow_daily_report.py tests/test_portfolio_sync.py tests/test_main_loop.py -q)",
+      "Bash(py -3 -m pytest -q)",
+      "Bash(py -3 -m pytest tests/test_config.py -q)",
+      "Bash(py -3 -c \"from tests.conftest import make_test_config; c=make_test_config\\(\\); print\\('updown_max_spread_bps=',c.t2_updown_max_spread_bps,'spot_feed=',c.t2_updown_spot_feed_enabled\\)\")",
+      "Bash(py -3 -c \"import polymarket_arb.main_helpers.signal_collectors; import polymarket_arb.main_helpers.directional_opportunity; import polymarket_arb.strategies.updown_pricer; import polymarket_arb.spot_feed; print\\('imports OK'\\)\")",
+      "Bash(py -3 -m pytest tests/ -q -k \"directional or statistical or signal_collect or signal_helper\")",
+      "Bash(py -3 -c \"import polymarket_arb.main_loop; print\\('main_loop imports OK'\\)\")",
+      "Bash(py -3 -m pytest tests/test_main_loop.py -q)",
+      "Bash(py -3 -m pytest tests/test_updown_phase2.py -q)",
+      "Bash(py -3 -m pytest tests/test_updown_phase2.py tests/test_main_helpers_directional_opportunity.py -q)",
+      "Bash(py -3 -c ' *)",
+      "WebFetch(domain:docs.polymarket.com)",
+      "Bash(py -3 -m pytest tests/test_arbitrage_detector.py -q)"
     ],
     "additionalDirectories": [
       "\\tmp"
