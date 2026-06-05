@@ -264,7 +264,9 @@ def collect_wallet_alpha_strategy_signals(
             continue
         category = str(obs.get("category", "") or "")
         if profile is None:
-            if candidate_shadow_enabled:
+            # candidate 模式只跟已在 profiles 里出现过的钱包（即使尚未通过 scorer 门槛）
+            # 若 profiles 有数据则只允许白名单内的钱包；profiles 为空时保持原有全量行为
+            if candidate_shadow_enabled and (not parsed_profiles or wallet in parsed_profiles):
                 candidate_signal = _wallet_alpha_candidate_signal(config, market, obs, action, wallet, category)
                 if candidate_signal is not None:
                     _attach_input_metadata(
