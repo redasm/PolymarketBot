@@ -136,10 +136,15 @@ class RiskManager:
             self._halt_time = None
             LOG.info("风控熔断自动解除（无新失败超过 %.0f 秒）", self._config.risk_halt_auto_recover_sec)
 
+        # T0 structural arb (BINARY / MULTI_OUTCOME) is locked-in profit by construction —
+        # no directional risk. Let it bypass the daily-loss stop so T2 drawdown cannot
+        # block genuinely risk-free opportunities.
+        from polymarket_arb.models import ArbType
+        is_structural = opp is not None and opp.arb_type in (ArbType.BINARY, ArbType.MULTI_OUTCOME)
         can, reason = self._state.check_can_trade(
             max_positions=self._config.max_open_positions,
             max_total_exposure=self._effective_max_total_exposure,
-            max_daily_loss=self._effective_max_daily_loss,
+            max_daily_loss=float("inf") if is_structural else self._effective_max_daily_loss,
             max_failures=self._config.max_consecutive_failures,
         )
         if not can:
