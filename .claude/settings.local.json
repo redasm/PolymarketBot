@@ -119,7 +119,25 @@
       "Bash(py -3 -m pytest tests/test_updown_phase2.py tests/test_main_helpers_directional_opportunity.py -q)",
       "Bash(py -3 -c ' *)",
       "WebFetch(domain:docs.polymarket.com)",
-      "Bash(py -3 -m pytest tests/test_arbitrage_detector.py -q)"
+      "Bash(py -3 -m pytest tests/test_arbitrage_detector.py -q)",
+      "WebSearch",
+      "Bash(python3 *)",
+      "Bash(python.exe *)",
+      "Read(//c/Windows/System32/**)",
+      "Bash(ls /c/Python*/python.exe)",
+      "Read(//c/Users/nave/AppData/Local/Programs/**)",
+      "Bash(/c/Windows/py *)",
+      "Bash(/c/Users/nave/AppData/Local/Microsoft/WindowsApps/python analyze_wallet_alpha.py)",
+      "Bash(cmd.exe *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(jq --version)",
+      "Bash(awk *)",
+      "Bash(/c/Users/nave/AppData/Local/Microsoft/WindowsApps/python3 --version)",
+      "WebFetch(domain:arxiv.org)",
+      "mcp__chrome-devtools__list_pages",
+      "mcp__chrome-devtools__navigate_page",
+      "mcp__chrome-devtools__take_screenshot",
+      "mcp__chrome-devtools__take_snapshot"
     ],
     "additionalDirectories": [
       "\\tmp"
