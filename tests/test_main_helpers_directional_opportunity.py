@@ -330,3 +330,80 @@ def test_updown_token_unresolved_when_no_match() -> None:
     )
     assert opp is None and reason == "updown_token_unresolved"
 
+
+# ---------- gross-edge anchored to fill price (Bug #3) -----------------------
+
+
+def test_gross_edge_anchored_to_ask_with_model_prob() -> None:
+    # model_prob (YES fair) = 0.55, fill price = 0.50 -> ask-anchored edge
+    # is 0.05, NOT the inflated mid-based deviation of 0.06.
+    signal = _make_signal(action="BUY_YES", deviation=0.06)
+    signal.payload["model_prob"] = 0.55
+    opp, _, reason = build_directional_opportunity_from_signal(
+        config=_make_config(polymarket_taker_fee_rate=0.02),
+        signal=signal,
+        market=_make_market(),
+        ob_analyzer=_ob_analyzer(),
+    )
+    assert reason == "" and opp is not None
+    assert signal.payload["execution_check"]["gross_edge"] == pytest.approx(0.05)
+
+
+def test_buy_no_uses_complement_model_prob() -> None:
+    # Standard T2 stores YES fair; a BUY_NO must price the NO token at the
+    # complement (1 - 0.30 = 0.70). Fill at 0.50 -> gross edge 0.20.
+    signal = _make_signal(action="BUY_NO", deviation=0.06)
+    signal.payload["model_prob"] = 0.30
+    opp, _, reason = build_directional_opportunity_from_signal(
+        config=_make_config(polymarket_taker_fee_rate=0.02),
+        signal=signal,
+        market=_make_market(),
+        ob_analyzer=_ob_analyzer(),
+    )
+    assert reason == "" and opp is not None
+    assert opp.legs[0].outcome == "No"
+    assert signal.payload["execution_check"]["gross_edge"] == pytest.approx(0.20)
+
+
+def test_updown_model_prob_not_complemented() -> None:
+    # UPDOWN stores the chosen side's fair value -> no complement.
+    # model_prob 0.62, fill 0.50 -> gross edge 0.12.
+    signal = _make_updown_signal("BUY_UP", token_id="up-1")
+    signal.payload["model_prob"] = 0.62
+    opp, _, reason = build_directional_opportunity_from_signal(
+        config=_make_config(polymarket_taker_fee_rate=0.02),
+        signal=signal,
+        market=_make_updown_market(),
+        ob_analyzer=_ob_analyzer(),
+    )
+    assert reason == "" and opp is not None
+    assert signal.payload["execution_check"]["gross_edge"] == pytest.approx(0.12)
+
+
+def test_legacy_deviation_path_unchanged() -> None:
+    # No model_prob in payload -> legacy abs(deviation) behaviour preserved.
+    signal = _make_signal(action="BUY_YES", deviation=0.05)
+    assert "model_prob" not in signal.payload
+    opp, _, reason = build_directional_opportunity_from_signal(
+        config=_make_config(polymarket_taker_fee_rate=0.02),
+        signal=signal,
+        market=_make_market(),
+        ob_analyzer=_ob_analyzer(),
+    )
+    assert reason == "" and opp is not None
+    assert signal.payload["execution_check"]["gross_edge"] == pytest.approx(0.05)
+
+
+def test_model_prob_below_fill_rejected_as_edge_below_fee() -> None:
+    # fair (0.50) == fill (0.50) -> gross edge 0, net edge < 0 once fee
+    # applies -> rejected before building an opportunity.
+    signal = _make_signal(action="BUY_YES", deviation=0.10)
+    signal.payload["model_prob"] = 0.50
+    opp, _, reason = build_directional_opportunity_from_signal(
+        config=_make_config(polymarket_taker_fee_rate=0.02),
+        signal=signal,
+        market=_make_market(),
+        ob_analyzer=_ob_analyzer(),
+    )
+    assert opp is None and reason == "edge_below_fee"
+

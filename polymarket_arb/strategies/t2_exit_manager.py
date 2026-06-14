@@ -48,6 +48,7 @@ from polymarket_arb.models import (
     ArbType,
     MarketInfo,
     OrderSide,
+    PositionSnapshot,
     TradeRecord,
     TradeStatus,
 )
@@ -77,6 +78,12 @@ _MAX_EXIT_RETRIES = 3
 _FLOOR_EXIT_AFTER = 10
 _ABANDON_AFTER = 20
 _FLOOR_PRICE = 0.01
+# After abandoning, portfolio_sync re-confirms the position is still
+# on-chain and we re-adopt it to retry exits. Cap the re-adopt cycles so a
+# genuinely undisposable position (e.g. zero standing bid until
+# settlement) can't ping-pong abandon<->readopt forever; after the cap we
+# leave it abandoned for the operator / market settlement.
+_MAX_READOPT = 3
 
 
 @dataclass
@@ -104,6 +111,10 @@ class T2OpenPosition:
     # underlying on-chain position may still exist; portfolio_sync owns
     # the reconciliation from that point on.
     abandoned: bool = False
+    # How many times this position has been re-adopted from the abandoned
+    # stash after portfolio_sync confirmed it is still on-chain. Capped at
+    # `_MAX_READOPT` so a permanently-stuck position can't loop forever.
+    readopt_count: int = 0
     # Scale-out state. `tranches_total` is fixed at registration from
     # config; `tranches_executed` only advances on a SUCCESSFUL full-fill
     # of a tranche slice (partial fills are retried until the slice
@@ -199,6 +210,12 @@ class T2ExitManager:
         # threshold. Provider returns None ⇒ fall back to entry prob.
         self._model_prob_provider = model_prob_provider
         self._positions: dict[str, T2OpenPosition] = {}
+        # Positions this manager gave up on (released exposure, dropped from
+        # `_positions`) but whose tokens may still be on-chain. Keyed by
+        # token_id. `reconcile_with_chain` re-adopts an entry from here when
+        # portfolio_sync confirms the chain still owns it, or prunes it once
+        # the chain shows it gone (settled / manually closed).
+        self._abandoned: dict[str, T2OpenPosition] = {}
         self._policy_cache: dict[float, OptimalStoppingPolicy] = {}
         self._stop_loss_bps = float(config.t2_stop_loss_bps)
         self._take_profit_capture_pct = float(config.t2_take_profit_capture_pct)
@@ -559,6 +576,72 @@ class T2ExitManager:
                 )
             except Exception:  # pragma: no cover - notifier transport
                 pass
+        # Stash for later reconciliation. Only positions THIS manager
+        # abandoned land here, so re-adoption can never pick up a T0/T3 leg
+        # or anything we don't own. Capped re-adopt positions stay stashed
+        # but won't be re-adopted again (see reconcile_with_chain).
+        self._abandoned[pos.token_id] = pos
+
+    def reconcile_with_chain(self, on_chain_positions: list[PositionSnapshot]) -> int:
+        """Re-adopt abandoned positions still held on-chain; prune the rest.
+
+        Called after a successful portfolio_sync. For each token we
+        previously abandoned:
+          - still on-chain AND under the re-adopt cap → move back into
+            `_positions` with a fresh retry budget so exits resume. Exposure
+            is owned by portfolio_sync (SET semantics), so re-adopting does
+            not double-book.
+          - no longer on-chain (settled / closed) → prune from the stash.
+          - on-chain but already hit `_MAX_READOPT` → leave stashed (the
+            operator owns it), don't re-adopt.
+
+        Returns the number of positions re-adopted this pass.
+        """
+        if not self._abandoned:
+            return 0
+        on_chain_sizes: dict[str, float] = {}
+        for snap in on_chain_positions:
+            size = max(0.0, float(getattr(snap, "size", 0.0) or 0.0))
+            if size > 0:
+                on_chain_sizes[str(snap.token_id)] = size
+        readopted = 0
+        with self._lock:
+            for token_id in list(self._abandoned.keys()):
+                pos = self._abandoned[token_id]
+                chain_size = on_chain_sizes.get(token_id, 0.0)
+                if chain_size <= 0:
+                    # Chain no longer holds it: settled or manually closed.
+                    self._abandoned.pop(token_id, None)
+                    LOG.info(
+                        "T2 放弃仓位已离链(结算/平仓)，清除追踪: token=%s", token_id[:16]
+                    )
+                    continue
+                if pos.readopt_count >= _MAX_READOPT:
+                    # Genuinely undisposable; leave for the operator.
+                    continue
+                if token_id in self._positions:
+                    # Somehow already re-tracked (e.g. a fresh fill); drop the
+                    # stale abandoned copy and let the live one win.
+                    self._abandoned.pop(token_id, None)
+                    continue
+                # Re-adopt with a fresh retry budget, syncing size to chain
+                # truth in case a partial exit did land before we gave up.
+                pos.abandoned = False
+                pos.exit_attempted = False
+                pos.exit_failure_count = 0
+                pos.next_exit_retry_ts = 0.0
+                pos.readopt_count += 1
+                pos.size_remaining = min(float(pos.size_remaining), chain_size) if pos.size_remaining > 0 else chain_size
+                self._positions[token_id] = pos
+                self._abandoned.pop(token_id, None)
+                readopted += 1
+                LOG.warning(
+                    "T2 放弃仓位重新接管(链上仍持有): token=%s size=%.4f 第%d次重试出场",
+                    token_id[:16],
+                    pos.size_remaining,
+                    pos.readopt_count,
+                )
+        return readopted
 
     def remove_position(self, token_id: str) -> None:
         with self._lock:
@@ -953,7 +1036,14 @@ def _sell_fill_size(trades: list[TradeRecord], token_id: str) -> float:
         if trade.token_id != token_id or trade.side != OrderSide.SELL:
             continue
         fill_size = trade.fill_size
-        if fill_size is None and trade.status in (TradeStatus.FILLED, TradeStatus.PARTIAL):
+        # When the CLOB response omits a fill amount we can only assume the
+        # full requested size for a *fully* FILLED order — that status means
+        # everything matched. For a PARTIAL we must NOT assume full size:
+        # crediting the whole request would zero out size_remaining and drop
+        # the position from tracking while on-chain tokens still exist
+        # (orphaned position + wrongly-released exposure). Fall back to 0 and
+        # let the next portfolio_sync reconcile the true remaining size.
+        if fill_size is None and trade.status == TradeStatus.FILLED:
             fill_size = trade.size
         if fill_size and fill_size > 0:
             total += float(fill_size)

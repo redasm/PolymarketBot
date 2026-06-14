@@ -137,7 +137,12 @@
       "mcp__chrome-devtools__list_pages",
       "mcp__chrome-devtools__navigate_page",
       "mcp__chrome-devtools__take_screenshot",
-      "mcp__chrome-devtools__take_snapshot"
+      "mcp__chrome-devtools__take_snapshot",
+      "Read(//app/**)",
+      "Bash(ls -d /app/*Data* /app/data)",
+      "Read(//e//**)",
+      "WebFetch(domain:github.com)",
+      "Bash(xargs wc -l)"
     ],
     "additionalDirectories": [
       "\\tmp"

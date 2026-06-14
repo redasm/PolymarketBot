@@ -213,6 +213,7 @@ def _refresh_portfolio_snapshot(
     event_recorder: EventRecorder,
     last_portfolio_sync_ts: float,
     forced: bool = False,
+    t2_exit_manager: "T2ExitManager | None" = None,
 ) -> tuple[float, bool]:
     """Refresh account ground truth and reconcile risk state.
 
@@ -242,6 +243,12 @@ def _refresh_portfolio_snapshot(
             realized_daily_pnl=snapshot.realized_daily_pnl,
             synced_at=snapshot.synced_at,
         )
+        readopted = 0
+        if t2_exit_manager is not None:
+            try:
+                readopted = t2_exit_manager.reconcile_with_chain(snapshot.positions)
+            except Exception as exc:  # pragma: no cover - defensive
+                LOG.warning("T2 放弃仓位对账失败: %s", exc)
         if event_recorder.is_enabled:
             event_recorder.write_event("risk_events", {
                 "event": "portfolio_sync",
@@ -250,6 +257,7 @@ def _refresh_portfolio_snapshot(
                 "positions": len(snapshot.positions),
                 "realized_daily_pnl": snapshot.realized_daily_pnl,
                 "synced_at": snapshot.synced_at,
+                "t2_readopted": readopted,
             })
         return snapshot.synced_at, True
     except Exception as exc:
@@ -272,6 +280,7 @@ def _handle_forced_portfolio_resync(
     risk_mgr: RiskManager,
     event_recorder: EventRecorder,
     last_portfolio_sync_ts: float,
+    t2_exit_manager: "T2ExitManager | None" = None,
 ) -> tuple[float, bool]:
     if not executor.consume_force_portfolio_resync():
         return last_portfolio_sync_ts, True
@@ -282,6 +291,7 @@ def _handle_forced_portfolio_resync(
         event_recorder=event_recorder,
         last_portfolio_sync_ts=last_portfolio_sync_ts,
         forced=True,
+        t2_exit_manager=t2_exit_manager,
     )
 
 
@@ -1289,6 +1299,7 @@ def main(dotenv_path: str | None = None) -> None:
                     risk_mgr=risk_mgr,
                     event_recorder=event_recorder,
                     last_portfolio_sync_ts=last_portfolio_sync_ts,
+                    t2_exit_manager=t2_exit_manager,
                 )
                 if not forced_sync_ok:
                     execution_blocked_by_forced_sync = True
@@ -1362,6 +1373,7 @@ def main(dotenv_path: str | None = None) -> None:
                     risk_mgr=risk_mgr,
                     event_recorder=event_recorder,
                     last_portfolio_sync_ts=last_portfolio_sync_ts,
+                    t2_exit_manager=t2_exit_manager,
                 )
                 if not forced_sync_ok:
                     break
@@ -1659,6 +1671,7 @@ def main(dotenv_path: str | None = None) -> None:
                 risk_mgr=risk_mgr,
                 event_recorder=event_recorder,
                 last_portfolio_sync_ts=last_portfolio_sync_ts,
+                t2_exit_manager=t2_exit_manager,
             )
 
         shadow_snapshot: dict[str, Any] = {}

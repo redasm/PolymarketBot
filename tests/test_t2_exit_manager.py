@@ -889,3 +889,52 @@ def test_cancelled_exit_with_fill_size_still_reduces_position() -> None:
 
     assert result.partial == 1
     assert mgr.open_positions["t-yes"].size_remaining == pytest.approx(1.0)
+
+
+# ---------- _sell_fill_size fallback (BUG-A) ---------------------------------
+
+
+def _sell_trade(token_id: str, *, status: TradeStatus, size: float, fill_size):
+    return TradeRecord(
+        trade_id="x",
+        arb_id="a",
+        token_id=token_id,
+        condition_id="c",
+        side=OrderSide.SELL,
+        price=0.5,
+        size=size,
+        status=status,
+        fill_size=fill_size,
+    )
+
+
+def test_sell_fill_size_filled_with_known_fill():
+    from polymarket_arb.strategies.t2_exit_manager import _sell_fill_size
+
+    trades = [_sell_trade("tok", status=TradeStatus.FILLED, size=100.0, fill_size=100.0)]
+    assert _sell_fill_size(trades, "tok") == pytest.approx(100.0)
+
+
+def test_sell_fill_size_filled_without_fill_falls_back_to_full():
+    # FILLED + unknown fill_size: the order fully matched, so crediting the
+    # full requested size is correct.
+    from polymarket_arb.strategies.t2_exit_manager import _sell_fill_size
+
+    trades = [_sell_trade("tok", status=TradeStatus.FILLED, size=100.0, fill_size=None)]
+    assert _sell_fill_size(trades, "tok") == pytest.approx(100.0)
+
+
+def test_sell_fill_size_partial_with_known_fill_uses_actual():
+    from polymarket_arb.strategies.t2_exit_manager import _sell_fill_size
+
+    trades = [_sell_trade("tok", status=TradeStatus.PARTIAL, size=100.0, fill_size=30.0)]
+    assert _sell_fill_size(trades, "tok") == pytest.approx(30.0)
+
+
+def test_sell_fill_size_partial_without_fill_is_zero_not_full():
+    # BUG-A regression: PARTIAL + unknown fill_size must NOT credit the full
+    # request (that would orphan the on-chain remainder). Conservatively 0.
+    from polymarket_arb.strategies.t2_exit_manager import _sell_fill_size
+
+    trades = [_sell_trade("tok", status=TradeStatus.PARTIAL, size=100.0, fill_size=None)]
+    assert _sell_fill_size(trades, "tok") == pytest.approx(0.0)

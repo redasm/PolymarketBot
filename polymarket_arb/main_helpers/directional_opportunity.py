@@ -217,7 +217,27 @@ def build_directional_opportunity_from_signal(
         )
         return None, 0.0, "zero_fillable_size"
 
-    gross_edge = abs(float(signal.payload.get("deviation", 0.0) or (signal.expected_edge / 10_000.0)))
+    # Anchor the gross edge to the *actual* fill price, not the mid.
+    # The signal's `deviation` is measured against the orderbook mid
+    # (`signal_collectors`: market_prob = snap.mid), but we buy at
+    # `execution_price` (VWAP over depth, >= best_ask). Using the raw
+    # deviation as gross edge silently skips the mid->ask half-spread plus
+    # depth slippage, systematically over-stating EV on wide-spread
+    # markets. Re-anchor to execution_price whenever the signal carries a
+    # model probability; fall back to the legacy deviation for signal
+    # sources that don't (e.g. wallet_alpha follows).
+    model_prob_raw = (signal.payload or {}).get("model_prob")
+    if model_prob_raw is not None:
+        model_prob = float(model_prob_raw)
+        # Standard T2 stores the YES-side fair value regardless of side, so
+        # a BUY_NO buys the complement token priced at `1 - model_prob`.
+        # UPDOWN already stores the chosen side's fair value -> no complement.
+        fair_target = 1.0 - model_prob if action == "BUY_NO" else model_prob
+        # May go negative when fair < fill price; downstream net_edge <= 0
+        # rejection (`edge_below_fee`) handles it correctly.
+        gross_edge = fair_target - float(execution_price)
+    else:
+        gross_edge = abs(float(signal.payload.get("deviation", 0.0) or (signal.expected_edge / 10_000.0)))
     fee_estimate = FeeStructure.for_market(config.polymarket_taker_fee_rate, market).estimate_price_fee(
         float(execution_price)
     )

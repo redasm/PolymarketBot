@@ -14,12 +14,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import pytest
+
 from polymarket_arb.models import (
     ArbOpportunity,
     MarketInfo,
     OrderBookLevel,
     OrderBookSnapshot,
     OrderSide,
+    PositionSnapshot,
     TokenInfo,
     TradeRecord,
     TradeStatus,
@@ -191,3 +194,59 @@ class TestAbandon:
         assert mgr._positions != {}
         # No release call has fired yet (floor dump is still trying).
         assert risk_mgr.releases == []
+
+
+class TestReconcileWithChain:
+    """BUG-B: abandoned positions still on-chain must be re-adopted."""
+
+    def _abandoned_manager(self):
+        from polymarket_arb.strategies.t2_exit_manager import _ABANDON_AFTER as _AB
+        executor = _AlwaysFailExecutor()
+        risk_mgr = _FakeRiskManager()
+        mgr = _make_manager(executor=executor, risk_manager=risk_mgr)
+        _run_failures(mgr, executor, _AB + 1)
+        assert mgr._positions == {}  # abandoned
+        assert "t-yes" in mgr._abandoned
+        return mgr, executor
+
+    def _chain_pos(self, size: float):
+        return PositionSnapshot(
+            token_id="t-yes", condition_id="c1", outcome="Yes",
+            size=size, avg_price=0.51,
+        )
+
+    def test_readopts_position_still_on_chain(self):
+        mgr, _ = self._abandoned_manager()
+        n = mgr.reconcile_with_chain([self._chain_pos(15.0)])
+        assert n == 1
+        assert "t-yes" in mgr._positions
+        assert "t-yes" not in mgr._abandoned
+        pos = mgr._positions["t-yes"]
+        assert pos.abandoned is False
+        assert pos.exit_failure_count == 0
+        assert pos.readopt_count == 1
+
+    def test_prunes_position_gone_from_chain(self):
+        mgr, _ = self._abandoned_manager()
+        n = mgr.reconcile_with_chain([])  # settled / closed off-chain
+        assert n == 0
+        assert "t-yes" not in mgr._positions
+        assert "t-yes" not in mgr._abandoned
+
+    def test_syncs_size_to_chain_truth(self):
+        mgr, _ = self._abandoned_manager()
+        # A partial exit landed before giving up: chain shows only 6 left.
+        mgr.reconcile_with_chain([self._chain_pos(6.0)])
+        assert mgr._positions["t-yes"].size_remaining == pytest.approx(6.0)
+
+    def test_readopt_capped(self):
+        from polymarket_arb.strategies.t2_exit_manager import _MAX_READOPT, _ABANDON_AFTER as _AB
+        mgr, executor = self._abandoned_manager()
+        # Cycle abandon -> readopt repeatedly; after _MAX_READOPT it stays put.
+        for _ in range(_MAX_READOPT):
+            assert mgr.reconcile_with_chain([self._chain_pos(15.0)]) == 1
+            _run_failures(mgr, executor, _AB + 1)  # fails again -> re-abandoned
+        # Now at the cap: further reconciles must NOT re-adopt.
+        assert mgr.reconcile_with_chain([self._chain_pos(15.0)]) == 0
+        assert "t-yes" in mgr._abandoned
+        assert "t-yes" not in mgr._positions
