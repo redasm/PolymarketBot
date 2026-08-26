@@ -443,6 +443,58 @@ class MarketScanner:
             LOG.info("UPDOWN slug 直查命中 %d 个市场（绕过 volume 过滤）", len(out))
         return list(out.values())
 
+    def fetch_weather_markets(
+        self,
+        *,
+        max_markets: int = 40,
+        max_total_sec: float = 12.0,
+    ) -> list[MarketInfo]:
+        """Probe Weather-tagged events so low-volume contracts are not lost.
+
+        The normal `/markets?order=volume_24hr` universe is biased toward
+        high-volume political markets. Weather contracts are often newly
+        listed and have little 24h volume, so an additive event probe mirrors
+        the UPDOWN discovery path. Parsing remains the normal MarketInfo
+        parser; failures are isolated and never break the main refresh.
+        """
+        if max_markets <= 0:
+            return []
+        session = _get_session()
+        deadline = time.monotonic() + max(0.0, float(max_total_sec))
+        out: dict[str, MarketInfo] = {}
+        for params in (
+            {"tag": "Weather", "active": "true", "closed": "false", "limit": min(max_markets, 100)},
+            {"slug_contains": "weather", "active": "true", "closed": "false", "limit": min(max_markets, 100)},
+            {"slug_contains": "temperature", "active": "true", "closed": "false", "limit": min(max_markets, 100)},
+        ):
+            if time.monotonic() >= deadline or len(out) >= max_markets:
+                break
+            try:
+                resp = session.get(f"{self._gamma_host}/events", params=params, timeout=min(8.0, max(1.0, deadline - time.monotonic())))
+                resp.raise_for_status()
+                rows = _load_json_payload(resp, expected_type=list, endpoint="Gamma /events weather")
+            except (requests.RequestException, APIResponseValidationError) as exc:
+                LOG.debug("天气事件探测失败 params=%s: %s", params, exc)
+                continue
+            for raw in rows:
+                event = _parse_event(raw) if isinstance(raw, dict) else None
+                if event is None:
+                    continue
+                for market in event.markets:
+                    text = f"{market.question} {market.slug} {event.title} {event.slug}".lower()
+                    if re.search(r"\b(?:weather|temperature|temp|degrees?)\b|°\s*f\b", text) is None:
+                        continue
+                    if market.active and not market.closed and len(market.tokens) == 2:
+                        self._market_cache[market.condition_id] = market
+                        out.setdefault(market.condition_id, market)
+                        if len(out) >= max_markets:
+                            break
+                if len(out) >= max_markets:
+                    break
+        if out:
+            LOG.info("天气事件探测命中 %d 个市场（绕过 volume 过滤）", len(out))
+        return list(out.values())
+
     def enrich_markets_with_research(
         self,
         markets: list[MarketInfo],

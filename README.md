@@ -716,6 +716,21 @@ python -m research.backtest.run --strategy wallet-alpha --dataset current_quant_
 
 本次结果：逻辑约束 `30/135` fills，净 PnL `-28.18`; 事件日历 `30/1080` fills，净 PnL `-51.80`; 钱包 alpha `10/400` fills，净 PnL `-17.27`。在这个假设样本里三者都不能进入实盘，只能说明 runner 和执行/markout 管线可用。
 
+### 天气策略（T2，默认关闭）
+
+天气策略参考天气仓库的“合约解析 → 集合预报 → 盘口/费用过滤”流程，使用 Gamma 的 Weather 事件探测低成交量天气合约，并通过 Open-Meteo GFS ensemble 估计未来 7 天内的最高/最低温度阈值或温度区间概率。信号以标准 `BUY_YES` / `BUY_NO` 进入现有 T2 执行和退出管理器，实际入场仍按盘口 VWAP 重新计算 edge。
+
+先在 dry-run 中启用并收集结算样本：
+
+```dotenv
+WEATHER_STRATEGY_ENABLED=true
+ARB_DRY_RUN=true
+WEATHER_MIN_EDGE=0.10
+WEATHER_MIN_CONFIDENCE=0.70
+```
+
+回测/实盘评估必须使用可成交 bid/VWAP 退出并记录实际费率；在至少一个完整结算周期的样本确认扣除费用、价差和滑点后仍为正之前，不要关闭 dry-run。
+
 ### 使用 tmux（远程服务器）
 
 ```bash

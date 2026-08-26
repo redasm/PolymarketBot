@@ -83,6 +83,12 @@ def is_updown_market(market: MarketInfo) -> bool:
     return outcomes == {"up", "down"}
 
 
+def is_weather_market(market: MarketInfo) -> bool:
+    """Conservative text classification for weather/temperature contracts."""
+    text = market_focus_text(market)
+    return bool(re.search(r"\b(?:weather|temperature|temp|degrees?)\b|°\s*f\b", text))
+
+
 def event_focus_text(event: Any) -> str:
     parts = [getattr(event, "title", ""), getattr(event, "slug", "")]
     for market in getattr(event, "markets", []) or []:
@@ -124,6 +130,7 @@ def matches_focus(text: str, keywords: list[str]) -> bool:
 def market_priority_score(
     market: MarketInfo,
     updown_boost: float = 0.0,
+    weather_boost: float = 0.0,
 ) -> tuple[float, float, float, float]:
     """Sort key: UPDOWN boost > binary > multi-outcome, then 24h volume, then liquidity.
 
@@ -133,9 +140,10 @@ def market_priority_score(
     term is constant and the ordering is identical to the pre-UPDOWN behaviour.
     """
     updown_term = updown_boost if (updown_boost > 0.0 and is_updown_market(market)) else 0.0
+    weather_term = weather_boost if (weather_boost > 0.0 and is_weather_market(market)) else 0.0
     binary_boost = 1.0 if len(market.tokens) == 2 else 0.0
     return (
-        updown_term,
+        updown_term + weather_term,
         binary_boost,
         float(market.volume_24h or 0.0),
         float(market.liquidity or 0.0),
@@ -159,12 +167,13 @@ def select_scan_candidates(
     *,
     focus_keywords: list[str] | None = None,
     updown_boost: float = 0.0,
+    weather_boost: float = 0.0,
 ) -> list[MarketInfo]:
     active = [
         market for market in markets
         if market.active and not market.closed and matches_focus(market_focus_text(market), focus_keywords or [])
     ]
-    active.sort(key=lambda m: market_priority_score(m, updown_boost), reverse=True)
+    active.sort(key=lambda m: market_priority_score(m, updown_boost, weather_boost), reverse=True)
     return active[:max_count]
 
 
@@ -191,6 +200,7 @@ def merge_focus_event_markets(
     *,
     focus_keywords: list[str] | None = None,
     updown_boost: float = 0.0,
+    weather_boost: float = 0.0,
 ) -> list[MarketInfo]:
     """Merge per-event markets into the flat market list.
 
@@ -221,7 +231,7 @@ def merge_focus_event_markets(
             merged.setdefault(market.condition_id, market)
 
     ranked = list(merged.values())
-    ranked.sort(key=lambda m: market_priority_score(m, updown_boost), reverse=True)
+    ranked.sort(key=lambda m: market_priority_score(m, updown_boost, weather_boost), reverse=True)
     return ranked[:max_count]
 
 
@@ -230,6 +240,7 @@ def select_ws_targets(
     max_count: int,
     *,
     updown_boost: float = 0.0,
+    weather_boost: float = 0.0,
 ) -> list[MarketInfo]:
     """Pick the top-N binary markets to mirror over WebSocket.
 
@@ -246,7 +257,8 @@ def select_ws_targets(
     use_updown = updown_boost > 0.0
     binary.sort(
         key=lambda m: (
-            1.0 if (use_updown and is_updown_market(m)) else 0.0,
+            (1.0 if (use_updown and is_updown_market(m)) else 0.0)
+            + (weather_boost if (weather_boost > 0.0 and is_weather_market(m)) else 0.0),
             m.volume_24h * m.liquidity,
         ),
         reverse=True,

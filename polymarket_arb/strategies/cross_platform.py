@@ -44,7 +44,7 @@ from polymarket_arb.models import FeeStructure
 LOG = logging.getLogger(__name__)
 
 KALSHI_API_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-DEFAULT_POLY_FEE_RATE = 0.02
+DEFAULT_POLY_FEE_RATE = 0.005
 DEFAULT_KALSHI_FEE_RATE = 0.003
 
 
@@ -172,9 +172,18 @@ class CrossPlatformScanner:
     3. 检测是否存在跨平台套利
     """
 
-    def __init__(self, kalshi: KalshiClient, poly_ob_analyzer: "OrderBookAnalyzer"):
+    def __init__(
+        self,
+        kalshi: KalshiClient,
+        poly_ob_analyzer: "OrderBookAnalyzer",
+        *,
+        poly_fee_rate: float = DEFAULT_POLY_FEE_RATE,
+        kalshi_fee_rate: float = DEFAULT_KALSHI_FEE_RATE,
+    ):
         self._kalshi = kalshi
         self._poly_ob = poly_ob_analyzer
+        self._poly_fee_rate = max(0.0, float(poly_fee_rate))
+        self._kalshi_fee_rate = max(0.0, float(kalshi_fee_rate))
         self._pairs: list[CrossPlatformPair] = []
 
     def add_pair(self, pair: CrossPlatformPair) -> None:
@@ -230,8 +239,8 @@ class CrossPlatformScanner:
 
         任一方向 cost < 1.0 (扣费后) → 套利
         """
-        poly_fee_rate = DEFAULT_POLY_FEE_RATE
-        kalshi_fee_rate = DEFAULT_KALSHI_FEE_RATE
+        poly_fee_rate = self._poly_fee_rate
+        kalshi_fee_rate = self._kalshi_fee_rate
 
         cost_a = pair.poly_yes_price + pair.kalshi_no_price
         cost_b = pair.poly_no_price + pair.kalshi_yes_price

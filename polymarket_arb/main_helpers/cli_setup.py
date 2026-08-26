@@ -179,7 +179,12 @@ def create_cross_platform_scanner(
         LOG.error("跨平台配对配置必须是 JSON list")
         return None
 
-    scanner = CrossPlatformScanner(KalshiClient(), ob_analyzer)
+    scanner = CrossPlatformScanner(
+        KalshiClient(),
+        ob_analyzer,
+        poly_fee_rate=config.polymarket_taker_fee_rate,
+        kalshi_fee_rate=config.kalshi_taker_fee_rate,
+    )
     scanner.load_pairs_from_config([item for item in pairs if isinstance(item, dict)])
     LOG.info("跨平台扫描器已启用: 配对=%d", len(getattr(scanner, "_pairs", [])))
     return scanner

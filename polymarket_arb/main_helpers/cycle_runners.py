@@ -82,6 +82,19 @@ def refresh_market_universe(
                 markets = markets + [m for m in updown if m.condition_id not in seen]
         except Exception:  # noqa: BLE001 - additive path, must not break refresh
             LOG.exception("UPDOWN 市场合并失败（忽略，不影响主 universe）")
+    # Weather contracts are also commonly low-volume at listing time. Probe
+    # the Weather-tagged event feed when the opt-in strategy is enabled and
+    # merge them before hot-pool ranking, otherwise they never reach T2.
+    if getattr(config, "weather_strategy_enabled", False):
+        try:
+            weather_markets = scanner.fetch_weather_markets(
+                max_markets=int(getattr(config, "weather_max_markets", 40) or 40),
+            )
+            if weather_markets:
+                seen = {m.condition_id for m in markets}
+                markets = markets + [m for m in weather_markets if m.condition_id not in seen]
+        except Exception:  # noqa: BLE001 - additive path, must not break refresh
+            LOG.exception("天气市场合并失败（忽略，不影响主 universe）")
     events = scanner.fetch_active_events(limit=max(50, config.hot_event_pool_size * 2))
     return markets, events, now, True
 

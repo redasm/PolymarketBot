@@ -1,4 +1,5 @@
 """从已下载的 parquet 计算 wallet profiles 并运行 wallet_alpha backtest."""
+import argparse
 import json, sys
 from collections import defaultdict
 from pathlib import Path
@@ -10,12 +11,19 @@ from research.backtest.adapters.quant_strategy_adapter import WalletAlphaBacktes
 from polymarket_arb.strategies.wallet_alpha import WalletProfile
 from research.backtest.execution_model.base import DepthVWAPExecutionModel, ExecutionModelConfig
 
-FEE_RATE = 0.02
+from polymarket_arb.config import ArbConfig
+FEE_RATE = ArbConfig.from_env(require_wallet=False).polymarket_taker_fee_rate
 MIN_TRADES = 10
-PROFILES_OUT = Path("data/quant_inputs/wallet_alpha_profiles.json")
+parser = argparse.ArgumentParser(description="Build wallet alpha profiles")
+parser.add_argument("--trades", type=Path, default=Path("analysis/wallet_trades_apr_jun2026.parquet"))
+parser.add_argument("--profiles-out", type=Path, default=Path("data/quant_inputs/wallet_alpha_profiles.json"))
+parser.add_argument("--fee-rate", type=float, default=FEE_RATE)
+args = parser.parse_args()
+FEE_RATE = args.fee_rate
+PROFILES_OUT = args.profiles_out
 
 # ── 1. 计算 profiles ────────────────────────────────────────────────────
-df = pd.read_parquet("analysis/wallet_trades_apr_jun2026.parquet")
+df = pd.read_parquet(args.trades)
 df["taker"] = df["taker"].str.lower()
 print(f"加载 {len(df):,} 笔交易，钱包数: {df['taker'].nunique()}")
 

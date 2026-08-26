@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import argparse
 import collections
 import json
 import sys
@@ -13,7 +14,7 @@ from pathlib import Path
 
 DATA = Path(__file__).resolve().parents[1] / "research/backtest/data/wallet_alpha_hf/market_snapshots.jsonl"
 ORDER_USDC = 10.0
-FEE_RATE = 0.02  # V2 taker fee rate（保守，与项目 polymarket_taker_fee_rate 同量级）
+FEE_RATE = 0.005
 
 
 def v2_fee(price: float, size: float) -> float:
@@ -68,6 +69,13 @@ def agg(name, recs):
 
 
 def main() -> None:
+    global DATA, ORDER_USDC, FEE_RATE
+    parser = argparse.ArgumentParser(description="Validate wallet alpha through settlement")
+    parser.add_argument("--data", type=Path, default=DATA)
+    parser.add_argument("--order-usdc", type=float, default=ORDER_USDC)
+    parser.add_argument("--fee-rate", type=float, default=FEE_RATE)
+    args = parser.parse_args()
+    DATA, ORDER_USDC, FEE_RATE = args.data, args.order_usdc, args.fee_rate
     rows = [json.loads(l) for l in open(DATA, encoding="utf-8-sig") if l.strip()]
     recs = simulate(rows)
     print(f"=== Wallet-alpha 跟单到结算 (订单${ORDER_USDC}, fee_rate={FEE_RATE}) ===")

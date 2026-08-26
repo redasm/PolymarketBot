@@ -743,17 +743,59 @@ def _directional_realized_pnl(
         return 0.0, {"exit_price": None, "markout_bps": None}
     action = str(signal.payload.get("action", "BUY_YES")).upper()
     prefix = "no" if action == "BUY_NO" else "yes"
-    exit_mid = _mid(exit_row.get(f"{prefix}_best_bid"), exit_row.get(f"{prefix}_best_ask"))
-    if exit_mid is None:
+    exit_price = _executable_bid_price(
+        exit_row.get(f"{prefix}_best_bid"),
+        exit_row.get(f"{prefix}_bid_size"),
+        exit_row.get(f"{prefix}_bid_levels"),
+        filled_size,
+    )
+    if exit_price is None:
         return 0.0, {"exit_price": None, "markout_bps": None}
-    gross = (exit_mid - execution_price) * filled_size
-    exit_fee = estimate_binary_clob_fee(exit_mid, filled_size, exit_fee_rate)
+    gross = (exit_price - execution_price) * filled_size
+    exit_fee = estimate_binary_clob_fee(exit_price, filled_size, exit_fee_rate)
     pnl = gross - entry_fees - exit_fee
-    markout_bps = ((exit_mid - execution_price) / execution_price) * 10_000.0 if execution_price > 0 else None
-    return pnl, {"exit_price": exit_mid, "markout_bps": markout_bps}
+    markout_bps = ((exit_price - execution_price) / execution_price) * 10_000.0 if execution_price > 0 else None
+    return pnl, {"exit_price": exit_price, "markout_bps": markout_bps}
 
 
 def _mid(bid: Any, ask: Any) -> float | None:
     if bid is None or ask is None:
         return None
     return (float(bid) + float(ask)) / 2.0
+
+
+def _executable_bid_price(
+    best_bid: Any,
+    best_size: Any,
+    levels: Any,
+    target_size: float,
+) -> float | None:
+    """Return sell VWAP at executable bids; never mark exits at midpoint."""
+    try:
+        fallback_price = float(best_bid) if best_bid is not None else 0.0
+        fallback_size = float(best_size or 0.0)
+    except (TypeError, ValueError):
+        return None
+    parsed: list[tuple[float, float]] = []
+    if isinstance(levels, list):
+        for item in levels:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                try:
+                    parsed.append((float(item[0]), float(item[1])))
+                except (TypeError, ValueError):
+                    continue
+    if not parsed and fallback_price > 0 and fallback_size > 0:
+        parsed = [(fallback_price, fallback_size)]
+    remaining = max(0.0, float(target_size))
+    if remaining <= 0 or not parsed:
+        return None
+    value = filled = 0.0
+    for price, size in parsed:
+        take = min(max(0.0, size), remaining - filled)
+        if take <= 0:
+            continue
+        value += take * price
+        filled += take
+        if filled >= remaining - 1e-9:
+            break
+    return value / filled if filled > 0 else None

@@ -171,6 +171,10 @@ from polymarket_arb.volatility_estimator import VolEstimator
 from polymarket_arb.websocket_feed import OrderBookMirror, WebSocketFeed
 from polymarket_arb.spot_feed import BinanceSpotFeed, parse_spot_pairs
 from polymarket_arb.strategies.updown_pricer import UpdownPricer
+from polymarket_arb.strategies.weather_strategy import (
+    OpenMeteoEnsembleProvider,
+    collect_weather_strategy_signals as _collect_weather_strategy_signals,
+)
 
 if TYPE_CHECKING:
     from research_signal.service import ResearchSignalService
@@ -434,6 +438,17 @@ def main(dotenv_path: str | None = None) -> None:
             LOG.warning("T2 UPDOWN 现货 feed 启动失败,回退 Phase 1: %s", e)
             spot_feed = None
             updown_pricer = None
+    weather_provider: Optional[OpenMeteoEnsembleProvider] = None
+    if getattr(config, "weather_strategy_enabled", False):
+        weather_provider = OpenMeteoEnsembleProvider(
+            ttl_sec=config.weather_forecast_ttl_sec,
+            timeout_sec=config.weather_request_timeout_sec,
+        )
+        LOG.info(
+            "天气 T2 已启用（Open-Meteo GFS ensemble，min_edge=%.1f%%，min_confidence=%.2f）",
+            config.weather_min_edge * 100.0,
+            config.weather_min_confidence,
+        )
     maker_strategy = MakerStrategy(
         spread_calc=DynamicSpreadCalculator(vol_estimator=vol_estimator),
         default_size=config.default_order_size_usdc,
@@ -826,12 +841,14 @@ def main(dotenv_path: str | None = None) -> None:
             updown_boost = (
                 config.t2_updown_priority_boost if config.t2_updown_enabled else 0.0
             )
+            weather_boost = 2.0 if getattr(config, "weather_strategy_enabled", False) else 0.0
             if universe_refreshed or not cached_scanned_markets:
                 scanned_markets = _select_scan_candidates(
                     cached_universe_markets,
                     config.hot_market_pool_size,
                     focus_keywords=focus_keywords,
                     updown_boost=updown_boost,
+                    weather_boost=weather_boost,
                 )
                 event_candidates = _select_event_candidates(
                     cached_universe_events,
@@ -844,6 +861,7 @@ def main(dotenv_path: str | None = None) -> None:
                     config.hot_market_pool_size,
                     focus_keywords=focus_keywords,
                     updown_boost=updown_boost,
+                    weather_boost=weather_boost,
                 )
                 cached_scanned_markets = scanned_markets
                 cached_event_candidates = event_candidates
@@ -863,6 +881,7 @@ def main(dotenv_path: str | None = None) -> None:
                         scanned_markets,
                         config.ws_max_markets,
                         updown_boost=updown_boost,
+                        weather_boost=weather_boost,
                     )
                     if targets:
                         new_ids = sorted(t.token_id for m in targets for t in m.tokens)
@@ -1121,6 +1140,15 @@ def main(dotenv_path: str | None = None) -> None:
             updown_pricer=updown_pricer,
         )
         strategy_signals.extend(statistical_signals)
+        if weather_provider is not None:
+            strategy_signals.extend(
+                _collect_weather_strategy_signals(
+                    config=config,
+                    candidate_markets=scanned_markets,
+                    ob_analyzer=ob_analyzer,
+                    provider=weather_provider,
+                )
+            )
         strategy_signals.extend(
             _collect_logical_constraint_strategy_signals(
                 config=config,

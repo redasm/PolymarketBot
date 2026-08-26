@@ -1,0 +1,10 @@
+https://github.com/HarrierOnChain/Prediction-Markets-Trading-Bot-Toolkits/tree/main
+https://github.com/suislanchez/polymarket-kalshi-weather-bot
+https://github.com/MoonsatProtocol/Polymarket-Weather-Bot
+https://github.com/yangyuan-zhen/PolyWeather
+https://github.com/nicolastinkl/hermes_weatherbot
+https://github.com/AruneshDev/Automated-Trading-System-Kalshi-Weather-Model
+https://github.com/bwjoke/BTC-Trading-Since-2020
+https://github.com/warproxxx/poly_data
+https://github.com/warproxxx/poly-maker
+https://github.com/MrFadiAi/Polymarket-bot

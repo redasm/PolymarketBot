@@ -1,7 +1,11 @@
+import argparse
 import json, glob, os
 from collections import defaultdict
 
-BASE = "E:/PolymarketData/6.2-6.5/data/telemetry"
+parser = argparse.ArgumentParser(description="Detailed position lifecycle PnL analysis")
+parser.add_argument("--telemetry-dir", default="data/telemetry")
+args = parser.parse_args()
+BASE = args.telemetry_dir
 
 # ── positions_lifecycle: 只取 closed ─────────────────────────────────────────
 closed = []

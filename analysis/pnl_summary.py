@@ -1,6 +1,10 @@
+import argparse
 import json, glob, os
 
-BASE = "E:/PolymarketData/6.2-6.5/data/telemetry"
+parser = argparse.ArgumentParser(description="Summarize bot telemetry")
+parser.add_argument("--telemetry-dir", default="data/telemetry")
+args = parser.parse_args()
+BASE = args.telemetry_dir
 
 # ── 1. virtual_fills ──────────────────────────────────────────────────────────
 fills = []

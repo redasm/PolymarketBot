@@ -433,6 +433,17 @@ class ArbConfig:
     wallet_alpha_shadow_max_signals_per_cycle: int = 5
     wallet_alpha_shadow_max_exec_ms_per_cycle: float = 250.0
 
+    # Weather strategy (opt-in). Forecasts are external and must remain
+    # shadow/dry-run until settlement data proves positive net expectancy.
+    weather_strategy_enabled: bool = False
+    weather_min_edge: float = 0.10
+    weather_min_confidence: float = 0.70
+    weather_max_spread_bps: float = 180.0
+    weather_min_top_depth: float = 25.0
+    weather_forecast_ttl_sec: float = 900.0
+    weather_request_timeout_sec: float = 10.0
+    weather_max_markets: int = 40
+
     def __post_init__(self) -> None:
         self.validate()
 
@@ -482,6 +493,16 @@ class ArbConfig:
             raise ValueError("POLYMARKET_TAKER_FEE_RATE 必须在 [0, 1) 区间")
         if not 0 <= self.kalshi_taker_fee_rate < 1:
             raise ValueError("KALSHI_TAKER_FEE_RATE 必须在 [0, 1) 区间")
+        if not 0 <= self.weather_min_edge < 1:
+            raise ValueError("WEATHER_MIN_EDGE 必须在 [0, 1) 区间")
+        if not 0 <= self.weather_min_confidence <= 1:
+            raise ValueError("WEATHER_MIN_CONFIDENCE 必须在 [0, 1] 区间")
+        if self.weather_max_spread_bps < 0 or self.weather_min_top_depth < 0:
+            raise ValueError("WEATHER_MAX_SPREAD_BPS 和 WEATHER_MIN_TOP_DEPTH 不能为负数")
+        if self.weather_forecast_ttl_sec <= 0 or self.weather_request_timeout_sec <= 0:
+            raise ValueError("天气预测缓存和请求超时必须大于 0")
+        if self.weather_max_markets < 0:
+            raise ValueError("WEATHER_MAX_MARKETS 不能为负数")
         if self.market_universe_refresh_sec <= 0:
             raise ValueError("ARB_MARKET_UNIVERSE_REFRESH_SEC 必须大于 0")
         if self.hot_market_pool_size <= 0:
@@ -764,7 +785,11 @@ class ArbConfig:
             orderbook_retry_delay_sec=_env_float("ORDERBOOK_RETRY_DELAY_SEC", 0.15),
             orderbook_missing_cooldown_sec=_env_float("ORDERBOOK_MISSING_COOLDOWN_SEC", 300.0),
             cross_platform_pairs_json=_env("CROSS_PLATFORM_PAIRS_JSON", ""),
-            polymarket_taker_fee_rate=_env_float("POLYMARKET_TAKER_FEE_RATE", 0.05),
+            # Polymarket's current binary taker baseline is 0.5%. Keep the
+            # fallback aligned with `.env.example`; a 5% fallback silently
+            # changes signal admission and makes offline/live results diverge
+            # by an order of magnitude.
+            polymarket_taker_fee_rate=_env_float("POLYMARKET_TAKER_FEE_RATE", 0.005),
             kalshi_taker_fee_rate=_env_float("KALSHI_TAKER_FEE_RATE", 0.003),
             max_multi_outcome_legs=_env_int("ARB_MAX_MULTI_OUTCOME_LEGS", 20),
             t0_min_multi_outcome_median_leg_price=_env_float("T0_MIN_MULTI_OUTCOME_MEDIAN_LEG_PRICE", 0.05),
@@ -987,6 +1012,14 @@ class ArbConfig:
                 "WALLET_ALPHA_SHADOW_MAX_EXEC_MS_PER_CYCLE",
                 250.0,
             ),
+            weather_strategy_enabled=_env_bool("WEATHER_STRATEGY_ENABLED", False),
+            weather_min_edge=_env_float("WEATHER_MIN_EDGE", 0.10),
+            weather_min_confidence=_env_float("WEATHER_MIN_CONFIDENCE", 0.70),
+            weather_max_spread_bps=_env_float("WEATHER_MAX_SPREAD_BPS", 180.0),
+            weather_min_top_depth=_env_float("WEATHER_MIN_TOP_DEPTH", 25.0),
+            weather_forecast_ttl_sec=_env_float("WEATHER_FORECAST_TTL_SEC", 900.0),
+            weather_request_timeout_sec=_env_float("WEATHER_REQUEST_TIMEOUT_SEC", 10.0),
+            weather_max_markets=_env_int("WEATHER_MAX_MARKETS", 40),
         )
 
         LOG.info(

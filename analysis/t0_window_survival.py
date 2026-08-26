@@ -8,12 +8,12 @@
 from __future__ import annotations
 
 import collections
+import argparse
 import json
 import statistics
-import sys
 from pathlib import Path
 
-FEE = 0.02
+FEE = 0.005
 
 
 def vfee(p: float) -> float:
@@ -96,10 +96,17 @@ def process_file(path: Path, windows: list):
 
 
 def main():
-    tick_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/e/PolymarketData/6.6-6.12/data/ticks")
+    global FEE
+    parser = argparse.ArgumentParser(description="Measure executable T0 window survival")
+    parser.add_argument("--ticks-dir", type=Path, default=Path("data/ticks"))
+    parser.add_argument("--max-files", type=int, default=0)
+    parser.add_argument("--fee-rate", type=float, default=0.005)
+    args = parser.parse_args()
+    FEE = args.fee_rate
+    tick_dir = args.ticks_dir
     files = sorted(tick_dir.glob("*.ndjson"))
-    if len(sys.argv) > 2:
-        files = files[: int(sys.argv[2])]
+    if args.max_files > 0:
+        files = files[: args.max_files]
     windows = []
     for fp in files:
         print(f"processing {fp.name} ...", file=sys.stderr)

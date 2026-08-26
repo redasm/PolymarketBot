@@ -15,3 +15,5 @@ positions_snapshot.json
 data/
 .tmp_selftest*/
 research/backtest/output/
+.pytest-tmp*/
+AppProjectPolymarketBot.pytest-tmp-local*/
