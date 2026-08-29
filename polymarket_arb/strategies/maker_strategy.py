@@ -8,8 +8,12 @@
    如果你做 maker，费率为 0 → 相当于 edge 提升 2 个百分点
 
 2. 流动性奖励:
-   Polymarket 对在 δ (rewards_max_spread/2) 范围内挂单给予积分激励
-   这是额外收入来源
+   Polymarket 对落在 [mid - δ, mid + δ] 内、且规模 >= rewards_min_size
+   的挂单发放流动性奖励。δ 由市场自身的 rewards_max_spread 决定
+   （该字段以 cent 计价，价格空间 δ = rewards_max_spread * 0.01）。
+   参数来自 CLOB /rewards/markets/{condition_id}，由 RewardsClient
+   缓存后经 compute_quote(reward_delta=...) 传入 —— 传 0 或不传就是
+   "不知道奖励带"，报价退回纯 fair value（历史行为）。
 
 3. 信息优势变现:
    当你有概率模型时，不是等 mispricing 出现再吃单
@@ -234,12 +238,14 @@ class MakerStrategy:
 
         delta = reward_delta or self._reward_delta
         if delta > 0 and mid_price is not None:
-            reward_lo = mid_price - delta
-            reward_hi = mid_price + delta
-            if bid_price is not None and bid_price < reward_lo:
-                bid_price = self._align_to_tick(reward_lo, tick_size, round_down=False)
-            if ask_price is not None and ask_price > reward_hi:
-                ask_price = self._align_to_tick(reward_hi, tick_size, round_down=True)
+            bid_price, ask_price = self._apply_reward_band(
+                bid_price,
+                ask_price,
+                mid_price=mid_price,
+                delta=delta,
+                tick_size=tick_size,
+                fair_value=fair_value,
+            )
 
         bid_sz = self._default_size
         ask_sz = self._default_size
@@ -274,6 +280,62 @@ class MakerStrategy:
             spread=spread,
             fair_value=fair_value,
         )
+
+    def _apply_reward_band(
+        self,
+        bid_price: Optional[float],
+        ask_price: Optional[float],
+        *,
+        mid_price: float,
+        delta: float,
+        tick_size: float,
+        fair_value: float,
+    ) -> tuple[Optional[float], Optional[float]]:
+        """把报价收进流动性奖励的计分区间.
+
+        计分区间是 mid 两侧各 δ，且方向分开:
+          BUY  计分区间 = [mid - δ, mid]
+          SELL 计分区间 = [mid, mid + δ]
+
+        两个易错点:
+
+        1. **必须双向收窄**。旧实现只把过低的 bid 抬到带下沿、把过高的
+           ask 压到带上沿。当模型 fair value 明显偏离盘口时（例如
+           fair=0.60 / mid=0.50），原始 bid 会落在 mid 之上，而 ask 被
+           压回 mid + δ —— 结果 bid > ask，报出一个交叉的报价。δ 恒为 0
+           时这段代码从不执行，所以这个缺陷一直没暴露。收进各自的半带
+           之后 bid <= mid <= ask 天然成立，交叉不可能发生。
+
+        2. **收窄不能制造负期望的一侧**。把 ask 压到 mid + δ 可能让它
+           低于模型 fair value —— 那是在用低于自己估值的价格卖。这种
+           情况下正确做法是**撤掉这一侧**（只报另一侧），而不是为了拿
+           奖励去挂一个负 EV 的单。
+        """
+        reward_lo = mid_price - delta
+        reward_hi = mid_price + delta
+
+        if bid_price is not None:
+            bounded = min(max(bid_price, reward_lo), mid_price)
+            bounded = self._align_to_tick(bounded, tick_size, round_down=True)
+            if bounded < reward_lo:
+                bounded = self._align_to_tick(reward_lo, tick_size, round_down=False)
+            # 挂在高于自己估值的价位买 = 负期望，宁可不挂。
+            bid_price = bounded if bounded <= fair_value else None
+
+        if ask_price is not None:
+            bounded = max(min(ask_price, reward_hi), mid_price)
+            bounded = self._align_to_tick(bounded, tick_size, round_down=False)
+            if bounded > reward_hi:
+                bounded = self._align_to_tick(reward_hi, tick_size, round_down=True)
+            # 挂在低于自己估值的价位卖 = 负期望，宁可不挂。
+            ask_price = bounded if bounded >= fair_value else None
+
+        if bid_price is not None and ask_price is not None and bid_price >= ask_price:
+            # 带宽窄于一个 tick，两侧对齐到同一格。保留买侧（库存为零
+            # 时先建仓比先出货更符合做市起手），撤掉卖侧。
+            ask_price = None
+
+        return bid_price, ask_price
 
     def update_inventory(self, token_id: str, side: str, size: float) -> None:
         """成交后更新库存."""

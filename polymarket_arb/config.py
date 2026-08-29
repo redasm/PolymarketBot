@@ -444,6 +444,27 @@ class ArbConfig:
     weather_request_timeout_sec: float = 10.0
     weather_max_markets: int = 40
 
+    # T3 流动性奖励带 (CLOB /rewards/markets/{condition_id})。
+    # rewards_max_spread 以 cent 计价，换算成价格空间半宽 δ 后约束
+    # maker 报价，使挂单真正落在计分区间内。关掉即回到"不知道奖励带"
+    # 的历史行为（δ=0，纯 fair-value 报价）。
+    maker_rewards_enabled: bool = True
+    maker_rewards_ttl_sec: float = 900.0
+    maker_rewards_negative_ttl_sec: float = 300.0
+    maker_rewards_timeout_sec: float = 5.0
+    # 单周期最多为多少个新市场拉取奖励参数（限制串行网络调用）。
+    maker_rewards_prefetch_per_cycle: int = 20
+    # true = 只在有奖励带的市场做市（默认 false，不改变现有覆盖面）。
+    maker_rewards_only: bool = False
+
+    # T3 挂单计分校验 (CLOB /orders-scoring)。挂在带内不等于真计分，
+    # 这是"T3 到底有没有在赚奖励"的唯一客观指标。
+    maker_scoring_audit_enabled: bool = True
+    maker_scoring_audit_interval_sec: float = 60.0
+    # 连续 grace 秒未计分的挂单是否撤掉（默认只观测不动作）。
+    maker_scoring_cancel_unscored: bool = False
+    maker_scoring_unscored_grace_sec: float = 90.0
+
     def __post_init__(self) -> None:
         self.validate()
 
@@ -624,6 +645,18 @@ class ArbConfig:
             raise ValueError("MAKER_TAKE_PROFIT_BPS 不能为负数")
         if self.maker_exit_eval_interval_sec < 0:
             raise ValueError("MAKER_EXIT_EVAL_INTERVAL_SEC 不能为负数")
+        if self.maker_rewards_ttl_sec < 0:
+            raise ValueError("MAKER_REWARDS_TTL_SEC 不能为负数")
+        if self.maker_rewards_negative_ttl_sec < 0:
+            raise ValueError("MAKER_REWARDS_NEGATIVE_TTL_SEC 不能为负数")
+        if self.maker_rewards_timeout_sec <= 0:
+            raise ValueError("MAKER_REWARDS_TIMEOUT_SEC 必须大于 0")
+        if self.maker_rewards_prefetch_per_cycle < 0:
+            raise ValueError("MAKER_REWARDS_PREFETCH_PER_CYCLE 不能为负数")
+        if self.maker_scoring_audit_interval_sec < 0:
+            raise ValueError("MAKER_SCORING_AUDIT_INTERVAL_SEC 不能为负数")
+        if self.maker_scoring_unscored_grace_sec < 0:
+            raise ValueError("MAKER_SCORING_UNSCORED_GRACE_SEC 不能为负数")
         if self.t2_scale_out_tranches < 1:
             raise ValueError("T2_SCALE_OUT_TRANCHES 必须 >= 1")
         if self.t2_stop_loss_dynamic_k < 0:
@@ -921,6 +954,26 @@ class ArbConfig:
             maker_take_profit_bps=_env_float("MAKER_TAKE_PROFIT_BPS", 200.0),
             maker_exit_eval_interval_sec=_env_float(
                 "MAKER_EXIT_EVAL_INTERVAL_SEC", 30.0
+            ),
+            maker_rewards_enabled=_env_bool("MAKER_REWARDS_ENABLED", True),
+            maker_rewards_ttl_sec=_env_float("MAKER_REWARDS_TTL_SEC", 900.0),
+            maker_rewards_negative_ttl_sec=_env_float(
+                "MAKER_REWARDS_NEGATIVE_TTL_SEC", 300.0
+            ),
+            maker_rewards_timeout_sec=_env_float("MAKER_REWARDS_TIMEOUT_SEC", 5.0),
+            maker_rewards_prefetch_per_cycle=_env_int(
+                "MAKER_REWARDS_PREFETCH_PER_CYCLE", 20
+            ),
+            maker_rewards_only=_env_bool("MAKER_REWARDS_ONLY", False),
+            maker_scoring_audit_enabled=_env_bool("MAKER_SCORING_AUDIT_ENABLED", True),
+            maker_scoring_audit_interval_sec=_env_float(
+                "MAKER_SCORING_AUDIT_INTERVAL_SEC", 60.0
+            ),
+            maker_scoring_cancel_unscored=_env_bool(
+                "MAKER_SCORING_CANCEL_UNSCORED", False
+            ),
+            maker_scoring_unscored_grace_sec=_env_float(
+                "MAKER_SCORING_UNSCORED_GRACE_SEC", 90.0
             ),
             tick_record_enabled=_env_bool("TICK_RECORD_ENABLED", False),
             tick_record_dir=_env("TICK_RECORD_DIR", "data/ticks"),

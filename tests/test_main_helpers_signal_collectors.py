@@ -788,3 +788,109 @@ def test_collect_maker_omits_flow_bias_when_aggregator_has_no_data():
 
     assert len(out) == 1
     assert "flow_bias" not in out[0].payload
+
+
+# --------- T3: 流动性奖励带 ----------
+
+
+def _reward_cfg(delta: float, min_size: float = 0.0):
+    return SimpleNamespace(reward_delta=delta, rewards_min_size=min_size)
+
+
+def test_maker_passes_reward_delta_to_compute_quote():
+    snapshots = {"m-yes": _balanced_snapshot("m-yes", mid=0.50)}
+    maker = _StubMaker(quote=_maker_quote())
+    out = collect_maker_strategy_signals(
+        candidate_markets=[_binary_market("m")],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        maker_strategy=maker,
+        fair_values_by_market={"m": 0.50},
+        reward_config_provider=lambda cid: _reward_cfg(0.03),
+    )
+    assert len(out) == 1
+    assert maker.calls[0]["reward_delta"] == pytest.approx(0.03)
+    band = out[0].payload["reward_band"]
+    assert band["incentivized"] is True
+    assert band["delta"] == pytest.approx(0.03)
+    assert band["band_lo"] == pytest.approx(0.47)
+    assert band["band_hi"] == pytest.approx(0.53)
+    assert band["bid_in_band"] is True
+    assert band["ask_in_band"] is True
+
+
+def test_maker_without_provider_keeps_legacy_behaviour():
+    """没有 provider 时 δ 必须是 None —— 等价于历史的"不知道奖励带"."""
+    snapshots = {"m-yes": _balanced_snapshot("m-yes", mid=0.50)}
+    maker = _StubMaker(quote=_maker_quote())
+    out = collect_maker_strategy_signals(
+        candidate_markets=[_binary_market("m")],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        maker_strategy=maker,
+        fair_values_by_market={"m": 0.50},
+    )
+    assert maker.calls[0]["reward_delta"] is None
+    assert out[0].payload["reward_band"] == {"delta": 0.0, "incentivized": False}
+
+
+def test_maker_reward_provider_failure_does_not_block_quote():
+    def _boom(_cid):
+        raise RuntimeError("rewards api down")
+
+    snapshots = {"m-yes": _balanced_snapshot("m-yes", mid=0.50)}
+    maker = _StubMaker(quote=_maker_quote())
+    out = collect_maker_strategy_signals(
+        candidate_markets=[_binary_market("m")],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        maker_strategy=maker,
+        fair_values_by_market={"m": 0.50},
+        reward_config_provider=_boom,
+    )
+    assert len(out) == 1
+    assert maker.calls[0]["reward_delta"] is None
+
+
+def test_maker_flags_quote_outside_reward_band():
+    snapshots = {"m-yes": _balanced_snapshot("m-yes", mid=0.50)}
+    maker = _StubMaker(quote=_maker_quote(bid=0.40, ask=0.60))
+    out = collect_maker_strategy_signals(
+        candidate_markets=[_binary_market("m")],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        maker_strategy=maker,
+        fair_values_by_market={"m": 0.50},
+        reward_config_provider=lambda cid: _reward_cfg(0.01),
+    )
+    band = out[0].payload["reward_band"]
+    assert band["bid_in_band"] is False
+    assert band["ask_in_band"] is False
+
+
+def test_maker_records_min_size_eligibility():
+    snapshots = {"m-yes": _balanced_snapshot("m-yes", mid=0.50)}
+    maker = _StubMaker(quote=_maker_quote(bid_size=5.0, ask_size=6.0))
+    out = collect_maker_strategy_signals(
+        candidate_markets=[_binary_market("m")],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        maker_strategy=maker,
+        fair_values_by_market={"m": 0.50},
+        reward_config_provider=lambda cid: _reward_cfg(0.03, min_size=50.0),
+    )
+    band = out[0].payload["reward_band"]
+    assert band["min_size"] == pytest.approx(50.0)
+    assert band["min_size_ok"] is False
+
+
+def test_maker_rewards_only_skips_unincentivized_markets():
+    snapshots = {"m-yes": _balanced_snapshot("m-yes", mid=0.50)}
+    maker = _StubMaker(quote=_maker_quote())
+    out = collect_maker_strategy_signals(
+        candidate_markets=[_binary_market("m")],
+        ob_analyzer=_StubBookAnalyzer(snapshots),
+        maker_strategy=maker,
+        fair_values_by_market={"m": 0.50},
+        reward_config_provider=lambda cid: None,
+        rewards_only=True,
+    )
+    assert out == []
+    assert maker.calls == []
+    summary = collect_maker_strategy_signals.last_skip_summary
+    assert summary["reasons"].get("no_reward_band") == 1

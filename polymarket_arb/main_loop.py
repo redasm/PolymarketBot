@@ -140,6 +140,7 @@ from polymarket_arb.main_helpers.scan_focus import (
     select_ws_targets as _select_ws_targets,
 )
 from polymarket_arb.market_scanner import MarketScanner
+from polymarket_arb.rewards_client import RewardsClient
 from polymarket_arb.models import (
     MarketInfo,
     ResearchSignalReport,
@@ -454,6 +455,15 @@ def main(dotenv_path: str | None = None) -> None:
         default_size=config.default_order_size_usdc,
         max_inventory=max(config.max_exposure_per_market, config.default_order_size_usdc),
         flow_inventory_weight=config.t3_flow_bias_inventory_weight,
+    )
+    # T3 流动性奖励带。缓存 + 后台预热，扫描热路径只读缓存，拿不到
+    # 就退回 δ=0（历史行为）。maker 关闭时不建客户端。
+    rewards_client = RewardsClient(
+        config.clob_host,
+        timeout_sec=config.maker_rewards_timeout_sec,
+        ttl_sec=config.maker_rewards_ttl_sec,
+        negative_ttl_sec=config.maker_rewards_negative_ttl_sec,
+        enabled=config.maker_rewards_enabled and config.maker_strategy_enabled,
     )
     cross_platform_scanner = _create_cross_platform_scanner(config, ob_analyzer)
     tick_recorder = TickRecorder(
@@ -1204,16 +1214,25 @@ def main(dotenv_path: str | None = None) -> None:
             for signal in statistical_signals
             if signal.payload.get("model_prob") is not None
         }
+        if rewards_client.enabled:
+            # 只排队，不阻塞：本周期用得上的是已缓存的那些，新市场的
+            # 奖励参数下个周期才生效（δ=0 期间等价于旧行为）。
+            rewards_client.request(
+                [market.condition_id for market in scanned_markets],
+                max_pending=max(1, config.maker_rewards_prefetch_per_cycle * 10),
+            )
         maker_signals = (
             _collect_maker_strategy_signals(
                 candidate_markets=scanned_markets,
                 ob_analyzer=ob_analyzer,
                 maker_strategy=maker_strategy,
                 fair_values_by_market=fair_values_by_market,
-            detector=statistical_detector,
-            flow_aggregator=flow_aggregator,
-            event_baselines=quant_inputs.event_baselines_json,
-        )
+                detector=statistical_detector,
+                flow_aggregator=flow_aggregator,
+                event_baselines=quant_inputs.event_baselines_json,
+                reward_config_provider=rewards_client.cached,
+                rewards_only=config.maker_rewards_only,
+            )
             if config.maker_strategy_enabled
             else []
         )
@@ -1876,6 +1895,7 @@ def main(dotenv_path: str | None = None) -> None:
     if spot_feed is not None:
         spot_feed.stop()
         LOG.info("Binance 现货 feed 已停止")
+    rewards_client.close()
     if research_refresh_state.pending_future is not None:
         research_refresh_state.pending_future.cancel()
     if research_executor is not None:

@@ -22,7 +22,7 @@ import logging
 import json
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from polymarket_arb.config import ArbConfig
 from polymarket_arb.main_helpers.flow_aggregator import FlowAggregator
@@ -869,6 +869,8 @@ def collect_maker_strategy_signals(
     detector: StatisticalMispricingDetector | None = None,
     flow_aggregator: FlowAggregator | None = None,
     event_baselines: dict[str, dict[str, Any]] | str | None = None,
+    reward_config_provider: Callable[[str], Any] | None = None,
+    rewards_only: bool = False,
 ) -> list[StrategySignal]:
     """T3 maker quote signals around model fair value.
 
@@ -882,6 +884,20 @@ def collect_maker_strategy_signals(
     For the current "最小落地" phase this is telemetry-only — it lets
     us validate the dataset before letting it drive quote-side
     selection.
+
+    `reward_config_provider` maps condition_id -> the market's
+    liquidity-reward config (anything exposing ``reward_delta`` /
+    ``rewards_min_size``, or a bare δ float, or ``None``).
+    It is what makes `MakerStrategy.compute_quote`'s
+    reward-band clamp actually bind — without it δ stays 0 and the
+    clamp is dead code, i.e. quotes are posted with no knowledge of
+    whether they sit inside the market's scoring range. The provider
+    must never raise and must return 0.0 when unknown; a 0 δ simply
+    restores the historical fair-value-only behaviour.
+
+    `rewards_only` skips markets with no reward band entirely. Off by
+    default so enabling the provider does not silently shrink the
+    maker universe.
     """
     signals: list[StrategySignal] = []
     skip_reasons: dict[str, int] = {}
@@ -931,12 +947,18 @@ def collect_maker_strategy_signals(
             else None
         )
         event_toxicity = _maker_event_time_toxicity(market, event_baseline_map)
+        reward_config = _maker_reward_config(reward_config_provider, market.condition_id)
+        reward_delta = _reward_delta_of(reward_config)
+        if rewards_only and reward_delta <= 0:
+            _record_skip(skip_reasons, skip_by_market, market.condition_id, "no_reward_band")
+            continue
         quote = maker_strategy.compute_quote(
             token_id=yes_token.token_id,
             condition_id=market.condition_id,
             fair_value=float(fair_value),
             tick_size=max(float(getattr(snap, "tick_size", 0.01) or 0.01), 0.01),
             mid_price=float(snap.mid),
+            reward_delta=reward_delta if reward_delta > 0 else None,
             flow_bias_yes_share=flow_share,
             spread_multiplier=float(event_toxicity["spread_multiplier"]),
         )
@@ -990,6 +1012,9 @@ def collect_maker_strategy_signals(
             "category": category,
             "category_maker_taker_gap_pp": gap_pp,
             "queue_position": _maker_queue_position_payload(snap, quote),
+            "reward_band": _maker_reward_band_payload(
+                reward_config, reward_delta, float(snap.mid), quote
+            ),
         }
         if event_toxicity["applied"]:
             payload["event_time_toxicity"] = event_toxicity
@@ -1019,6 +1044,79 @@ def collect_maker_strategy_signals(
         )[:10],
     }
     return signals
+
+
+def _maker_reward_config(
+    provider: Callable[[str], Any] | None, condition_id: str
+) -> Any:
+    """取市场的奖励配置，永不抛异常.
+
+    provider 背后是一次缓存读取（网络预热在后台线程）。它失败时 T3
+    必须继续报价，只是退回"不知道奖励带"的行为，所以任何异常都吞掉。
+    """
+    if provider is None or not condition_id:
+        return None
+    try:
+        return provider(condition_id)
+    except Exception as exc:  # noqa: BLE001 - 奖励元数据不得阻塞报价
+        LOG.debug("reward config provider 失败 %s: %s", condition_id[:12], exc)
+        return None
+
+
+def _reward_delta_of(reward_config: Any) -> float:
+    """从奖励配置里取出半宽 δ；支持裸 float、对象和 None."""
+    if reward_config is None:
+        return 0.0
+    raw = getattr(reward_config, "reward_delta", reward_config)
+    try:
+        delta = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if delta != delta or delta < 0:  # NaN / 负数
+        return 0.0
+    return delta
+
+
+def _maker_reward_band_payload(
+    reward_config: Any, reward_delta: float, mid_price: float, quote: Any
+) -> dict[str, Any]:
+    """记录报价相对奖励带的位置，供 telemetry 事后核账.
+
+    `bid_in_band` / `ask_in_band` 是"这笔挂单理论上是否落在计分区间"
+    的先验判断；真正是否计分要靠 /orders-scoring 校验。两者不一致就
+    说明奖励带参数过期，或报价被 tick 对齐挤出了带外。
+
+    `min_size_ok` 同理：低于 rewards_min_size 的挂单落在带内也不计分。
+    """
+    if reward_delta <= 0:
+        return {"delta": 0.0, "incentivized": False}
+    lo = mid_price - reward_delta
+    hi = mid_price + reward_delta
+    bid = getattr(quote, "bid_price", None)
+    ask = getattr(quote, "ask_price", None)
+    payload: dict[str, Any] = {
+        "delta": round(reward_delta, 6),
+        "incentivized": True,
+        "band_lo": round(lo, 6),
+        "band_hi": round(hi, 6),
+        "bid_in_band": bool(bid is not None and lo - 1e-9 <= bid <= hi + 1e-9),
+        "ask_in_band": bool(ask is not None and lo - 1e-9 <= ask <= hi + 1e-9),
+    }
+    min_size = 0.0
+    try:
+        min_size = float(getattr(reward_config, "rewards_min_size", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        min_size = 0.0
+    if min_size > 0:
+        payload["min_size"] = min_size
+        payload["min_size_ok"] = bool(
+            max(
+                float(getattr(quote, "bid_size", 0.0) or 0.0),
+                float(getattr(quote, "ask_size", 0.0) or 0.0),
+            )
+            >= min_size
+        )
+    return payload
 
 
 def _maker_queue_position_payload(snap: OrderBookSnapshot, quote: Any) -> dict[str, Any]:
