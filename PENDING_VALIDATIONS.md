@@ -208,6 +208,77 @@ For each item:
 
 ---
 
+## 5. RTDS crypto_prices as the UPDOWN settlement reference
+
+- **Claim**: UPDOWN markets settle against Polymarket's own price feed, so
+  pricing them off Binance introduces a basis that is largest exactly when
+  UPDOWN is most sensitive (high volatility).
+- **Status**: `RtdsSpotFeed` + `CompositeSpotFeed` ship in **shadow mode**
+  (`T2_UPDOWN_RTDS_MODE=shadow`). Pricing still uses Binance; RTDS only
+  emits an `updown_spot_basis` row into `risk_events` every
+  `T2_UPDOWN_BASIS_LOG_INTERVAL_SEC`.
+- **Data required**: an authoritative sample of the `crypto_prices` payload.
+  The subscription protocol is confirmed (`{"action": "subscribe",
+  "subscriptions": [{"topic", "type"}]}`, messages shaped
+  `{"topic", "type", "timestamp", "payload"}`), but the payload field names
+  are not. `parse_rtds_crypto_payload` therefore matches field names
+  leniently (`symbol`/`pair`/`asset`, `value`/`price`/`close`, …) and drops
+  anything it cannot read rather than guessing.
+- **Validation method**: over ≥ 24h of `updown_spot_basis` rows, require
+  (a) RTDS ticks arrive for every configured symbol with
+  `rtds_age_sec` staying under `T2_UPDOWN_RTDS_STALENESS_SEC`, and
+  (b) the basis distribution is centred near 0 with no unexplained regime
+  breaks. A persistently non-zero basis means the two feeds are quoting
+  different things — investigate before switching, do not switch.
+- **Script**: `jq 'select(.event=="updown_spot_basis")'` over
+  `data/telemetry/*.risk_events.ndjson`.
+- **Flag to flip**: `T2_UPDOWN_RTDS_MODE=primary`.
+
+---
+
+## 6. Wallet profit-quality thresholds
+
+- **Claim**: filtering followed wallets by win rate / profit factor /
+  consistency / single-trade concentration yields better copy signals than
+  ranking by activity.
+- **Status**: `strategies/wallet_quality.py` ships **off**
+  (`--quality-filter` not passed). The offline worker computes the full
+  profile for every candidate regardless, so the distribution is
+  observable before any threshold binds.
+- **Data required**: our own distribution of `/closed-positions` metrics
+  across the candidate pool. The default thresholds (win rate ≥ 0.60,
+  profit factor ≥ 1.5, consistency ≥ 0.70, top-trade share ≤ 0.30) are
+  taken from a public reference implementation and are **not validated on
+  this project's data**.
+- **Validation method**: run `python scripts/scan_quant_strategy_inputs.py
+  wallet-quality --output data/quant_inputs/wallet_quality.json`, read the
+  distribution of each metric, and set thresholds from percentiles rather
+  than from the imported defaults.
+- **Flag to flip**: pass `--quality-filter` to `auto-wallet-observations`
+  (plus any `--min-*` overrides derived above).
+
+---
+
+## 7. Cancelling maker orders that are not scoring
+
+- **Claim**: a resting maker order that `/orders-scoring` reports as
+  non-scoring is earning no liquidity reward and should be re-posted.
+- **Status**: the audit ships **observation-only**
+  (`MAKER_SCORING_CANCEL_UNSCORED=false`). Every cycle writes
+  `maker_scoring_audit` with `scoring / not_scoring / unknown /
+  scoring_ratio`.
+- **Data required**: enough `maker_scoring_audit` rows to know the baseline
+  `scoring_ratio` and how often an order goes non-scoring transiently.
+  Cancelling on a transient reading would churn orders and lose queue
+  position for nothing.
+- **Validation method**: confirm that orders flagged non-scoring stay
+  non-scoring beyond `MAKER_SCORING_UNSCORED_GRACE_SEC` (i.e. the grace
+  window separates transient from persistent), and that `unknown` stays a
+  small share.
+- **Flag to flip**: `MAKER_SCORING_CANCEL_UNSCORED=true`.
+
+---
+
 ## Quick re-validation checklist (when paid data is acquired)
 
 ```bash
