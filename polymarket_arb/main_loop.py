@@ -45,6 +45,7 @@ from polymarket_arb.main_helpers.flow_aggregator import FlowAggregator, FlowInge
 from polymarket_arb.main_helpers.order_sync import (
     cancel_stale_maker_orders as _cancel_stale_maker_orders,
     sync_live_order_statuses as _sync_live_order_statuses,
+    sync_user_channel_fills as _sync_user_channel_fills,
 )
 from polymarket_arb.main_helpers.maker_fill_notifications import (
     handle_observed_maker_fills as _handle_observed_maker_fills,
@@ -145,6 +146,7 @@ from polymarket_arb.main_helpers.scan_focus import (
 )
 from polymarket_arb.market_scanner import MarketScanner
 from polymarket_arb.rewards_client import RewardsClient
+from polymarket_arb.user_feed import UserChannelFeed
 from polymarket_arb.models import (
     MarketInfo,
     ResearchSignalReport,
@@ -354,6 +356,29 @@ def _signal_dedupe_key(signal: StrategySignal) -> tuple[Any, ...]:
 # `polymarket_arb.main_helpers.{signal_collectors, strategy_execution}`.
 # Re-imported above under their underscore aliases so the existing call
 # graph stays unchanged.
+
+
+def _resolve_user_ws_credentials(config, trading_client) -> tuple[str, str, str]:
+    """user 频道订阅需要 L2 凭证 (apiKey / secret / passphrase).
+
+    优先用配置里显式给的；没配就从交易客户端上取 —— `build_trading_client`
+    在未配置时会 create_or_derive 一套并挂在 client.creds 上，那套才是
+    实际在用的凭证。取不到就返回空串，调用方据此退回纯轮询。
+    """
+    api_key = (config.clob_api_key or "").strip()
+    api_secret = (config.clob_api_secret or "").strip()
+    api_passphrase = (config.clob_api_passphrase or "").strip()
+    if api_key and api_secret and api_passphrase:
+        return api_key, api_secret, api_passphrase
+
+    creds = getattr(trading_client, "creds", None)
+    if creds is None:
+        return api_key, api_secret, api_passphrase
+    return (
+        api_key or str(getattr(creds, "api_key", "") or ""),
+        api_secret or str(getattr(creds, "api_secret", "") or ""),
+        api_passphrase or str(getattr(creds, "api_passphrase", "") or ""),
+    )
 
 
 def main(dotenv_path: str | None = None) -> None:
@@ -713,6 +738,25 @@ def main(dotenv_path: str | None = None) -> None:
     dirty_market_tracker = DirtyMarketTracker(
         wake_threshold=config.dirty_market_wake_threshold,
     )
+    # user 频道：成交推送。后台线程只入队，主循环每周期排干后在主线程
+    # 落地（见 _sync_user_channel_fills）。dry-run 没有真实挂单，不启。
+    user_ws_markets: set[str] = set()
+    user_feed: Optional[UserChannelFeed] = None
+    if config.user_ws_enabled and not config.dry_run and trading_client is not None:
+        api_key, api_secret, api_passphrase = _resolve_user_ws_credentials(
+            config, trading_client
+        )
+        user_feed = UserChannelFeed(
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+            market_provider=lambda: sorted(user_ws_markets),
+            wake_event=dirty_market_tracker.wake_event,
+            queue_size=config.user_ws_queue_size,
+        )
+        if not user_feed.start():
+            # 没有凭证就退回纯轮询，不影响下单，只是成交观测慢一个周期。
+            user_feed = None
     last_vol_feed_ts = 0.0
     cached_universe_markets: list[MarketInfo] = []
     cached_universe_events: list[Any] = []
@@ -1629,6 +1673,18 @@ def main(dotenv_path: str | None = None) -> None:
                     market=live_markets_by_cid.get(trade.condition_id),
                 )
 
+            user_ws_markets.update(live_markets_by_cid)
+            _sync_user_channel_fills(
+                user_feed=user_feed,
+                executor=executor,
+                risk_mgr=risk_mgr,
+                maker_strategy=maker_strategy,
+                event_recorder=event_recorder,
+                notifier=notifier,
+                orchestrator=orchestrator,
+                on_observed_maker_fill=_register_live_maker_fill,
+                max_events=config.user_ws_max_events_per_cycle,
+            )
             _sync_live_order_statuses(
                 executor=executor,
                 risk_mgr=risk_mgr,
@@ -1910,6 +1966,9 @@ def main(dotenv_path: str | None = None) -> None:
         spot_feed.stop()
         LOG.info("Binance 现货 feed 已停止")
     rewards_client.close()
+    if user_feed is not None:
+        user_feed.stop()
+        LOG.info("user 频道 WebSocket 已停止")
     if research_refresh_state.pending_future is not None:
         research_refresh_state.pending_future.cancel()
     if research_executor is not None:

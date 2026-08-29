@@ -793,6 +793,112 @@ class ExecutionEngine:
 
         return OrderSyncResult(polled=polled, changed=changed)
 
+    def apply_user_channel_events(self, events: list[Any]) -> OrderSyncResult:
+        """把 user 频道推送的订单/成交事件应用到本地 trade 记录.
+
+        返回与 `sync_pending_trade_statuses` 完全相同的 `OrderSyncResult`
+        形状，**故意如此**：下游（风险对账、maker 库存、T2/T3 退出管理）
+        因此走同一条路径，推送和轮询不会产生两套语义。
+
+        两种成交量语义分开处理:
+          - `cumulative_matched`（order 消息的 size_matched）是累计量，
+            取 max 天然幂等，重放安全；
+          - `incremental_matched`（trade 消息的 matched_amount）是增量，
+            必须靠 UserChannelFeed 的 (trade_id, order_id) 去重保证只加
+            一次。
+
+        成交量一律 clamp 到下单量：交易所重放或本地记录不同步时，宁可
+        少记也不能凭空放大敞口。
+        """
+        if self._config.dry_run or not events:
+            return OrderSyncResult(polled=[], changed=[])
+
+        by_order: dict[str, TradeRecord] = {}
+        for trade in self._trade_history:
+            if trade.simulated or not trade.order_id:
+                continue
+            if trade.status not in (TradeStatus.PENDING, TradeStatus.PARTIAL):
+                continue
+            by_order.setdefault(str(trade.order_id), trade)
+
+        polled: list[TradeRecord] = []
+        changed: list[TradeRecord] = []
+        touched: set[int] = set()
+
+        for event in events:
+            trade = by_order.get(str(getattr(event, "order_id", "")))
+            if trade is None:
+                continue
+            if id(trade) not in touched:
+                touched.add(id(trade))
+                polled.append(trade)
+
+            before = (trade.status, trade.fill_size, trade.fill_price, trade.error or "")
+            self._apply_single_user_event(trade, event)
+            after = (trade.status, trade.fill_size, trade.fill_price, trade.error or "")
+            if after != before and trade not in changed:
+                changed.append(trade)
+                LOG.info(
+                    "user 频道订单更新: order=%s status=%s fill_size=%s fill_price=%s",
+                    str(trade.order_id)[:16],
+                    trade.status.value,
+                    f"{trade.fill_size:.4f}" if trade.fill_size is not None else "N/A",
+                    f"{trade.fill_price:.4f}" if trade.fill_price is not None else "N/A",
+                )
+
+        return OrderSyncResult(polled=polled, changed=changed)
+
+    @staticmethod
+    def _apply_single_user_event(trade: TradeRecord, event: Any) -> None:
+        current_fill = max(0.0, float(trade.fill_size or 0.0))
+        current_price = float(trade.fill_price or 0.0)
+        requested = max(0.0, float(trade.size or 0.0))
+
+        cumulative = getattr(event, "cumulative_matched", None)
+        incremental = getattr(event, "incremental_matched", None)
+        event_price = max(0.0, float(getattr(event, "price", 0.0) or 0.0))
+
+        observed = current_fill
+        if cumulative is not None:
+            observed = max(current_fill, max(0.0, float(cumulative)))
+            if event_price > 0:
+                current_price = event_price
+        elif incremental:
+            added = max(0.0, float(incremental))
+            observed = current_fill + added
+            if event_price > 0 and added > 0:
+                # 多次部分成交取加权均价，而不是最后一次的价格。
+                total = current_fill + added
+                current_price = (
+                    (current_fill * current_price + added * event_price) / total
+                    if total > 0
+                    else event_price
+                )
+
+        if requested > 0:
+            observed = min(observed, requested)
+        if observed > current_fill:
+            trade.fill_size = observed
+        if current_price > 0:
+            trade.fill_price = current_price
+
+        fill = max(0.0, float(trade.fill_size or 0.0))
+        if getattr(event, "is_failure", False):
+            trade.status = TradeStatus.FAILED
+            trade.error = trade.error or f"user_ws_{str(getattr(event, 'status', '')).lower()}"
+            return
+        if getattr(event, "is_cancel", False):
+            # 部分成交后撤单也是终态 CANCELLED —— 已成交部分留在
+            # fill_size 里，未成交部分由风险对账释放。留成 PARTIAL 会
+            # 让这笔订单永远待在 pending 集合里，敞口再也不释放。
+            trade.status = TradeStatus.CANCELLED
+            trade.error = trade.error or "user_ws_cancelled"
+            return
+        if requested > 0 and fill + 1e-9 >= requested:
+            trade.status = TradeStatus.FILLED
+        elif fill > 0:
+            trade.status = TradeStatus.PARTIAL
+
     def sweep_simulated_maker_fills(
         self,
         book_snapshot_provider: Any,

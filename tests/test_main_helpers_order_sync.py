@@ -433,3 +433,91 @@ def test_cancel_swallow_exception_with_disabled_recorder_does_not_crash() -> Non
         risk_mgr=_RiskMgr(),
         event_recorder=_DisabledRecorder(),
     )
+
+
+# --------- user 频道成交落地 ----------
+
+
+class _StubUserFeed:
+    def __init__(self, events):
+        self._events = list(events)
+        self.drains = 0
+
+    def drain(self, max_items=500):
+        self.drains += 1
+        out = self._events[:max_items]
+        self._events = self._events[max_items:]
+        return out
+
+
+class _StubUserExecutor:
+    def __init__(self, result, *, error=None):
+        self._result = result
+        self._error = error
+        self.applied = []
+
+    def apply_user_channel_events(self, events):
+        if self._error is not None:
+            raise self._error
+        self.applied.append(list(events))
+        return self._result
+
+
+def test_sync_user_channel_fills_applies_the_same_downstream_as_polling():
+    from polymarket_arb.execution_engine import OrderSyncResult
+    from polymarket_arb.main_helpers.order_sync import sync_user_channel_fills
+
+    trade = _trade(status_value="filled", fill_size=5.0)
+    executor = _StubUserExecutor(OrderSyncResult(polled=[trade], changed=[trade]))
+    risk = _RiskMgr()
+    recorder = _Recorder()
+    maker = _MakerStrategy()
+    feed = _StubUserFeed([object(), object()])
+
+    handled = sync_user_channel_fills(
+        user_feed=feed,
+        executor=executor,
+        risk_mgr=risk,
+        maker_strategy=maker,
+        event_recorder=recorder,
+    )
+    assert handled == 2
+    assert risk.reconciled == [[trade]]
+    synced = [e for e in recorder.events if e[1].get("event") == "order_status_sync"]
+    assert synced and synced[0][1]["source"] == "user_ws"
+
+
+def test_sync_user_channel_fills_is_noop_without_feed_or_events():
+    from polymarket_arb.execution_engine import OrderSyncResult
+    from polymarket_arb.main_helpers.order_sync import sync_user_channel_fills
+
+    executor = _StubUserExecutor(OrderSyncResult(polled=[], changed=[]))
+    kwargs = dict(
+        executor=executor,
+        risk_mgr=_RiskMgr(),
+        maker_strategy=_MakerStrategy(),
+        event_recorder=_Recorder(),
+    )
+    assert sync_user_channel_fills(user_feed=None, **kwargs) == 0
+    assert sync_user_channel_fills(user_feed=_StubUserFeed([]), **kwargs) == 0
+    assert executor.applied == []
+
+
+def test_sync_user_channel_fills_records_errors_without_raising():
+    from polymarket_arb.main_helpers.order_sync import sync_user_channel_fills
+
+    recorder = _Recorder()
+    executor = _StubUserExecutor(None, error=RuntimeError("boom"))
+    assert (
+        sync_user_channel_fills(
+            user_feed=_StubUserFeed([object()]),
+            executor=executor,
+            risk_mgr=_RiskMgr(),
+            maker_strategy=_MakerStrategy(),
+            event_recorder=recorder,
+        )
+        == 0
+    )
+    assert any(
+        e[1].get("event") == "user_channel_sync_error" for e in recorder.events
+    )

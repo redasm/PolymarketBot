@@ -465,6 +465,13 @@ class ArbConfig:
     maker_scoring_cancel_unscored: bool = False
     maker_scoring_unscored_grace_sec: float = 90.0
 
+    # user 频道 WebSocket（自己的订单/成交推送）。开启后成交在毫秒级
+    # 回写风险敞口与退出管理器，而不是等下一个扫描周期的 REST 轮询。
+    # REST 轮询保留作为兜底，两条路径走同一段落地逻辑。
+    user_ws_enabled: bool = True
+    user_ws_queue_size: int = 2000
+    user_ws_max_events_per_cycle: int = 500
+
     def __post_init__(self) -> None:
         self.validate()
 
@@ -657,6 +664,10 @@ class ArbConfig:
             raise ValueError("MAKER_SCORING_AUDIT_INTERVAL_SEC 不能为负数")
         if self.maker_scoring_unscored_grace_sec < 0:
             raise ValueError("MAKER_SCORING_UNSCORED_GRACE_SEC 不能为负数")
+        if self.user_ws_queue_size < 1:
+            raise ValueError("USER_WS_QUEUE_SIZE 必须 >= 1")
+        if self.user_ws_max_events_per_cycle < 1:
+            raise ValueError("USER_WS_MAX_EVENTS_PER_CYCLE 必须 >= 1")
         if self.t2_scale_out_tranches < 1:
             raise ValueError("T2_SCALE_OUT_TRANCHES 必须 >= 1")
         if self.t2_stop_loss_dynamic_k < 0:
@@ -975,6 +986,9 @@ class ArbConfig:
             maker_scoring_unscored_grace_sec=_env_float(
                 "MAKER_SCORING_UNSCORED_GRACE_SEC", 90.0
             ),
+            user_ws_enabled=_env_bool("USER_WS_ENABLED", True),
+            user_ws_queue_size=_env_int("USER_WS_QUEUE_SIZE", 2000),
+            user_ws_max_events_per_cycle=_env_int("USER_WS_MAX_EVENTS_PER_CYCLE", 500),
             tick_record_enabled=_env_bool("TICK_RECORD_ENABLED", False),
             tick_record_dir=_env("TICK_RECORD_DIR", "data/ticks"),
             telemetry_record_enabled=_env_bool("TELEMETRY_RECORD_ENABLED", False),

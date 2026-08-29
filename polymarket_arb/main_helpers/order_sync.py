@@ -62,43 +62,16 @@ def sync_live_order_statuses(
     """
     try:
         order_sync = executor.sync_pending_trade_statuses()
-        if order_sync.polled:
-            risk_mgr.reconcile_pending_order_statuses(order_sync.polled)
-        if order_sync.changed:
-            inventory_deltas = {
-                trade.trade_id: apply_maker_fill_to_inventory(maker_strategy, trade)
-                for trade in order_sync.changed
-            }
-            _release_t3_exposure_for_synced_orders(
-                orchestrator,
-                order_sync.changed,
-                inventory_deltas=inventory_deltas,
-            )
-            handle_observed_maker_fills(
-                trades=order_sync.changed,
-                maker_strategy=maker_strategy,
-                notifier=notifier,
-                event_recorder=event_recorder,
-                simulated=False,
-                event_name="live_maker_fill_observed",
-                apply_inventory=False,
-                inventory_deltas=inventory_deltas,
-                on_observed=on_observed_maker_fill,
-            )
-        if event_recorder.is_enabled and order_sync.changed:
-            for trade in order_sync.changed:
-                event_recorder.write_event("risk_events", {
-                    "event": "order_status_sync",
-                    "order_id": trade.order_id,
-                    "trade_id": trade.trade_id,
-                    "condition_id": trade.condition_id,
-                    "status": trade.status.value,
-                    "fill_size": trade.fill_size,
-                    "fill_price": trade.fill_price,
-                    "inventory_delta": inventory_deltas.get(trade.trade_id, 0.0),
-                    "error": trade.error,
-                    "ts": time.time(),
-                })
+        apply_order_sync_result(
+            order_sync=order_sync,
+            risk_mgr=risk_mgr,
+            maker_strategy=maker_strategy,
+            event_recorder=event_recorder,
+            notifier=notifier,
+            orchestrator=orchestrator,
+            on_observed_maker_fill=on_observed_maker_fill,
+            source="rest_poll",
+        )
     except Exception as exc:
         LOG.warning("订单状态同步失败: %s", exc)
         if event_recorder.is_enabled:
@@ -107,6 +80,114 @@ def sync_live_order_statuses(
                 "error": str(exc),
                 "ts": time.time(),
             })
+
+
+def apply_order_sync_result(
+    *,
+    order_sync,
+    risk_mgr: RiskManager,
+    maker_strategy: MakerStrategy,
+    event_recorder: EventRecorder,
+    notifier: NotificationManager | None = None,
+    orchestrator: StrategyOrchestrator | None = None,
+    on_observed_maker_fill: Callable[[TradeRecord, float], None] | None = None,
+    source: str = "rest_poll",
+) -> None:
+    """把一次订单同步的结果落到风险 / 库存 / 退出管理器上。
+
+    轮询 (`sync_pending_trade_statuses`) 和 user 频道推送
+    (`apply_user_channel_events`) 共用这段下游 —— 两条路径产生的
+    `OrderSyncResult` 形状相同，落地语义就必须完全一致，否则同一笔成交
+    会因为"是谁先看到的"而得到不同的敞口结果。`source` 只进 telemetry。
+    """
+    if order_sync.polled:
+        risk_mgr.reconcile_pending_order_statuses(order_sync.polled)
+    if not order_sync.changed:
+        return
+
+    inventory_deltas = {
+        trade.trade_id: apply_maker_fill_to_inventory(maker_strategy, trade)
+        for trade in order_sync.changed
+    }
+    _release_t3_exposure_for_synced_orders(
+        orchestrator,
+        order_sync.changed,
+        inventory_deltas=inventory_deltas,
+    )
+    handle_observed_maker_fills(
+        trades=order_sync.changed,
+        maker_strategy=maker_strategy,
+        notifier=notifier,
+        event_recorder=event_recorder,
+        simulated=False,
+        event_name="live_maker_fill_observed",
+        apply_inventory=False,
+        inventory_deltas=inventory_deltas,
+        on_observed=on_observed_maker_fill,
+    )
+    if not event_recorder.is_enabled:
+        return
+    for trade in order_sync.changed:
+        event_recorder.write_event("risk_events", {
+            "event": "order_status_sync",
+            "source": source,
+            "order_id": trade.order_id,
+            "trade_id": trade.trade_id,
+            "condition_id": trade.condition_id,
+            "status": trade.status.value,
+            "fill_size": trade.fill_size,
+            "fill_price": trade.fill_price,
+            "inventory_delta": inventory_deltas.get(trade.trade_id, 0.0),
+            "error": trade.error,
+            "ts": time.time(),
+        })
+
+
+def sync_user_channel_fills(
+    *,
+    user_feed,
+    executor: ExecutionEngine,
+    risk_mgr: RiskManager,
+    maker_strategy: MakerStrategy,
+    event_recorder: EventRecorder,
+    notifier: NotificationManager | None = None,
+    orchestrator: StrategyOrchestrator | None = None,
+    on_observed_maker_fill: Callable[[TradeRecord, float], None] | None = None,
+    max_events: int = 500,
+) -> int:
+    """排干 user 频道队列并落地，返回本轮处理的事件数.
+
+    事件由后台 WS 线程入队，**这里是主线程**，所有风险状态变更都发生
+    在这个调用里 —— 后台线程绝不直接改状态。REST 轮询仍然保留作为
+    兜底：user 频道断线或队列溢出时，下一轮轮询会补齐。
+    """
+    if user_feed is None:
+        return 0
+    try:
+        events = user_feed.drain(max_items=max_events)
+        if not events:
+            return 0
+        order_sync = executor.apply_user_channel_events(events)
+        apply_order_sync_result(
+            order_sync=order_sync,
+            risk_mgr=risk_mgr,
+            maker_strategy=maker_strategy,
+            event_recorder=event_recorder,
+            notifier=notifier,
+            orchestrator=orchestrator,
+            on_observed_maker_fill=on_observed_maker_fill,
+            source="user_ws",
+        )
+        return len(events)
+    except Exception as exc:
+        LOG.warning("user 频道成交落地失败: %s", exc)
+        if event_recorder.is_enabled:
+            event_recorder.write_event("risk_events", {
+                "event": "user_channel_sync_error",
+                "error": str(exc),
+                "ts": time.time(),
+            })
+        return 0
 
 
 def cancel_stale_maker_orders(
