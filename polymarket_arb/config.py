@@ -472,6 +472,20 @@ class ArbConfig:
     user_ws_queue_size: int = 2000
     user_ws_max_events_per_cycle: int = 500
 
+    # UPDOWN 结算口径现货源 (Polymarket RTDS crypto_prices)。
+    # Binance 是流动性口径，UPDOWN 用的是 Polymarket 自己的价格源 ——
+    # 两者的 basis 在剧烈波动时最大，正好是 UPDOWN 定价最敏感的时候。
+    #   off     = 只用 Binance（接入前行为）
+    #   shadow  = 定价仍走 Binance，RTDS 只产出 basis telemetry（默认）
+    #   primary = 定价用 RTDS，过期时自动回落 Binance
+    # 默认 shadow：crypto_prices 的 payload 字段名尚未拿到权威样本，
+    # 先观测数据连续性再决定是否接管定价。
+    t2_updown_rtds_mode: str = "shadow"
+    t2_updown_rtds_staleness_sec: float = 30.0
+    t2_updown_rtds_chainlink: bool = False
+    t2_updown_basis_log_interval_sec: float = 300.0
+    t2_updown_basis_alert_bps: float = 50.0
+
     def __post_init__(self) -> None:
         self.validate()
 
@@ -668,6 +682,14 @@ class ArbConfig:
             raise ValueError("USER_WS_QUEUE_SIZE 必须 >= 1")
         if self.user_ws_max_events_per_cycle < 1:
             raise ValueError("USER_WS_MAX_EVENTS_PER_CYCLE 必须 >= 1")
+        if self.t2_updown_rtds_mode not in ("off", "shadow", "primary"):
+            raise ValueError("T2_UPDOWN_RTDS_MODE 必须是 off / shadow / primary")
+        if self.t2_updown_rtds_staleness_sec < 0:
+            raise ValueError("T2_UPDOWN_RTDS_STALENESS_SEC 不能为负数")
+        if self.t2_updown_basis_log_interval_sec < 0:
+            raise ValueError("T2_UPDOWN_BASIS_LOG_INTERVAL_SEC 不能为负数")
+        if self.t2_updown_basis_alert_bps < 0:
+            raise ValueError("T2_UPDOWN_BASIS_ALERT_BPS 不能为负数")
         if self.t2_scale_out_tranches < 1:
             raise ValueError("T2_SCALE_OUT_TRANCHES 必须 >= 1")
         if self.t2_stop_loss_dynamic_k < 0:
@@ -989,6 +1011,13 @@ class ArbConfig:
             user_ws_enabled=_env_bool("USER_WS_ENABLED", True),
             user_ws_queue_size=_env_int("USER_WS_QUEUE_SIZE", 2000),
             user_ws_max_events_per_cycle=_env_int("USER_WS_MAX_EVENTS_PER_CYCLE", 500),
+            t2_updown_rtds_mode=_env("T2_UPDOWN_RTDS_MODE", "shadow").lower() or "shadow",
+            t2_updown_rtds_staleness_sec=_env_float("T2_UPDOWN_RTDS_STALENESS_SEC", 30.0),
+            t2_updown_rtds_chainlink=_env_bool("T2_UPDOWN_RTDS_CHAINLINK", False),
+            t2_updown_basis_log_interval_sec=_env_float(
+                "T2_UPDOWN_BASIS_LOG_INTERVAL_SEC", 300.0
+            ),
+            t2_updown_basis_alert_bps=_env_float("T2_UPDOWN_BASIS_ALERT_BPS", 50.0),
             tick_record_enabled=_env_bool("TICK_RECORD_ENABLED", False),
             tick_record_dir=_env("TICK_RECORD_DIR", "data/ticks"),
             telemetry_record_enabled=_env_bool("TELEMETRY_RECORD_ENABLED", False),

@@ -177,6 +177,12 @@ from polymarket_arb.tick_recorder import TickRecorder
 from polymarket_arb.volatility_estimator import VolEstimator
 from polymarket_arb.websocket_feed import OrderBookMirror, WebSocketFeed
 from polymarket_arb.spot_feed import BinanceSpotFeed, parse_spot_pairs
+from polymarket_arb.rtds_feed import (
+    RTDS_CRYPTO_CHAINLINK_TOPIC,
+    RTDS_CRYPTO_TOPIC,
+    CompositeSpotFeed,
+    RtdsSpotFeed,
+)
 from polymarket_arb.strategies.updown_pricer import UpdownPricer
 from polymarket_arb.strategies.weather_strategy import (
     OpenMeteoEnsembleProvider,
@@ -447,8 +453,11 @@ def main(dotenv_path: str | None = None) -> None:
     # T2 UPDOWN Phase 2: Binance 现货 feed + spot-anchored pricer。
     # 仅 t2_updown_enabled 且 spot_feed_enabled 时启动;否则 pricer=None,
     # UPDOWN 分支不触发 (退化为 Phase 1 行为)。feed 是 daemon 线程,绝不阻塞主循环。
-    spot_feed: Optional[BinanceSpotFeed] = None
+    spot_feed: Optional[Any] = None
+    rtds_feed: Optional[RtdsSpotFeed] = None
     updown_pricer: Optional[UpdownPricer] = None
+    last_basis_log_ts = 0.0
+    _ud_symbols: list[str] = []
     if getattr(config, "t2_updown_enabled", False) and getattr(config, "t2_updown_spot_feed_enabled", False):
         try:
             _ud_symbols = [s.strip() for s in (config.t2_updown_symbols or "").split(",") if s.strip()]
@@ -462,11 +471,38 @@ def main(dotenv_path: str | None = None) -> None:
                 min_bars=config.vol_min_bars,
             )
             spot_feed.start()
+            if config.t2_updown_rtds_mode != "off":
+                # RTDS 是结算口径的价格源。默认 shadow：只产 basis
+                # telemetry，定价仍走 Binance。
+                _topics = [RTDS_CRYPTO_TOPIC]
+                if config.t2_updown_rtds_chainlink:
+                    _topics.append(RTDS_CRYPTO_CHAINLINK_TOPIC)
+                rtds_feed = RtdsSpotFeed(
+                    symbols=_ud_symbols,
+                    window_secs=_ud_windows or [900],
+                    topics=_topics,
+                    fast_minutes=config.vol_fast_minutes,
+                    slow_minutes=config.vol_slow_minutes,
+                    min_bars=config.vol_min_bars,
+                )
+                rtds_feed.start()
+                spot_feed = CompositeSpotFeed(
+                    primary=rtds_feed,
+                    fallback=spot_feed,
+                    mode=config.t2_updown_rtds_mode,
+                    staleness_sec=config.t2_updown_rtds_staleness_sec,
+                )
+                LOG.info(
+                    "UPDOWN RTDS 现货源已启用 (mode=%s, topic=%s)",
+                    config.t2_updown_rtds_mode,
+                    ",".join(_topics),
+                )
             updown_pricer = UpdownPricer(spot_feed)
             LOG.info("T2 UPDOWN Phase 2 已启用: 现货源 %s", ",".join(sorted(_ud_pairs.values())))
         except Exception as e:  # noqa: BLE001 - feed 启动失败不能拖垮主循环
             LOG.warning("T2 UPDOWN 现货 feed 启动失败,回退 Phase 1: %s", e)
             spot_feed = None
+            rtds_feed = None
             updown_pricer = None
     weather_provider: Optional[OpenMeteoEnsembleProvider] = None
     if getattr(config, "weather_strategy_enabled", False):
@@ -1884,6 +1920,32 @@ def main(dotenv_path: str | None = None) -> None:
             event_recorder.write_event("risk_events", cycle_summary_payload)
             last_telemetry_heartbeat_ts = now_ts
 
+        # UPDOWN 两源 basis：这是决定 RTDS 能否从 shadow 切到 primary 的
+        # 唯一依据 —— 需要看到 RTDS 侧有连续数据，且 basis 分布稳定。
+        if (
+            rtds_feed is not None
+            and isinstance(spot_feed, CompositeSpotFeed)
+            and config.t2_updown_basis_log_interval_sec > 0
+            and (now_ts - last_basis_log_ts) >= config.t2_updown_basis_log_interval_sec
+        ):
+            last_basis_log_ts = now_ts
+            try:
+                basis = spot_feed.basis_report(_ud_symbols, now=now_ts)
+                if event_recorder.is_enabled:
+                    event_recorder.write_event(
+                        "risk_events",
+                        {"event": "updown_spot_basis", **basis, "ts": now_ts},
+                    )
+                max_bps = basis.get("max_abs_basis_bps")
+                if max_bps is not None and max_bps >= config.t2_updown_basis_alert_bps:
+                    LOG.warning(
+                        "UPDOWN 现货两源偏离 %.1f bps (mode=%s) — 结算口径与定价口径分歧",
+                        max_bps,
+                        basis.get("mode"),
+                    )
+            except Exception as exc:  # noqa: BLE001 - telemetry 不得影响主循环
+                LOG.debug("basis 报告失败: %s", exc)
+
         wallet_usdc = executor.get_available_collateral_balance(use_cache=True)
         LOG.info(
             "钱包余额观测: %s",
@@ -1964,7 +2026,7 @@ def main(dotenv_path: str | None = None) -> None:
         LOG.info("WebSocket feed 已停止")
     if spot_feed is not None:
         spot_feed.stop()
-        LOG.info("Binance 现货 feed 已停止")
+        LOG.info("UPDOWN 现货 feed 已停止")
     rewards_client.close()
     if user_feed is not None:
         user_feed.stop()
