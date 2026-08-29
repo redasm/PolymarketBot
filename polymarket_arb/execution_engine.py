@@ -41,6 +41,8 @@ _SIZE_QUANT = Decimal("0.00001")
 # limit rounded UP to 0.51 → no bid ≥ 0.51 → "no orders found to match".
 _DEFAULT_TICK_SIZE = _PRICE_QUANT
 _SIZE_DENOMINATOR = 100000  # 5-decimal size precision (10^5)
+# CLOB /orders-scoring 单次请求的 order id 上限（保守取值）。
+_SCORING_CHUNK_SIZE = 80
 _PENDING_REMOTE_STATUSES = {
     "accepted",
     "live",
@@ -63,6 +65,55 @@ _FAILED_REMOTE_STATUSES = {
     "rejected",
     "unmatched",
 }
+
+
+
+def _as_scoring_bool(value: Any) -> bool:
+    """把 /orders-scoring 的各种真值表示规整成 bool.
+
+    上游返回过 bool、字符串 "true"/"false"、0/1，以及
+    {"scoring": true} 三种形态。认不出来一律 False。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, dict) and "scoring" in value:
+        return _as_scoring_bool(value["scoring"])
+    return False
+
+
+def _parse_orders_scoring_payload(raw: Any, chunk: list[str]) -> dict[str, bool]:
+    """规整 /orders-scoring 响应为 order_id -> bool.
+
+    响应形态见过 {"data": {...}}、裸 map、以及 list[{order_id, scoring}]。
+    本批次里没被提及的 order 视为未计分（它已经不在簿上了）。
+    """
+    if raw is None:
+        return {str(oid): False for oid in chunk}
+    if isinstance(raw, dict) and "data" in raw:
+        raw = raw["data"]
+
+    out: dict[str, bool] = {str(oid): False for oid in chunk}
+    if isinstance(raw, dict):
+        for oid in out:
+            out[oid] = _as_scoring_bool(raw.get(oid))
+        return out
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            oid = str(
+                item.get("order_id") or item.get("orderId") or item.get("id") or ""
+            )
+            if oid in out:
+                out[oid] = _as_scoring_bool(
+                    item.get("scoring") if "scoring" in item else item
+                )
+        return out
+    return out
 
 
 @dataclass
@@ -913,6 +964,110 @@ class ExecutionEngine:
                 now - trade.timestamp,
             )
         return cancelled
+
+    def cancel_maker_orders_by_id(
+        self, order_ids: list[str], *, reason: str
+    ) -> list[TradeRecord]:
+        """按 order_id 撤销 T3 挂单，返回成功撤单的 TradeRecord.
+
+        与 `cancel_stale_maker_orders` 同样只处理 post_only GTC 的在簿
+        订单；调用方仍需把返回值交给
+        `risk_manager.reconcile_pending_order_statuses` 释放预留敞口。
+        """
+        if self._config.dry_run or not order_ids:
+            return []
+        if not hasattr(self._client, "cancel"):
+            return []
+        wanted = {str(oid) for oid in order_ids if oid}
+        if not wanted:
+            return []
+
+        cancelled: list[TradeRecord] = []
+        for trade in self.live_maker_trades():
+            if str(trade.order_id) not in wanted:
+                continue
+            try:
+                self._client.cancel(trade.order_id)
+            except Exception as exc:  # pragma: no cover - depends on transport
+                LOG.warning(
+                    "撤单失败 order=%s reason=%s: %s",
+                    str(trade.order_id)[:16],
+                    reason,
+                    exc,
+                )
+                continue
+            trade.status = TradeStatus.CANCELLED
+            trade.error = trade.error or reason
+            cancelled.append(trade)
+            LOG.info(
+                "撤销挂单: order=%s trade=%s market=%s reason=%s",
+                str(trade.order_id)[:16],
+                trade.trade_id,
+                trade.condition_id[:12],
+                reason,
+            )
+        return cancelled
+
+    def live_maker_trades(self) -> list[TradeRecord]:
+        """当前仍在簿上的 T3 挂单 (post_only GTC，未成交/部分成交)。
+
+        与 `cancel_stale_maker_orders` 用同一组判据，这样"计分校验"和
+        "TTL 撤单"看到的是同一批订单，不会出现一个认为在簿上、另一个
+        认为已经不在的分歧。
+        """
+        out: list[TradeRecord] = []
+        for trade in self._trade_history:
+            if trade.simulated or not trade.order_id:
+                continue
+            if trade.status not in (TradeStatus.PENDING, TradeStatus.PARTIAL):
+                continue
+            if not bool(getattr(trade, "post_only", False)):
+                continue
+            if str(getattr(trade, "order_type_name", "") or "").upper() != "GTC":
+                continue
+            out.append(trade)
+        return out
+
+    def check_orders_scoring(self, order_ids: list[str]) -> dict[str, bool]:
+        """order_id -> 是否计入流动性奖励.
+
+        挂在奖励带内**不等于**真的计分（带宽参数可能过期、规模低于
+        rewards_min_size、订单已不在簿上……）。这是唯一的客观校验。
+
+        任何失败都返回空 dict（"未知"），绝不把未知当成"未计分" ——
+        否则一次 API 抖动就会触发一轮误撤单。
+        """
+        ids = [str(oid) for oid in order_ids if oid]
+        if self._config.dry_run or not ids:
+            return {}
+        if not hasattr(self._client, "are_orders_scoring"):
+            return {}
+        params_cls = self._resolve_orders_scoring_params()
+        if params_cls is None:
+            return {}
+
+        out: dict[str, bool] = {}
+        for start in range(0, len(ids), _SCORING_CHUNK_SIZE):
+            chunk = ids[start : start + _SCORING_CHUNK_SIZE]
+            try:
+                raw = self._client.are_orders_scoring(params_cls(orderIds=chunk))
+            except Exception as exc:  # pragma: no cover - depends on transport
+                LOG.warning("are_orders_scoring 批次失败 (%d 单): %s", len(chunk), exc)
+                continue
+            out.update(_parse_orders_scoring_payload(raw, chunk))
+        return out
+
+    @staticmethod
+    def _resolve_orders_scoring_params() -> Any | None:
+        try:
+            from py_clob_client_v2.clob_types import OrdersScoringParams
+        except ImportError:
+            try:
+                from py_clob_client.clob_types import OrdersScoringParams
+            except ImportError:
+                LOG.warning("py_clob_client 缺少 OrdersScoringParams，跳过计分校验")
+                return None
+        return OrdersScoringParams
 
     def get_pnl_summary(self, *, include_simulated: bool = False) -> dict:
         """计算已执行交易的盈亏摘要."""

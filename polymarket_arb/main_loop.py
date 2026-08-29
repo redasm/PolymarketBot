@@ -98,6 +98,10 @@ from polymarket_arb.main_helpers.signal_helpers import (
     spread_bps_from_snapshot as _spread_bps_from_snapshot,
     sum_trade_exposure as _sum_trade_exposure,
 )
+from polymarket_arb.main_helpers.maker_scoring_audit import (
+    MakerScoringAuditState as _MakerScoringAuditState,
+    audit_maker_order_scoring as _audit_maker_order_scoring,
+)
 from polymarket_arb.main_helpers.signal_telemetry import StrategySignalTelemetryCompressor
 from polymarket_arb.main_helpers.virtual_fill_emitter import (
     VirtualFillEmitter as _VirtualFillEmitter,
@@ -465,6 +469,8 @@ def main(dotenv_path: str | None = None) -> None:
         negative_ttl_sec=config.maker_rewards_negative_ttl_sec,
         enabled=config.maker_rewards_enabled and config.maker_strategy_enabled,
     )
+    # 挂在带内 != 真计分。这个 state 跨周期记住每个挂单连续未计分多久。
+    maker_scoring_state = _MakerScoringAuditState()
     cross_platform_scanner = _create_cross_platform_scanner(config, ob_analyzer)
     tick_recorder = TickRecorder(
         output_dir=config.tick_record_dir,
@@ -1637,6 +1643,14 @@ def main(dotenv_path: str | None = None) -> None:
                 executor=executor,
                 risk_mgr=risk_mgr,
                 event_recorder=event_recorder,
+                orchestrator=orchestrator,
+            )
+            _audit_maker_order_scoring(
+                config=config,
+                executor=executor,
+                risk_mgr=risk_mgr,
+                event_recorder=event_recorder,
+                state=maker_scoring_state,
                 orchestrator=orchestrator,
             )
 
