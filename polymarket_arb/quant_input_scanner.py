@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import time
 from collections import defaultdict
@@ -14,6 +15,14 @@ import requests
 
 from polymarket_arb.models import EventInfo, MarketInfo
 from polymarket_arb.strategies.wallet_alpha import WalletAlphaScorer, WalletProfile
+from polymarket_arb.strategies.wallet_quality import (
+    WalletQuality,
+    WalletQualityThresholds,
+    rank_wallets_by_quality,
+    score_wallet_quality,
+)
+
+LOG = logging.getLogger(__name__)
 
 
 def generate_logical_constraint_candidates(
@@ -627,6 +636,34 @@ class DataApiWalletTradeClient:
             return [dict(row) for row in rows if isinstance(row, dict)]
         return []
 
+    def fetch_closed_positions(
+        self, wallet_address: str, *, limit: int = 500, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """已平仓头寸（带 realizedPnl），用于算钱包盈利质量.
+
+        与 `portfolio_sync` 打同一个端点，但那边只关心自己的当日已实现
+        PnL，这里要的是别人钱包的历史分布，所以单独走一条只读路径。
+        """
+        resp = self._session.get(
+            f"{self._host}/closed-positions",
+            params={
+                "user": wallet_address,
+                "limit": int(limit),
+                "offset": int(offset),
+                "sortBy": "TIMESTAMP",
+                "sortDirection": "DESC",
+            },
+            timeout=self._timeout_sec,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if isinstance(payload, list):
+            return [dict(row) for row in payload if isinstance(row, dict)]
+        if isinstance(payload, dict):
+            rows = payload.get("data") or payload.get("positions") or payload.get("results") or []
+            return [dict(row) for row in rows if isinstance(row, dict)]
+        return []
+
     def fetch_recent_trades(self, *, limit: int = 500, offset: int = 0) -> list[dict[str, Any]]:
         resp = self._session.get(
             f"{self._host}/trades",
@@ -670,6 +707,61 @@ def discover_wallets_from_trades(
     ]
     ranked.sort(key=lambda item: (item[1], item[2]), reverse=True)
     return [wallet for wallet, _, _ in ranked[:max_wallets]]
+
+
+def score_wallets_from_closed_positions(
+    client: Any,
+    wallets: list[str],
+    *,
+    limit: int = 500,
+    thresholds: WalletQualityThresholds | None = None,
+) -> list[WalletQuality]:
+    """给每个候选钱包打盈利质量分。单个钱包拉取失败只跳过它，不中断整批."""
+    out: list[WalletQuality] = []
+    for wallet in wallets:
+        try:
+            rows = client.fetch_closed_positions(wallet, limit=limit)
+        except Exception as exc:  # noqa: BLE001 - 离线路径，单点失败不致命
+            LOG.warning("拉取已平仓头寸失败 %s: %s", wallet[:12], exc)
+            continue
+        out.append(score_wallet_quality(wallet, rows, thresholds=thresholds))
+    return out
+
+
+def discover_quality_wallets(
+    client: Any,
+    recent_trades: list[dict[str, Any]],
+    *,
+    min_trades: int = 3,
+    min_notional_usdc: float = 100.0,
+    candidate_pool: int = 50,
+    max_wallets: int = 25,
+    require_passed: bool = True,
+    thresholds: WalletQualityThresholds | None = None,
+) -> tuple[list[str], list[WalletQuality]]:
+    """两段式：先按活跃度圈候选池，再按**盈利质量**排序取前 N.
+
+    活跃度只用来把候选池收敛到可承受的拉取量（每个钱包一次
+    /closed-positions 调用），最终排序依据是 profit_factor 和总 PnL ——
+    "谁交易得多"和"谁赚钱"是两回事，旧实现只有前者。
+
+    `require_passed=False` 时不过滤只排序，用于先观测指标分布再定阈值。
+    返回 (钱包地址列表, 全部候选的质量画像) —— 画像永远是全量的，
+    即使被过滤掉，这样产物里能看到分布。
+    """
+    candidates = discover_wallets_from_trades(
+        recent_trades,
+        min_trades=min_trades,
+        min_notional_usdc=min_notional_usdc,
+        max_wallets=max(1, int(candidate_pool)),
+    )
+    qualities = score_wallets_from_closed_positions(
+        client, candidates, thresholds=thresholds
+    )
+    ranked = rank_wallets_by_quality(
+        qualities, require_passed=require_passed, max_wallets=max_wallets
+    )
+    return [q.wallet_address for q in ranked], qualities
 
 
 def build_wallet_observations_from_trades(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

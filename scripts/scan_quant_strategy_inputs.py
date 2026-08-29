@@ -27,6 +27,7 @@ from polymarket_arb.quant_input_scanner import (
     build_wallet_observations_from_trades,
     build_wallet_profiles_from_markout_rows,
     discover_wallets_from_trades,
+    discover_quality_wallets,
     generate_event_baseline_candidates,
     generate_logical_constraint_candidates,
     promote_wallet_profiles_from_markout_rows,
@@ -34,6 +35,19 @@ from polymarket_arb.quant_input_scanner import (
     select_logical_constraints_with_llm,
     select_research_feeds_with_llm,
 )
+from polymarket_arb.strategies.wallet_quality import WalletQualityThresholds
+
+
+def _wallet_quality_thresholds(args: Any) -> WalletQualityThresholds:
+    """CLI flag -> 阈值对象。缺省值与 WalletQualityThresholds 保持一致."""
+    return WalletQualityThresholds(
+        min_closed_positions=int(getattr(args, "min_closed_positions", 20)),
+        min_win_rate=float(getattr(args, "min_win_rate", 0.60)),
+        min_profit_factor=float(getattr(args, "min_profit_factor", 1.5)),
+        min_total_pnl_usdc=float(getattr(args, "min_total_pnl", 500.0)),
+        max_top_trade_share=float(getattr(args, "max_top_trade_share", 0.30)),
+        min_consistency=float(getattr(args, "min_consistency", 0.70)),
+    )
 
 
 def _load_rows(path: Path) -> list[dict[str, Any]]:
@@ -177,8 +191,30 @@ def main() -> int:
     p_auto_obs.add_argument("--min-trades", type=int, default=3)
     p_auto_obs.add_argument("--min-notional", type=float, default=100.0)
     p_auto_obs.add_argument("--max-wallets", type=int, default=25)
+    # 盈利质量过滤：默认关闭。阈值取自公开参考实现，未在本项目数据上
+    # 验证过，先用 wallet-quality 看分布再决定要不要开。
+    p_auto_obs.add_argument("--quality-filter", action="store_true")
+    p_auto_obs.add_argument("--candidate-pool", type=int, default=50)
+    p_auto_obs.add_argument("--min-closed-positions", type=int, default=20)
+    p_auto_obs.add_argument("--min-win-rate", type=float, default=0.60)
+    p_auto_obs.add_argument("--min-profit-factor", type=float, default=1.5)
+    p_auto_obs.add_argument("--min-total-pnl", type=float, default=500.0)
+    p_auto_obs.add_argument("--max-top-trade-share", type=float, default=0.30)
+    p_auto_obs.add_argument("--min-consistency", type=float, default=0.70)
     p_auto_obs.add_argument("--repeat-interval-sec", type=float, default=0.0)
     p_auto_obs.add_argument("--repeat-count", type=int, default=1, help="Use 0 to repeat forever")
+
+    p_wallet_quality = sub.add_parser(
+        "wallet-quality",
+        help="Score candidate wallets by realised-PnL quality (observation only)",
+    )
+    p_wallet_quality.add_argument("--output", default=None, help="Optional JSON output file")
+    p_wallet_quality.add_argument("--data-api-host", default="https://data-api.polymarket.com")
+    p_wallet_quality.add_argument("--recent-limit", type=int, default=500)
+    p_wallet_quality.add_argument("--min-trades", type=int, default=3)
+    p_wallet_quality.add_argument("--min-notional", type=float, default=100.0)
+    p_wallet_quality.add_argument("--candidate-pool", type=int, default=50)
+    p_wallet_quality.add_argument("--closed-position-limit", type=int, default=500)
 
     p_profiles = sub.add_parser("wallet-profiles", help="Build wallet profiles from offline markout rows")
     p_profiles.add_argument("--output", default=None, help="Optional JSON output file; written atomically")
@@ -435,16 +471,45 @@ def _build_payload(args) -> Any:
     if args.kind == "auto-wallet-observations":
         client = DataApiWalletTradeClient(args.data_api_host)
         recent_trades = client.fetch_recent_trades(limit=args.recent_limit)
-        wallets = discover_wallets_from_trades(
-            recent_trades,
-            min_trades=args.min_trades,
-            min_notional_usdc=args.min_notional,
-            max_wallets=args.max_wallets,
-        )
+        if getattr(args, "quality_filter", False):
+            # 活跃度只圈候选池，最终排序按 profit_factor / 总 PnL。
+            wallets, _ = discover_quality_wallets(
+                client,
+                recent_trades,
+                min_trades=args.min_trades,
+                min_notional_usdc=args.min_notional,
+                candidate_pool=args.candidate_pool,
+                max_wallets=args.max_wallets,
+                thresholds=_wallet_quality_thresholds(args),
+            )
+        else:
+            wallets = discover_wallets_from_trades(
+                recent_trades,
+                min_trades=args.min_trades,
+                min_notional_usdc=args.min_notional,
+                max_wallets=args.max_wallets,
+            )
         trades = []
         for wallet in wallets:
             trades.extend(client.fetch_trades(wallet, limit=args.wallet_trade_limit))
         return build_wallet_observations_from_trades(trades)
+    if args.kind == "wallet-quality":
+        client = DataApiWalletTradeClient(args.data_api_host)
+        recent_trades = client.fetch_recent_trades(limit=args.recent_limit)
+        _, qualities = discover_quality_wallets(
+            client,
+            recent_trades,
+            min_trades=args.min_trades,
+            min_notional_usdc=args.min_notional,
+            candidate_pool=args.candidate_pool,
+            max_wallets=args.candidate_pool,
+            require_passed=False,
+        )
+        return {
+            "schema_version": 1,
+            "generated_at": time.time(),
+            "wallets": [q.to_dict() for q in qualities],
+        }
     if args.kind == "wallet-profiles":
         return build_wallet_profiles_from_markout_rows(
             _load_rows(Path(args.input)),
