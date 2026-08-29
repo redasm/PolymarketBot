@@ -184,6 +184,8 @@ def create_cross_platform_scanner(
         ob_analyzer,
         poly_fee_rate=config.polymarket_taker_fee_rate,
         kalshi_fee_rate=config.kalshi_taker_fee_rate,
+        entity_veto_enabled=config.cross_platform_entity_veto_enabled,
+        min_token_overlap=config.cross_platform_min_token_overlap,
     )
     scanner.load_pairs_from_config([item for item in pairs if isinstance(item, dict)])
     LOG.info("跨平台扫描器已启用: 配对=%d", len(getattr(scanner, "_pairs", [])))

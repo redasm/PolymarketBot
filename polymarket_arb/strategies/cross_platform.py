@@ -39,6 +39,7 @@ from typing import Any, Optional
 import requests
 
 from polymarket_arb.confidence import confidence_from_edge_pct
+from polymarket_arb.strategies.market_entity_match import verify_pair_match
 from polymarket_arb.models import FeeStructure
 
 LOG = logging.getLogger(__name__)
@@ -63,6 +64,12 @@ class CrossPlatformPair:
     polymarket_slug: str
     kalshi_ticker: str
     kalshi_event_ticker: str
+
+    # 两侧的问题原文。有了它才能做实体一致性校验 —— 手写配对最危险的
+    # 失败模式是"配错了"而不是"配漏了"：阈值/日期/方向不同的两个市场
+    # 看起来仍然会满足 poly_yes + kalshi_no < 1。留空则跳过校验。
+    polymarket_question: str = ""
+    kalshi_title: str = ""
 
     poly_yes_price: float = 0.0
     poly_no_price: float = 0.0
@@ -179,12 +186,18 @@ class CrossPlatformScanner:
         *,
         poly_fee_rate: float = DEFAULT_POLY_FEE_RATE,
         kalshi_fee_rate: float = DEFAULT_KALSHI_FEE_RATE,
+        entity_veto_enabled: bool = True,
+        min_token_overlap: float = 0.0,
     ):
         self._kalshi = kalshi
         self._poly_ob = poly_ob_analyzer
         self._poly_fee_rate = max(0.0, float(poly_fee_rate))
         self._kalshi_fee_rate = max(0.0, float(kalshi_fee_rate))
         self._pairs: list[CrossPlatformPair] = []
+        self._entity_veto_enabled = bool(entity_veto_enabled)
+        self._min_token_overlap = max(0.0, float(min_token_overlap))
+        # pair_id -> 否决原因，供 telemetry 与排障读取。
+        self.last_veto_summary: dict[str, list[str]] = {}
 
     def add_pair(self, pair: CrossPlatformPair) -> None:
         self._pairs.append(pair)
@@ -200,12 +213,17 @@ class CrossPlatformScanner:
                 polymarket_slug=cfg.get("poly_slug", ""),
                 kalshi_ticker=cfg.get("kalshi_ticker", ""),
                 kalshi_event_ticker=cfg.get("kalshi_event", ""),
+                polymarket_question=str(
+                    cfg.get("poly_question") or cfg.get("description") or ""
+                ),
+                kalshi_title=str(cfg.get("kalshi_title") or ""),
             )
             self._pairs.append(pair)
 
     def scan(self) -> list[CrossPlatformOpportunity]:
         """扫描所有配对的跨平台套利机会."""
         opportunities: list[CrossPlatformOpportunity] = []
+        self.last_veto_summary = {}
 
         for pair in self._pairs:
             self._refresh_prices(pair)
@@ -227,8 +245,41 @@ class CrossPlatformScanner:
             yes_p, no_p = self._kalshi.extract_prices(kalshi_market)
             pair.kalshi_yes_price = yes_p
             pair.kalshi_no_price = no_p
+            if not pair.kalshi_title:
+                # 配置里没写 kalshi_title 就用接口返回的标题，这样实体
+                # 校验对既有配置也能生效，无需用户重写配对表。
+                title = str(kalshi_market.get("title") or "").strip()
+                subtitle = str(kalshi_market.get("subtitle") or "").strip()
+                pair.kalshi_title = " ".join(part for part in (title, subtitle) if part)
 
         pair.last_updated = time.time()
+
+    def _pair_is_consistent(self, pair: CrossPlatformPair) -> bool:
+        """实体一致性否决：证据表明两侧不是同一事件时返回 False.
+
+        只否决，不建对。任一侧缺问题原文就放行 —— 宁可放过一个错配，
+        也不能因为文案差异静默关掉用户手写的合法配对。
+        """
+        if not self._entity_veto_enabled:
+            return True
+        verification = verify_pair_match(
+            pair.polymarket_question,
+            pair.kalshi_title,
+            min_token_overlap=self._min_token_overlap,
+        )
+        if verification.ok:
+            return True
+        self.last_veto_summary[pair.pair_id or pair.kalshi_ticker] = list(
+            verification.mismatches
+        )
+        LOG.warning(
+            "跨平台配对实体不一致，已否决: pair=%s 原因=%s | poly=%r kalshi=%r",
+            pair.pair_id or pair.kalshi_ticker,
+            ",".join(verification.mismatches),
+            pair.polymarket_question[:80],
+            pair.kalshi_title[:80],
+        )
+        return False
 
     def _check_pair(self, pair: CrossPlatformPair) -> Optional[CrossPlatformOpportunity]:
         """检查单个配对是否存在套利.
@@ -239,6 +290,9 @@ class CrossPlatformScanner:
 
         任一方向 cost < 1.0 (扣费后) → 套利
         """
+        if not self._pair_is_consistent(pair):
+            return None
+
         poly_fee_rate = self._poly_fee_rate
         kalshi_fee_rate = self._kalshi_fee_rate
 

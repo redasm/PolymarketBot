@@ -486,6 +486,15 @@ class ArbConfig:
     t2_updown_basis_log_interval_sec: float = 300.0
     t2_updown_basis_alert_bps: float = 50.0
 
+    # T1 跨平台配对的实体一致性否决。手写配对最危险的失败模式是"配错了"
+    # 而不是"配漏了"：阈值 / 日期 / 方向不同的两个市场，poly_yes +
+    # kalshi_no < 1 看起来仍像无风险套利，实际两条腿可能同时输。
+    # 只否决不建对；任一侧缺问题原文就放行。
+    cross_platform_entity_veto_enabled: bool = True
+    # 词元 Jaccard 重叠下限。默认 0（关闭）：跨平台措辞差异很大但确实
+    # 同一事件的配对很常见，用词重叠去否决容易误伤。
+    cross_platform_min_token_overlap: float = 0.0
+
     def __post_init__(self) -> None:
         self.validate()
 
@@ -690,6 +699,8 @@ class ArbConfig:
             raise ValueError("T2_UPDOWN_BASIS_LOG_INTERVAL_SEC 不能为负数")
         if self.t2_updown_basis_alert_bps < 0:
             raise ValueError("T2_UPDOWN_BASIS_ALERT_BPS 不能为负数")
+        if not (0.0 <= self.cross_platform_min_token_overlap <= 1.0):
+            raise ValueError("CROSS_PLATFORM_MIN_TOKEN_OVERLAP 必须在 [0, 1]")
         if self.t2_scale_out_tranches < 1:
             raise ValueError("T2_SCALE_OUT_TRANCHES 必须 >= 1")
         if self.t2_stop_loss_dynamic_k < 0:
@@ -1018,6 +1029,12 @@ class ArbConfig:
                 "T2_UPDOWN_BASIS_LOG_INTERVAL_SEC", 300.0
             ),
             t2_updown_basis_alert_bps=_env_float("T2_UPDOWN_BASIS_ALERT_BPS", 50.0),
+            cross_platform_entity_veto_enabled=_env_bool(
+                "CROSS_PLATFORM_ENTITY_VETO_ENABLED", True
+            ),
+            cross_platform_min_token_overlap=_env_float(
+                "CROSS_PLATFORM_MIN_TOKEN_OVERLAP", 0.0
+            ),
             tick_record_enabled=_env_bool("TICK_RECORD_ENABLED", False),
             tick_record_dir=_env("TICK_RECORD_DIR", "data/ticks"),
             telemetry_record_enabled=_env_bool("TELEMETRY_RECORD_ENABLED", False),
