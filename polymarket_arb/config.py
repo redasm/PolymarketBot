@@ -495,6 +495,20 @@ class ArbConfig:
     # 同一事件的配对很常见，用词重叠去否决容易误伤。
     cross_platform_min_token_overlap: float = 0.0
 
+    # T3 抗狙击。做市的主要成本是逆向选择，不是 spread —— 跳变瞬间被扫、
+    # 被单个异常 tick 牵着追价、刚被吃就原价补挂，是三个最常见的被吃场景。
+    # 阈值用 tick 而不是 bps：1 个 tick 在 0.50 是 200 bps、在 0.05 是
+    # 2000 bps，用 bps 设阈值会让低价市场永久暂停、高价市场形同虚设。
+    t3_anti_snipe_enabled: bool = True
+    t3_anti_snipe_jump_ticks: float = 3.0
+    t3_anti_snipe_jump_pause_sec: float = 20.0
+    t3_anti_snipe_stable_ticks_required: int = 2
+    t3_anti_snipe_stable_band_ticks: float = 1.0
+    t3_anti_snipe_ema_alpha: float = 0.3
+    t3_anti_snipe_mid_history: int = 7
+    t3_anti_snipe_post_fill_cooldown_sec: float = 15.0
+    t3_anti_snipe_max_chase_ticks: float = 2.0
+
     def __post_init__(self) -> None:
         self.validate()
 
@@ -701,6 +715,22 @@ class ArbConfig:
             raise ValueError("T2_UPDOWN_BASIS_ALERT_BPS 不能为负数")
         if not (0.0 <= self.cross_platform_min_token_overlap <= 1.0):
             raise ValueError("CROSS_PLATFORM_MIN_TOKEN_OVERLAP 必须在 [0, 1]")
+        if self.t3_anti_snipe_jump_ticks < 0:
+            raise ValueError("T3_ANTI_SNIPE_JUMP_TICKS 不能为负数")
+        if self.t3_anti_snipe_jump_pause_sec < 0:
+            raise ValueError("T3_ANTI_SNIPE_JUMP_PAUSE_SEC 不能为负数")
+        if self.t3_anti_snipe_stable_ticks_required < 0:
+            raise ValueError("T3_ANTI_SNIPE_STABLE_TICKS_REQUIRED 不能为负数")
+        if self.t3_anti_snipe_stable_band_ticks < 0:
+            raise ValueError("T3_ANTI_SNIPE_STABLE_BAND_TICKS 不能为负数")
+        if not (0.0 <= self.t3_anti_snipe_ema_alpha <= 1.0):
+            raise ValueError("T3_ANTI_SNIPE_EMA_ALPHA 必须在 [0, 1]")
+        if self.t3_anti_snipe_mid_history < 1:
+            raise ValueError("T3_ANTI_SNIPE_MID_HISTORY 必须 >= 1")
+        if self.t3_anti_snipe_post_fill_cooldown_sec < 0:
+            raise ValueError("T3_ANTI_SNIPE_POST_FILL_COOLDOWN_SEC 不能为负数")
+        if self.t3_anti_snipe_max_chase_ticks < 0:
+            raise ValueError("T3_ANTI_SNIPE_MAX_CHASE_TICKS 不能为负数")
         if self.t2_scale_out_tranches < 1:
             raise ValueError("T2_SCALE_OUT_TRANCHES 必须 >= 1")
         if self.t2_stop_loss_dynamic_k < 0:
@@ -1034,6 +1064,25 @@ class ArbConfig:
             ),
             cross_platform_min_token_overlap=_env_float(
                 "CROSS_PLATFORM_MIN_TOKEN_OVERLAP", 0.0
+            ),
+            t3_anti_snipe_enabled=_env_bool("T3_ANTI_SNIPE_ENABLED", True),
+            t3_anti_snipe_jump_ticks=_env_float("T3_ANTI_SNIPE_JUMP_TICKS", 3.0),
+            t3_anti_snipe_jump_pause_sec=_env_float(
+                "T3_ANTI_SNIPE_JUMP_PAUSE_SEC", 20.0
+            ),
+            t3_anti_snipe_stable_ticks_required=_env_int(
+                "T3_ANTI_SNIPE_STABLE_TICKS_REQUIRED", 2
+            ),
+            t3_anti_snipe_stable_band_ticks=_env_float(
+                "T3_ANTI_SNIPE_STABLE_BAND_TICKS", 1.0
+            ),
+            t3_anti_snipe_ema_alpha=_env_float("T3_ANTI_SNIPE_EMA_ALPHA", 0.3),
+            t3_anti_snipe_mid_history=_env_int("T3_ANTI_SNIPE_MID_HISTORY", 7),
+            t3_anti_snipe_post_fill_cooldown_sec=_env_float(
+                "T3_ANTI_SNIPE_POST_FILL_COOLDOWN_SEC", 15.0
+            ),
+            t3_anti_snipe_max_chase_ticks=_env_float(
+                "T3_ANTI_SNIPE_MAX_CHASE_TICKS", 2.0
             ),
             tick_record_enabled=_env_bool("TICK_RECORD_ENABLED", False),
             tick_record_dir=_env("TICK_RECORD_DIR", "data/ticks"),

@@ -871,6 +871,8 @@ def collect_maker_strategy_signals(
     event_baselines: dict[str, dict[str, Any]] | str | None = None,
     reward_config_provider: Callable[[str], Any] | None = None,
     rewards_only: bool = False,
+    anti_snipe_guard: Any | None = None,
+    now: float | None = None,
 ) -> list[StrategySignal]:
     """T3 maker quote signals around model fair value.
 
@@ -898,11 +900,19 @@ def collect_maker_strategy_signals(
     `rewards_only` skips markets with no reward band entirely. Off by
     default so enabling the provider does not silently shrink the
     maker universe.
+
+    `anti_snipe_guard` gates quoting on mid-jump pauses, post-fill
+    cooldowns and stable-mid confirmation, supplies a filtered mid as
+    the quote anchor, and caps how far a quote may move in one cycle.
+    It is stateful and advances once per token per cycle — never call
+    this collector twice on the same market in one cycle with a guard
+    attached.
     """
     signals: list[StrategySignal] = []
     skip_reasons: dict[str, int] = {}
     skip_by_market: dict[str, dict[str, Any]] = {}
     event_baseline_map = _parse_event_baselines(event_baselines)
+    now_ts = time.time() if now is None else float(now)
     for market in candidate_markets:
         if len(market.tokens) != 2 or market.closed or not market.active:
             _record_skip(skip_reasons, skip_by_market, market.condition_id, "non_binary_or_inactive")
@@ -952,16 +962,38 @@ def collect_maker_strategy_signals(
         if rewards_only and reward_delta <= 0:
             _record_skip(skip_reasons, skip_by_market, market.condition_id, "no_reward_band")
             continue
+
+        tick_size = max(float(getattr(snap, "tick_size", 0.01) or 0.01), 0.01)
+        anti_snipe = _maker_anti_snipe_decision(
+            anti_snipe_guard, yes_token.token_id, float(snap.mid), now_ts, tick_size
+        )
+        if anti_snipe is not None and not anti_snipe.allow:
+            _record_skip(
+                skip_reasons,
+                skip_by_market,
+                market.condition_id,
+                f"anti_snipe_{anti_snipe.reason}",
+            )
+            continue
+        # 报价锚点用滤波后的中价，不用原始 mid —— 单笔异常成交打歪的
+        # mid 会把报价拖过去，而下一 tick 往往就回来了。
+        quote_mid = (
+            float(anti_snipe.filtered_mid)
+            if anti_snipe is not None and anti_snipe.filtered_mid
+            else float(snap.mid)
+        )
         quote = maker_strategy.compute_quote(
             token_id=yes_token.token_id,
             condition_id=market.condition_id,
             fair_value=float(fair_value),
-            tick_size=max(float(getattr(snap, "tick_size", 0.01) or 0.01), 0.01),
-            mid_price=float(snap.mid),
+            tick_size=tick_size,
+            mid_price=quote_mid,
             reward_delta=reward_delta if reward_delta > 0 else None,
             flow_bias_yes_share=flow_share,
             spread_multiplier=float(event_toxicity["spread_multiplier"]),
         )
+        if quote is not None and anti_snipe_guard is not None:
+            _apply_chase_limit(anti_snipe_guard, yes_token.token_id, quote, tick_size)
         if quote is None or (quote.bid_price is None and quote.ask_price is None):
             _record_skip(skip_reasons, skip_by_market, market.condition_id, "maker_no_quote")
             continue
@@ -1013,9 +1045,11 @@ def collect_maker_strategy_signals(
             "category_maker_taker_gap_pp": gap_pp,
             "queue_position": _maker_queue_position_payload(snap, quote),
             "reward_band": _maker_reward_band_payload(
-                reward_config, reward_delta, float(snap.mid), quote
+                reward_config, reward_delta, quote_mid, quote
             ),
         }
+        if anti_snipe is not None:
+            payload["anti_snipe"] = anti_snipe.to_dict()
         if event_toxicity["applied"]:
             payload["event_time_toxicity"] = event_toxicity
         if flow_bias_payload is not None:
@@ -1044,6 +1078,36 @@ def collect_maker_strategy_signals(
         )[:10],
     }
     return signals
+
+
+def _maker_anti_snipe_decision(
+    guard: Any | None, token_id: str, mid: float, now: float, tick_size: float
+) -> Any:
+    """推进抗狙击状态机。guard 未启用或异常时返回 None（等价于放行）."""
+    if guard is None:
+        return None
+    try:
+        return guard.evaluate(token_id, mid, now, tick_size=tick_size)
+    except Exception as exc:  # noqa: BLE001 - 保护层失效不该让做市停摆
+        LOG.warning("抗狙击判定失败 token=%s: %s", str(token_id)[:12], exc)
+        return None
+
+
+def _apply_chase_limit(guard: Any, token_id: str, quote: Any, tick_size: float) -> None:
+    """就地限制报价相对上次的移动幅度，并同步 spread."""
+    try:
+        bid, ask = guard.clamp_chase(
+            token_id,
+            bid=quote.bid_price,
+            ask=quote.ask_price,
+            tick_size=tick_size,
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning("追价限制失败 token=%s: %s", str(token_id)[:12], exc)
+        return
+    quote.bid_price = bid
+    quote.ask_price = ask
+    quote.spread = (ask - bid) if (bid is not None and ask is not None) else 0.0
 
 
 def _maker_reward_config(

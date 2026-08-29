@@ -147,6 +147,10 @@ from polymarket_arb.main_helpers.scan_focus import (
 from polymarket_arb.market_scanner import MarketScanner
 from polymarket_arb.rewards_client import RewardsClient
 from polymarket_arb.user_feed import UserChannelFeed
+from polymarket_arb.strategies.maker_anti_snipe import (
+    AntiSnipeConfig as _AntiSnipeConfig,
+    AntiSnipeGuard as _AntiSnipeGuard,
+)
 from polymarket_arb.models import (
     MarketInfo,
     ResearchSignalReport,
@@ -532,6 +536,21 @@ def main(dotenv_path: str | None = None) -> None:
     )
     # 挂在带内 != 真计分。这个 state 跨周期记住每个挂单连续未计分多久。
     maker_scoring_state = _MakerScoringAuditState()
+    # 抗狙击：跳变暂停 / 稳定确认 / 滤波中价 / 成交冷却 / 追价上限。
+    # 有状态且每 token 每周期只推进一次，所以由主循环持有。
+    anti_snipe_guard = _AntiSnipeGuard(
+        _AntiSnipeConfig(
+            enabled=config.t3_anti_snipe_enabled,
+            mid_history_size=config.t3_anti_snipe_mid_history,
+            jump_pause_ticks=config.t3_anti_snipe_jump_ticks,
+            jump_pause_sec=config.t3_anti_snipe_jump_pause_sec,
+            stable_ticks_required=config.t3_anti_snipe_stable_ticks_required,
+            stable_band_ticks=config.t3_anti_snipe_stable_band_ticks,
+            ema_alpha=config.t3_anti_snipe_ema_alpha,
+            post_fill_cooldown_sec=config.t3_anti_snipe_post_fill_cooldown_sec,
+            max_chase_ticks=config.t3_anti_snipe_max_chase_ticks,
+        )
+    )
     cross_platform_scanner = _create_cross_platform_scanner(config, ob_analyzer)
     tick_recorder = TickRecorder(
         output_dir=config.tick_record_dir,
@@ -1318,6 +1337,7 @@ def main(dotenv_path: str | None = None) -> None:
                 event_baselines=quant_inputs.event_baselines_json,
                 reward_config_provider=rewards_client.cached,
                 rewards_only=config.maker_rewards_only,
+                anti_snipe_guard=anti_snipe_guard,
             )
             if config.maker_strategy_enabled
             else []
@@ -1704,6 +1724,8 @@ def main(dotenv_path: str | None = None) -> None:
             live_markets_by_cid = {m.condition_id: m for m in execution_markets}
 
             def _register_live_maker_fill(trade: TradeRecord, _fill_delta: float) -> None:
+                # 刚被吃说明对手方可能有信息优势，冷却一段时间再重挂。
+                anti_snipe_guard.register_fill(trade.token_id, time.time())
                 t3_maker_exit_manager.register_fill(
                     trade=trade,
                     market=live_markets_by_cid.get(trade.condition_id),
@@ -1799,6 +1821,8 @@ def main(dotenv_path: str | None = None) -> None:
             shadow_markets_by_cid = {m.condition_id: m for m in execution_markets}
 
             def _register_shadow_maker_fill(trade: TradeRecord, _fill_delta: float) -> None:
+                # 刚被吃说明对手方可能有信息优势，冷却一段时间再重挂。
+                anti_snipe_guard.register_fill(trade.token_id, time.time())
                 t3_maker_exit_manager.register_fill(
                     trade=trade,
                     market=shadow_markets_by_cid.get(trade.condition_id),

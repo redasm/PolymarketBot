@@ -894,3 +894,92 @@ def test_maker_rewards_only_skips_unincentivized_markets():
     assert maker.calls == []
     summary = collect_maker_strategy_signals.last_skip_summary
     assert summary["reasons"].get("no_reward_band") == 1
+
+
+# --------- T3: 抗狙击接线 ----------
+
+
+def _anti_snipe_guard(**kwargs):
+    from polymarket_arb.strategies.maker_anti_snipe import AntiSnipeConfig, AntiSnipeGuard
+
+    return AntiSnipeGuard(AntiSnipeConfig(**kwargs))
+
+
+def _collect_maker(maker, guard=None, now=0.0, mid=0.50):
+    return collect_maker_strategy_signals(
+        candidate_markets=[_binary_market("m")],
+        ob_analyzer=_StubBookAnalyzer({"m-yes": _balanced_snapshot("m-yes", mid=mid)}),
+        maker_strategy=maker,
+        fair_values_by_market={"m": 0.50},
+        anti_snipe_guard=guard,
+        now=now,
+    )
+
+
+def test_maker_blocks_quote_after_mid_jump():
+    guard = _anti_snipe_guard(jump_pause_ticks=3.0)
+    maker = _StubMaker(quote=_maker_quote())
+    assert len(_collect_maker(maker, guard, now=0.0, mid=0.50)) == 1
+    assert _collect_maker(maker, guard, now=1.0, mid=0.60) == []
+    summary = collect_maker_strategy_signals.last_skip_summary
+    assert summary["reasons"].get("anti_snipe_mid_jump") == 1
+
+
+def test_maker_uses_filtered_mid_as_quote_anchor():
+    guard = _anti_snipe_guard(jump_pause_ticks=1000.0, ema_alpha=0.5, use_median=False)
+    maker = _StubMaker(quote=_maker_quote())
+    _collect_maker(maker, guard, now=0.0, mid=0.50)
+    _collect_maker(maker, guard, now=1.0, mid=0.60)
+    # 第二次报价的锚点应该是滤波后的中价，不是原始的 0.60。
+    assert 0.50 < maker.calls[1]["mid_price"] < 0.60
+
+
+def test_maker_blocks_quote_during_post_fill_cooldown():
+    guard = _anti_snipe_guard(post_fill_cooldown_sec=30.0)
+    maker = _StubMaker(quote=_maker_quote())
+    _collect_maker(maker, guard, now=0.0)
+    guard.register_fill("m-yes", 1.0)
+    assert _collect_maker(maker, guard, now=5.0) == []
+    summary = collect_maker_strategy_signals.last_skip_summary
+    assert summary["reasons"].get("anti_snipe_post_fill_cooldown") == 1
+
+
+def test_maker_caps_quote_chase_between_cycles():
+    guard = _anti_snipe_guard(jump_pause_ticks=1000.0, max_chase_ticks=2.0, ema_alpha=0.0)
+    maker = _StubMaker(quote=_maker_quote(bid=0.49, ask=0.51))
+    _collect_maker(maker, guard, now=0.0)
+    maker._quote = _maker_quote(bid=0.60, ask=0.62)
+    out = _collect_maker(maker, guard, now=1.0)
+    assert out[0].payload["quote"]["bid_price"] == pytest.approx(0.51)
+    assert out[0].payload["quote"]["ask_price"] == pytest.approx(0.53)
+
+
+def test_maker_records_anti_snipe_telemetry():
+    guard = _anti_snipe_guard()
+    maker = _StubMaker(quote=_maker_quote())
+    out = _collect_maker(maker, guard, now=0.0)
+    payload = out[0].payload["anti_snipe"]
+    assert payload["allow"] is True
+    assert payload["raw_mid"] == pytest.approx(0.50)
+
+
+def test_maker_without_guard_is_unchanged():
+    maker = _StubMaker(quote=_maker_quote())
+    out = _collect_maker(maker, guard=None, now=0.0)
+    assert len(out) == 1
+    assert "anti_snipe" not in out[0].payload
+    assert maker.calls[0]["mid_price"] == pytest.approx(0.50)
+
+
+def test_maker_survives_a_broken_guard():
+    class _BrokenGuard:
+        def evaluate(self, *_args, **_kwargs):
+            raise RuntimeError("guard exploded")
+
+        def clamp_chase(self, *_args, **_kwargs):
+            raise RuntimeError("guard exploded")
+
+    maker = _StubMaker(quote=_maker_quote())
+    out = _collect_maker(maker, _BrokenGuard(), now=0.0)
+    # 保护层失效不该让做市停摆。
+    assert len(out) == 1
