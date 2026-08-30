@@ -12,7 +12,14 @@ custom_pricing_rules.json
 arb_state.json
 positions_snapshot.json
 *.log
-data/
+# 只忽略仓库根部的运行时数据目录。以前写作无锚定的 `data/`，会匹配任意
+# 层级的同名目录 —— research/backtest/data/ 因此被整个吞掉，连同里面的
+# reader.py 源码模块，导致 `python -m research.backtest.run` 与
+# tests/test_backtest_runner.py 在任何全新 clone 上都直接 ImportError。
+/data/
+# 回测数据集本身仍然不入库，但该目录下的 .py 源码必须入库。
+research/backtest/data/*
+!research/backtest/data/*.py
 .tmp_selftest*/
 research/backtest/output/
 .pytest-tmp*/

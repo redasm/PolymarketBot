@@ -925,13 +925,18 @@ def test_maker_blocks_quote_after_mid_jump():
     assert summary["reasons"].get("anti_snipe_mid_jump") == 1
 
 
-def test_maker_uses_filtered_mid_as_quote_anchor():
+def test_filtered_mid_drives_jump_detection_not_the_quote():
+    """滤波中价只服务于跳变判定与 telemetry，不进 compute_quote."""
     guard = _anti_snipe_guard(jump_pause_ticks=1000.0, ema_alpha=0.5, use_median=False)
     maker = _StubMaker(quote=_maker_quote())
     _collect_maker(maker, guard, now=0.0, mid=0.50)
-    _collect_maker(maker, guard, now=1.0, mid=0.60)
-    # 第二次报价的锚点应该是滤波后的中价，不是原始的 0.60。
-    assert 0.50 < maker.calls[1]["mid_price"] < 0.60
+    out = _collect_maker(maker, guard, now=1.0, mid=0.60)
+    # 传给 compute_quote 的是原始 mid。
+    assert maker.calls[1]["mid_price"] == pytest.approx(0.60)
+    # 滤波值在 telemetry 里可见，且确实被平滑过。
+    payload = out[0].payload["anti_snipe"]
+    assert payload["raw_mid"] == pytest.approx(0.60)
+    assert 0.50 < payload["filtered_mid"] < 0.60
 
 
 def test_maker_blocks_quote_during_post_fill_cooldown():
@@ -983,3 +988,35 @@ def test_maker_survives_a_broken_guard():
     out = _collect_maker(maker, _BrokenGuard(), now=0.0)
     # 保护层失效不该让做市停摆。
     assert len(out) == 1
+
+
+def test_reward_band_is_centred_on_the_real_mid_not_the_filtered_mid():
+    """回归：奖励带带心必须是真实盘口中价.
+
+    compute_quote 里 mid_price 唯一的用途就是奖励带带心，而交易所计分对
+    的是真实中价。传滤波中价会让"我以为在带内"和"交易所认定在带内"系统
+    性错开 (raw - filtered)。
+    """
+    guard = _anti_snipe_guard(jump_pause_ticks=1000.0, ema_alpha=0.5, use_median=False)
+    maker = _StubMaker(quote=_maker_quote())
+
+    def _collect(now, mid):
+        return collect_maker_strategy_signals(
+            candidate_markets=[_binary_market("m")],
+            ob_analyzer=_StubBookAnalyzer({"m-yes": _balanced_snapshot("m-yes", mid=mid)}),
+            maker_strategy=maker,
+            fair_values_by_market={"m": 0.50},
+            reward_config_provider=lambda cid: _reward_cfg(0.03),
+            anti_snipe_guard=guard,
+            now=now,
+        )
+
+    _collect(0.0, 0.50)
+    out = _collect(1.0, 0.60)
+
+    # 滤波中价此时落在 0.50 和 0.60 之间，但带心必须是 0.60。
+    assert guard.evaluate("probe", 0.60, 2.0) is not None  # guard 仍可用
+    assert maker.calls[1]["mid_price"] == pytest.approx(0.60)
+    band = out[0].payload["reward_band"]
+    assert band["band_lo"] == pytest.approx(0.57)
+    assert band["band_hi"] == pytest.approx(0.63)

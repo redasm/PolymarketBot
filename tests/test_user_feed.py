@@ -323,3 +323,26 @@ def test_unchanged_event_is_not_reported_as_changed():
     )
     assert result.polled == [trade]
     assert result.changed == []
+
+
+def test_two_identical_orders_both_reach_the_changed_list():
+    """回归：TradeRecord 是带默认 __eq__ 的 dataclass.
+
+    用 `trade not in changed` 去重时，同市场同价同量的两笔挂单会被判为
+    相等，其中一笔的成交就永远到不了 maker 库存与退出管理器。
+    """
+    engine = _engine()
+    first = _trade("o1")
+    second = _trade("o2")
+    # 除 order_id / trade_id 外字段完全一致
+    second.trade_id = first.trade_id
+    engine._trade_history.extend([first, second])
+
+    result = engine.apply_user_channel_events(
+        [
+            UserOrderEvent(order_id="o1", event_type="UPDATE", cumulative_matched=10.0),
+            UserOrderEvent(order_id="o2", event_type="UPDATE", cumulative_matched=10.0),
+        ]
+    )
+    assert len(result.changed) == 2
+    assert {id(t) for t in result.changed} == {id(first), id(second)}

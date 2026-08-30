@@ -824,6 +824,10 @@ class ExecutionEngine:
         polled: list[TradeRecord] = []
         changed: list[TradeRecord] = []
         touched: set[int] = set()
+        # 按对象身份去重，不能用 `trade not in changed` —— TradeRecord 是
+        # 带默认 __eq__ 的 dataclass，同市场同价同量的两笔挂单会被判为相等，
+        # 其中一笔的成交就永远到不了库存与退出管理器。
+        changed_ids: set[int] = set()
 
         for event in events:
             trade = by_order.get(str(getattr(event, "order_id", "")))
@@ -836,7 +840,8 @@ class ExecutionEngine:
             before = (trade.status, trade.fill_size, trade.fill_price, trade.error or "")
             self._apply_single_user_event(trade, event)
             after = (trade.status, trade.fill_size, trade.fill_price, trade.error or "")
-            if after != before and trade not in changed:
+            if after != before and id(trade) not in changed_ids:
+                changed_ids.add(id(trade))
                 changed.append(trade)
                 LOG.info(
                     "user 频道订单更新: order=%s status=%s fill_size=%s fill_price=%s",

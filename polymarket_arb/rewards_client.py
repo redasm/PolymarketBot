@@ -152,7 +152,6 @@ class RewardsClient:
         # 后台预热：扫描热路径只读缓存，网络调用全部丢给 worker 线程。
         self._pending: collections.deque[str] = collections.deque()
         self._pending_set: set[str] = set()
-        self._pending_cv = threading.Condition(self._lock)
         self._worker: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._fetch_interval_sec = max(0.0, float(fetch_interval_sec))
@@ -232,8 +231,6 @@ class RewardsClient:
                 self._pending.append(cid)
                 self._pending_set.add(cid)
                 queued += 1
-            if queued:
-                self._pending_cv.notify()
         if queued:
             self._ensure_worker()
         return queued
@@ -293,7 +290,6 @@ class RewardsClient:
         with self._lock:
             self._pending.clear()
             self._pending_set.clear()
-            self._pending_cv.notify_all()
             worker = self._worker
         if worker is not None and worker.is_alive():
             worker.join(timeout=2.0)

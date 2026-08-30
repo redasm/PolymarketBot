@@ -902,11 +902,13 @@ def collect_maker_strategy_signals(
     maker universe.
 
     `anti_snipe_guard` gates quoting on mid-jump pauses, post-fill
-    cooldowns and stable-mid confirmation, supplies a filtered mid as
-    the quote anchor, and caps how far a quote may move in one cycle.
-    It is stateful and advances once per token per cycle — never call
-    this collector twice on the same market in one cycle with a guard
-    attached.
+    cooldowns and stable-mid confirmation, and caps how far a quote may
+    move in one cycle. Its filtered mid drives jump detection and
+    telemetry only — it is deliberately NOT used as the reward-band
+    centre, which must track the real book mid the venue scores against.
+    The guard is stateful and advances once per token per cycle — never
+    call this collector twice on the same market in one cycle with a
+    guard attached.
     """
     signals: list[StrategySignal] = []
     skip_reasons: dict[str, int] = {}
@@ -975,19 +977,16 @@ def collect_maker_strategy_signals(
                 f"anti_snipe_{anti_snipe.reason}",
             )
             continue
-        # 报价锚点用滤波后的中价，不用原始 mid —— 单笔异常成交打歪的
-        # mid 会把报价拖过去，而下一 tick 往往就回来了。
-        quote_mid = (
-            float(anti_snipe.filtered_mid)
-            if anti_snipe is not None and anti_snipe.filtered_mid
-            else float(snap.mid)
-        )
+        # `mid_price` 传**原始** mid，不能传滤波中价。它在 compute_quote
+        # 里唯一的用途是奖励带的带心，而交易所计分时对的是真实盘口中价
+        # —— 用我方的 EMA 当带心，会让"我以为在带内"和"交易所认定在带内"
+        # 系统性错开 (raw - filtered)。滤波中价只用于跳变判定和 telemetry。
         quote = maker_strategy.compute_quote(
             token_id=yes_token.token_id,
             condition_id=market.condition_id,
             fair_value=float(fair_value),
             tick_size=tick_size,
-            mid_price=quote_mid,
+            mid_price=float(snap.mid),
             reward_delta=reward_delta if reward_delta > 0 else None,
             flow_bias_yes_share=flow_share,
             spread_multiplier=float(event_toxicity["spread_multiplier"]),
@@ -1045,7 +1044,7 @@ def collect_maker_strategy_signals(
             "category_maker_taker_gap_pp": gap_pp,
             "queue_position": _maker_queue_position_payload(snap, quote),
             "reward_band": _maker_reward_band_payload(
-                reward_config, reward_delta, quote_mid, quote
+                reward_config, reward_delta, float(snap.mid), quote
             ),
         }
         if anti_snipe is not None:
