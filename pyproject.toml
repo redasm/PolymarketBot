@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polymarket-arb"
+version = "0.1.0"
+description = "Polymarket multi-tier arbitrage and market-making bot, published as research infrastructure and a record of negative results"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "redasm" }]
+keywords = [
+    "polymarket",
+    "prediction-markets",
+    "arbitrage",
+    "market-making",
+    "quantitative-trading",
+    "backtesting",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+dependencies = [
+    "py-clob-client==0.34.6",
+    # Pinned upper bound: ExecutionEngine relies on `_force_py_clob_http1` to
+    # toggle the module-private `_http_client` attribute. New majors of the
+    # client may rename or relocate that hook (see contract test in
+    # `tests/test_client_factory.py`); upgrade only after re-validating.
+    "py-clob-client-v2>=1.0.0,<2.0.0",
+    "python-dotenv>=1.0.0",
+    "requests>=2.31.0",
+    "websockets>=12.0",
+    "aiohttp>=3.9.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/redasm/PolymarketBot"
+Repository = "https://github.com/redasm/PolymarketBot"
+Issues = "https://github.com/redasm/PolymarketBot/issues"
+Documentation = "https://github.com/redasm/PolymarketBot/tree/master/doc"
+
+[project.optional-dependencies]
+ai = [
+    "openai>=1.30.0",
+    "anthropic>=0.30.0",
+    "httpx>=0.27.0",
+]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["polymarket_arb*", "research*", "research_signal*"]
+exclude = ["tests*", "data*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

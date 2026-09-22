@@ -1,0 +1,4 @@
+# AI providers are optional. Install this only when AI features are enabled.
+openai>=1.30.0
+anthropic>=0.30.0
+httpx>=0.27.0

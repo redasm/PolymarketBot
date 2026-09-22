@@ -1,0 +1,52 @@
+# --- Secrets. Never commit these. -------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Python ------------------------------------------------------------------
+*.pyc
+__pycache__/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# --- Editor / tooling local state --------------------------------------------
+.idea/
+.vscode/
+.claude/settings.local.json
+
+# --- Runtime state and logs ---------------------------------------------------
+custom_pricing_rules.json
+arb_state.json
+positions_snapshot.json
+*.log
+
+# Only ignore the runtime data directory at the repository root. This used to be
+# written as an unanchored `data/`, which matched the directory at any depth --
+# research/backtest/data/ was swallowed whole, including the reader.py source
+# module, so `python -m research.backtest.run` and tests/test_backtest_runner.py
+# failed with ImportError on every fresh clone.
+/data/
+
+# Backtest datasets stay out of the repo, but .py sources under that directory
+# must be tracked.
+research/backtest/data/*
+!research/backtest/data/*.py
+research/backtest/output/
+
+# --- Locally generated research datasets --------------------------------------
+# Regenerate with the scripts documented in analysis/README.md.
+*.parquet
+analysis/tracked_wallets.json
+
+# --- Test scratch directories --------------------------------------------------
+.tmp_selftest*/
+.pytest-tmp*/
+*.pytest-tmp-local*/

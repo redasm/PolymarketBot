@@ -1,0 +1,5 @@
+-r requirements-base.txt
+-r requirements-ai.txt
+
+# dev / test
+pytest>=8.0.0
