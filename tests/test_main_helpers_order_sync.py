@@ -1,0 +1,523 @@
+"""Tests for `polymarket_arb.main_helpers.order_sync`.
+
+Locks in the per-cycle live-mode housekeeping contract:
+
+- `sync_live_order_statuses` reconciles polled + changed orders, applies
+  fill deltas to the maker inventory, writes one `order_status_sync`
+  per change, and never escapes an exception.
+- `cancel_stale_maker_orders` is a no-op when TTL <= 0, otherwise
+  cancels stale orders, reconciles them, and writes one `maker_order_cancelled`
+  per cancellation; failures become `maker_order_cancel_error`.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from polymarket_arb.main_helpers.order_sync import (
+    cancel_stale_maker_orders,
+    sync_live_order_statuses,
+)
+
+
+# ---------- shared stubs -----------------------------------------------------
+
+
+class _Recorder:
+    is_enabled = True
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+
+    def write_event(self, kind: str, payload: dict) -> None:
+        self.events.append((kind, payload))
+
+
+class _DisabledRecorder:
+    is_enabled = False
+
+    def write_event(self, *_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("must not be called when disabled")
+
+
+class _RiskMgr:
+    def __init__(self) -> None:
+        self.reconciled: list[list] = []
+
+    def reconcile_pending_order_statuses(self, trades: list) -> None:
+        self.reconciled.append(list(trades))
+
+
+class _MakerStrategy:
+    """Tiny stub matching the surface `apply_maker_fill_to_inventory` calls."""
+
+    def __init__(self) -> None:
+        self.updates: list = []
+
+    def update_inventory(self, token_id: str, side: str, size: float) -> None:
+        self.updates.append((token_id, side, size))
+
+    def get_inventory(self, _token_id: str) -> float:
+        return 0.0
+
+
+class _Notifier:
+    def __init__(self) -> None:
+        self.successes: list[dict] = []
+
+    def notify_trade_success(self, **kwargs: Any) -> bool:
+        self.successes.append(kwargs)
+        return True
+
+
+class _Orchestrator:
+    def __init__(self) -> None:
+        self.settlements: list[tuple[Any, float, float]] = []
+
+    def record_settlement(self, tier: Any, amount: float, pnl: float) -> None:
+        self.settlements.append((tier, amount, pnl))
+
+
+def _trade(
+    *,
+    trade_id: str = "t1",
+    order_id: str = "o1",
+    condition_id: str = "c1",
+    token_id: str = "tok1",
+    status_value: str = "filled",
+    fill_size: float = 1.0,
+    fill_price: float = 0.5,
+    error: str = "",
+    side_value: str = "BUY",
+    timestamp: float = 0.0,
+    post_only: bool = True,  # T3 maker fills are post-only
+    inventory_accounted_size: float = 0.0,
+    notification_accounted_size: float = 0.0,
+    expected_edge_per_share: float = 0.0,
+    event_title: str = "",
+    size: float = 4.0,
+    price: float = 0.5,
+    economic_cost: float | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        trade_id=trade_id,
+        order_id=order_id,
+        condition_id=condition_id,
+        token_id=token_id,
+        status=SimpleNamespace(value=status_value),
+        fill_size=fill_size,
+        fill_price=fill_price,
+        error=error,
+        side=SimpleNamespace(value=side_value),
+        timestamp=timestamp,
+        price=price,
+        size=size,
+        economic_cost=economic_cost if economic_cost is not None else price,
+        post_only=post_only,
+        inventory_accounted_size=inventory_accounted_size,
+        notification_accounted_size=notification_accounted_size,
+        expected_edge_per_share=expected_edge_per_share,
+        event_title=event_title,
+    )
+
+
+def _executor(
+    *,
+    sync_result=None,
+    sync_exc: Exception | None = None,
+    cancel_result=None,
+    cancel_exc: Exception | None = None,
+) -> SimpleNamespace:
+    def sync():
+        if sync_exc is not None:
+            raise sync_exc
+        return sync_result or SimpleNamespace(polled=[], changed=[])
+
+    def cancel(_ttl):
+        if cancel_exc is not None:
+            raise cancel_exc
+        return cancel_result or []
+
+    return SimpleNamespace(
+        sync_pending_trade_statuses=sync,
+        cancel_stale_maker_orders=cancel,
+    )
+
+
+# ---------- sync_live_order_statuses -----------------------------------------
+
+
+def test_sync_no_changes_emits_no_events() -> None:
+    rec = _Recorder()
+    risk = _RiskMgr()
+    sync_live_order_statuses(
+        executor=_executor(sync_result=SimpleNamespace(polled=[], changed=[])),
+        risk_mgr=risk,
+        maker_strategy=_MakerStrategy(),
+        event_recorder=rec,
+    )
+    assert rec.events == []
+    assert risk.reconciled == []
+
+
+def test_sync_polled_only_reconciles_but_emits_nothing() -> None:
+    rec = _Recorder()
+    risk = _RiskMgr()
+    polled = [_trade(trade_id="t1", status_value="pending")]
+    sync_live_order_statuses(
+        executor=_executor(sync_result=SimpleNamespace(polled=polled, changed=[])),
+        risk_mgr=risk,
+        maker_strategy=_MakerStrategy(),
+        event_recorder=rec,
+    )
+    assert risk.reconciled == [polled]
+    assert rec.events == []
+
+
+def test_sync_changes_reconcile_apply_inventory_and_emit_event_per_trade() -> None:
+    rec = _Recorder()
+    risk = _RiskMgr()
+    maker = _MakerStrategy()
+    changed = [
+        _trade(trade_id="t1", token_id="tok1", side_value="BUY", fill_size=2.0),
+        _trade(trade_id="t2", token_id="tok2", side_value="SELL", fill_size=1.5),
+    ]
+    sync_live_order_statuses(
+        executor=_executor(sync_result=SimpleNamespace(polled=changed, changed=changed)),
+        risk_mgr=risk,
+        maker_strategy=maker,
+        event_recorder=rec,
+    )
+    # Reconciler runs once for `polled` (which includes the changes).
+    assert risk.reconciled == [changed]
+    # One observed-fill event and one status-sync event per changed trade.
+    kinds = [k for k, _ in rec.events]
+    assert kinds == ["risk_events", "risk_events", "risk_events", "risk_events"]
+    payloads = [p for _, p in rec.events]
+    sync_payloads = [p for p in payloads if p["event"] == "order_status_sync"]
+    assert sync_payloads[0]["trade_id"] == "t1"
+    assert sync_payloads[1]["trade_id"] == "t2"
+    # Inventory deltas applied: BUY t1 +2.0, SELL t2 -1.5.
+    assert ("tok1", "BUY", 2.0) in maker.updates
+    assert ("tok2", "SELL", 1.5) in maker.updates
+
+
+def test_sync_changes_notify_new_maker_fill_delta() -> None:
+    rec = _Recorder()
+    notifier = _Notifier()
+    changed = [
+        _trade(
+            trade_id="t1",
+            fill_size=3.0,
+            notification_accounted_size=1.0,
+            expected_edge_per_share=0.02,
+            event_title="Will test market fill?",
+        )
+    ]
+    sync_live_order_statuses(
+        executor=_executor(sync_result=SimpleNamespace(polled=changed, changed=changed)),
+        risk_mgr=_RiskMgr(),
+        maker_strategy=_MakerStrategy(),
+        event_recorder=rec,
+        notifier=notifier,
+    )
+
+    observed = [payload for _, payload in rec.events if payload["event"] == "live_maker_fill_observed"]
+    assert observed
+    assert observed[0]["fill_delta"] == pytest.approx(2.0)
+    assert observed[0]["expected_profit"] == pytest.approx(0.04)
+    assert changed[0].notification_accounted_size == pytest.approx(3.0)
+    assert notifier.successes[0]["event_title"] == "Will test market fill?"
+    assert notifier.successes[0]["expected_profit"] == pytest.approx(0.04)
+
+
+def test_sync_releases_t3_budget_for_cancelled_unfilled_maker_buy() -> None:
+    orchestrator = _Orchestrator()
+    cancelled = [
+        _trade(
+            trade_id="t1",
+            status_value="cancelled",
+            side_value="BUY",
+            size=4.0,
+            fill_size=0.0,
+            price=0.25,
+        )
+    ]
+
+    sync_live_order_statuses(
+        executor=_executor(sync_result=SimpleNamespace(polled=cancelled, changed=cancelled)),
+        risk_mgr=_RiskMgr(),
+        maker_strategy=_MakerStrategy(),
+        event_recorder=_Recorder(),
+        orchestrator=orchestrator,
+    )
+
+    assert orchestrator.settlements == [(3, pytest.approx(1.0), 0.0)]
+
+
+def test_sync_releases_t3_budget_for_maker_sell_fill_delta() -> None:
+    orchestrator = _Orchestrator()
+    sell_fill = [
+        _trade(
+            trade_id="t1",
+            status_value="partial",
+            side_value="SELL",
+            size=4.0,
+            fill_size=1.5,
+            price=0.40,
+            inventory_accounted_size=0.5,
+        )
+    ]
+
+    sync_live_order_statuses(
+        executor=_executor(sync_result=SimpleNamespace(polled=sell_fill, changed=sell_fill)),
+        risk_mgr=_RiskMgr(),
+        maker_strategy=_MakerStrategy(),
+        event_recorder=_Recorder(),
+        orchestrator=orchestrator,
+    )
+
+    assert orchestrator.settlements == [(3, pytest.approx(0.4), 0.0)]
+
+
+def test_sync_disabled_recorder_skips_events_but_still_reconciles() -> None:
+    risk = _RiskMgr()
+    changed = [_trade(trade_id="t1")]
+    sync_live_order_statuses(
+        executor=_executor(sync_result=SimpleNamespace(polled=changed, changed=changed)),
+        risk_mgr=risk,
+        maker_strategy=_MakerStrategy(),
+        event_recorder=_DisabledRecorder(),
+    )
+    assert risk.reconciled == [changed]
+
+
+def test_sync_swallow_exception_records_error_event() -> None:
+    rec = _Recorder()
+    sync_live_order_statuses(
+        executor=_executor(sync_exc=RuntimeError("venue 503")),
+        risk_mgr=_RiskMgr(),
+        maker_strategy=_MakerStrategy(),
+        event_recorder=rec,
+    )
+    assert len(rec.events) == 1
+    kind, payload = rec.events[0]
+    assert kind == "risk_events"
+    assert payload["event"] == "order_status_sync_error"
+    assert "venue 503" in payload["error"]
+
+
+def test_sync_swallow_exception_with_disabled_recorder_does_not_crash() -> None:
+    # `_DisabledRecorder.write_event` would raise — ensure the early
+    # return on `is_enabled` fires.
+    sync_live_order_statuses(
+        executor=_executor(sync_exc=RuntimeError("boom")),
+        risk_mgr=_RiskMgr(),
+        maker_strategy=_MakerStrategy(),
+        event_recorder=_DisabledRecorder(),
+    )
+
+
+# ---------- cancel_stale_maker_orders ----------------------------------------
+
+
+def _config(ttl: float) -> SimpleNamespace:
+    return SimpleNamespace(maker_stale_order_ttl_sec=ttl)
+
+
+def test_cancel_disabled_when_ttl_zero_or_negative() -> None:
+    rec = _Recorder()
+    risk = _RiskMgr()
+    cancel_stale_maker_orders(
+        config=_config(0.0),
+        executor=_executor(cancel_exc=RuntimeError("must not be called")),
+        risk_mgr=risk,
+        event_recorder=rec,
+    )
+    assert rec.events == []
+    assert risk.reconciled == []
+
+    cancel_stale_maker_orders(
+        config=_config(-1.0),
+        executor=_executor(cancel_exc=RuntimeError("must not be called")),
+        risk_mgr=risk,
+        event_recorder=rec,
+    )
+    assert rec.events == []
+
+
+def test_cancel_no_stale_orders_emits_nothing() -> None:
+    rec = _Recorder()
+    risk = _RiskMgr()
+    cancel_stale_maker_orders(
+        config=_config(60.0),
+        executor=_executor(cancel_result=[]),
+        risk_mgr=risk,
+        event_recorder=rec,
+    )
+    assert risk.reconciled == []
+    assert rec.events == []
+
+
+def test_cancel_stale_reconciles_and_emits_one_event_per_trade() -> None:
+    rec = _Recorder()
+    risk = _RiskMgr()
+    cancelled = [
+        _trade(trade_id="t1", order_id="o1", condition_id="c1"),
+        _trade(trade_id="t2", order_id="o2", condition_id="c2"),
+    ]
+    cancel_stale_maker_orders(
+        config=_config(60.0),
+        executor=_executor(cancel_result=cancelled),
+        risk_mgr=risk,
+        event_recorder=rec,
+    )
+    assert risk.reconciled == [cancelled]
+    kinds_payloads = [(k, p["event"], p["order_id"]) for k, p in rec.events]
+    assert kinds_payloads == [
+        ("risk_events", "maker_order_cancelled", "o1"),
+        ("risk_events", "maker_order_cancelled", "o2"),
+    ]
+
+
+def test_cancel_stale_releases_t3_budget_for_unfilled_buy_orders() -> None:
+    rec = _Recorder()
+    risk = _RiskMgr()
+    orchestrator = _Orchestrator()
+    cancelled = [
+        _trade(
+            trade_id="t1",
+            order_id="o1",
+            side_value="BUY",
+            status_value="cancelled",
+            size=10.0,
+            fill_size=2.0,
+            price=0.30,
+        )
+    ]
+
+    cancel_stale_maker_orders(
+        config=_config(60.0),
+        executor=_executor(cancel_result=cancelled),
+        risk_mgr=risk,
+        event_recorder=rec,
+        orchestrator=orchestrator,
+    )
+
+    assert risk.reconciled == [cancelled]
+    assert orchestrator.settlements == [(3, pytest.approx(2.4), 0.0)]
+
+
+def test_cancel_swallow_exception_records_error_event() -> None:
+    rec = _Recorder()
+    cancel_stale_maker_orders(
+        config=_config(60.0),
+        executor=_executor(cancel_exc=RuntimeError("ws gone")),
+        risk_mgr=_RiskMgr(),
+        event_recorder=rec,
+    )
+    assert len(rec.events) == 1
+    kind, payload = rec.events[0]
+    assert kind == "risk_events"
+    assert payload["event"] == "maker_order_cancel_error"
+    assert "ws gone" in payload["error"]
+
+
+def test_cancel_swallow_exception_with_disabled_recorder_does_not_crash() -> None:
+    cancel_stale_maker_orders(
+        config=_config(60.0),
+        executor=_executor(cancel_exc=RuntimeError("boom")),
+        risk_mgr=_RiskMgr(),
+        event_recorder=_DisabledRecorder(),
+    )
+
+
+# --------- user 频道成交落地 ----------
+
+
+class _StubUserFeed:
+    def __init__(self, events):
+        self._events = list(events)
+        self.drains = 0
+
+    def drain(self, max_items=500):
+        self.drains += 1
+        out = self._events[:max_items]
+        self._events = self._events[max_items:]
+        return out
+
+
+class _StubUserExecutor:
+    def __init__(self, result, *, error=None):
+        self._result = result
+        self._error = error
+        self.applied = []
+
+    def apply_user_channel_events(self, events):
+        if self._error is not None:
+            raise self._error
+        self.applied.append(list(events))
+        return self._result
+
+
+def test_sync_user_channel_fills_applies_the_same_downstream_as_polling():
+    from polymarket_arb.execution_engine import OrderSyncResult
+    from polymarket_arb.main_helpers.order_sync import sync_user_channel_fills
+
+    trade = _trade(status_value="filled", fill_size=5.0)
+    executor = _StubUserExecutor(OrderSyncResult(polled=[trade], changed=[trade]))
+    risk = _RiskMgr()
+    recorder = _Recorder()
+    maker = _MakerStrategy()
+    feed = _StubUserFeed([object(), object()])
+
+    handled = sync_user_channel_fills(
+        user_feed=feed,
+        executor=executor,
+        risk_mgr=risk,
+        maker_strategy=maker,
+        event_recorder=recorder,
+    )
+    assert handled == 2
+    assert risk.reconciled == [[trade]]
+    synced = [e for e in recorder.events if e[1].get("event") == "order_status_sync"]
+    assert synced and synced[0][1]["source"] == "user_ws"
+
+
+def test_sync_user_channel_fills_is_noop_without_feed_or_events():
+    from polymarket_arb.execution_engine import OrderSyncResult
+    from polymarket_arb.main_helpers.order_sync import sync_user_channel_fills
+
+    executor = _StubUserExecutor(OrderSyncResult(polled=[], changed=[]))
+    kwargs = dict(
+        executor=executor,
+        risk_mgr=_RiskMgr(),
+        maker_strategy=_MakerStrategy(),
+        event_recorder=_Recorder(),
+    )
+    assert sync_user_channel_fills(user_feed=None, **kwargs) == 0
+    assert sync_user_channel_fills(user_feed=_StubUserFeed([]), **kwargs) == 0
+    assert executor.applied == []
+
+
+def test_sync_user_channel_fills_records_errors_without_raising():
+    from polymarket_arb.main_helpers.order_sync import sync_user_channel_fills
+
+    recorder = _Recorder()
+    executor = _StubUserExecutor(None, error=RuntimeError("boom"))
+    assert (
+        sync_user_channel_fills(
+            user_feed=_StubUserFeed([object()]),
+            executor=executor,
+            risk_mgr=_RiskMgr(),
+            maker_strategy=_MakerStrategy(),
+            event_recorder=recorder,
+        )
+        == 0
+    )
+    assert any(
+        e[1].get("event") == "user_channel_sync_error" for e in recorder.events
+    )
