@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Polymarket Arb Dashboard</title>
+<style>
+  :root {
+    --bg: #0a0e17;
+    --surface: #111827;
+    --surface2: #1a2332;
+    --border: #1e2d3d;
+    --text: #e2e8f0;
+    --text-dim: #8892a4;
+    --green: #10b981;
+    --red: #ef4444;
+    --blue: #3b82f6;
+    --yellow: #f59e0b;
+    --purple: #8b5cf6;
+    --cyan: #06b6d4;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .header h1 { font-size: 16px; font-weight: 600; }
+  .header .meta { color: var(--text-dim); font-size: 12px; }
+  .status-dot {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+    animation: pulse 2s infinite;
+  }
+  .status-dot.live { background: var(--green); }
+  .status-dot.dry { background: var(--yellow); }
+  .status-dot.stopped { background: var(--red); animation: none; }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
+    padding: 16px 24px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .card h2 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    margin-bottom: 12px;
+  }
+  .metric {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .metric:last-child { border-bottom: none; }
+  .metric .label { color: var(--text-dim); }
+  .metric .value { font-weight: 600; }
+  .metric .value.positive { color: var(--green); }
+  .metric .value.negative { color: var(--red); }
+  .wide { grid-column: 1 / -1; }
+  .span2 { grid-column: span 2; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  th {
+    text-align: left;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-dim);
+    font-weight: 500;
+    font-size: 11px;
+  }
+  td {
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  tr:hover { background: var(--surface2); }
+  .badge {
+    display: inline-block;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .badge-green { background: rgba(16,185,129,0.15); color: var(--green); }
+  .badge-red { background: rgba(239,68,68,0.15); color: var(--red); }
+  .badge-blue { background: rgba(59,130,246,0.15); color: var(--blue); }
+  .badge-yellow { background: rgba(245,158,11,0.15); color: var(--yellow); }
+  .badge-purple { background: rgba(139,92,246,0.15); color: var(--purple); }
+  .badge-cyan { background: rgba(6,182,212,0.15); color: var(--cyan); }
+  .chart-container {
+    height: 160px;
+    position: relative;
+    margin-top: 8px;
+  }
+  canvas { width: 100% !important; height: 100% !important; }
+  .empty-state {
+    color: var(--text-dim);
+    text-align: center;
+    padding: 24px;
+    font-size: 12px;
+  }
+  .bar-track { background: var(--surface2); height: 6px; border-radius: 3px; margin-top: 4px; }
+  .bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+  .bar-fill.green { background: var(--green); }
+  .bar-fill.blue { background: var(--blue); }
+  .bar-fill.yellow { background: var(--yellow); }
+  .bar-fill.red { background: var(--red); }
+  .bar-fill.cyan { background: var(--cyan); }
+  .mono-sm { font-size: 11px; font-family: inherit; }
+  .scroll-table {
+    max-height: 320px;
+    overflow: auto;
+  }
+  .muted {
+    color: var(--text-dim);
+  }
+  .reason-cell {
+    max-width: 320px;
+    white-space: normal;
+    color: var(--text-dim);
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>Polymarket Arb Dashboard</h1>
+  </div>
+  <div class="meta">
+    <span class="status-dot" id="statusDot"></span>
+    <span id="statusText">连接中…</span>
+    &nbsp;|&nbsp; 运行 <span id="uptime">-</span>
+    &nbsp;|&nbsp; 周期 #<span id="cycleCount">0</span>
+    &nbsp;|&nbsp; 刷新 <span id="lastUpdate">-</span>
+  </div>
+</div>
+
+<div class="grid">
+
+  <!-- 核心指标 -->
+  <div class="card">
+    <h2>核心指标</h2>
+    <div class="metric"><span class="label">理论机会</span><span class="value" id="arbsFound">0</span></div>
+    <div class="metric"><span class="label">模拟成功</span><span class="value" id="simulatedExecs">0</span></div>
+    <div class="metric"><span class="label">实盘成功</span><span class="value" id="arbsExecuted">0</span></div>
+    <div class="metric"><span class="label">扫描市场数</span><span class="value" id="marketsScanned">0</span></div>
+    <div class="metric"><span class="label">模拟预期收益</span><span class="value" id="simProfit">-</span></div>
+    <div class="metric"><span class="label">实盘预期收益</span><span class="value" id="liveProfit">-</span></div>
+    <div class="metric"><span class="label">实盘执行率</span><span class="value" id="execRate">-</span></div>
+  </div>
+
+  <!-- 风控状态 -->
+  <div class="card">
+    <h2>风控状态</h2>
+    <div class="metric">
+      <span class="label">状态</span>
+      <span class="value" id="riskStatus">-</span>
+    </div>
+    <div class="metric">
+      <span class="label">持仓数</span>
+      <span class="value" id="openPositions">-</span>
+    </div>
+    <div class="metric">
+      <span class="label">总敞口</span>
+      <span class="value" id="totalExposure">-</span>
+    </div>
+    <div class="metric">
+      <span class="label">日盈亏</span>
+      <span class="value" id="dailyPnl">-</span>
+    </div>
+    <div class="metric">
+      <span class="label">连续失败</span>
+      <span class="value" id="consecutiveFails">0</span>
+    </div>
+  </div>
+
+  <!-- WebSocket 状态 -->
+  <div class="card">
+    <h2>WebSocket 实时数据</h2>
+    <div class="metric">
+      <span class="label">WS 状态</span>
+      <span class="value" id="wsStatus">-</span>
+    </div>
+    <div class="metric">
+      <span class="label">追踪市场</span>
+      <span class="value mono-sm" id="wsMarket">-</span>
+    </div>
+    <div class="metric">
+      <span class="label">订阅 Token</span>
+      <span class="value" id="wsTokens">0</span>
+    </div>
+    <div class="metric">
+      <span class="label">已扫盘口</span>
+      <span class="value" id="wsBooksScanned">0</span>
+    </div>
+    <div class="metric">
+      <span class="label">已扫事件</span>
+      <span class="value" id="wsEventsScanned">0</span>
+    </div>
+  </div>
+
+  <!-- Universe / Hot Pool -->
+  <div class="card">
+    <h2>Universe / Hot Pool</h2>
+    <div class="metric">
+      <span class="label">Universe 市场数</span>
+      <span class="value" id="universeMarkets">0</span>
+    </div>
+    <div class="metric">
+      <span class="label">热市场池</span>
+      <span class="value" id="hotMarkets">0</span>
+    </div>
+    <div class="metric">
+      <span class="label">热事件池</span>
+      <span class="value" id="hotEvents">0</span>
+    </div>
+    <div class="metric">
+      <span class="label">已选市场/事件</span>
+      <span class="value" id="selectedPools">-</span>
+    </div>
+    <div class="metric">
+      <span class="label">Focus</span>
+      <span class="value mono-sm" id="focusKeywords">ALL</span>
+    </div>
+    <div class="metric">
+      <span class="label">Universe 刷新</span>
+      <span class="value" id="universeRefresh">-</span>
+    </div>
+  </div>
+
+  <!-- 订单簿 -->
+  <div class="card">
+    <h2>订单簿 (主市场)</h2>
+    <div id="bookData">
+      <div class="metric"><span class="label">YES mid</span><span class="value" id="bookYesMid">-</span></div>
+      <div class="metric"><span class="label">NO mid</span><span class="value" id="bookNoMid">-</span></div>
+      <div class="metric"><span class="label">YES spread</span><span class="value" id="bookYesSpread">-</span></div>
+      <div class="metric"><span class="label">NO spread</span><span class="value" id="bookNoSpread">-</span></div>
+    </div>
+  </div>
+
+  <!-- Edge 引擎 -->
+  <div class="card">
+    <h2>Edge 引擎信号</h2>
+    <div class="metric"><span class="label">方向</span><span class="value" id="edgeDirection">-</span></div>
+    <div class="metric"><span class="label">Edge (bps)</span><span class="value" id="edgeBps">-</span></div>
+    <div class="metric"><span class="label">公允价值</span><span class="value" id="edgeFair">-</span></div>
+    <div class="metric"><span class="label">市场价格</span><span class="value" id="edgeMarket">-</span></div>
+    <div class="metric"><span class="label">置信度</span><span class="value" id="edgeConf">-</span></div>
+  </div>
+
+  <!-- 波动率 -->
+  <div class="card">
+    <h2>波动率估算</h2>
+    <div class="metric"><span class="label">就绪</span><span class="value" id="volReady">-</span></div>
+    <div class="metric"><span class="label">数据点</span><span class="value" id="volBars">0</span></div>
+    <div class="metric"><span class="label">σ fast (15m)</span><span class="value" id="volFast">-</span></div>
+    <div class="metric"><span class="label">σ slow (15m)</span><span class="value" id="volSlow">-</span></div>
+    <div class="metric"><span class="label">σ blend (15m)</span><span class="value" id="volBlend">-</span></div>
+    <div class="metric"><span class="label">最新价格</span><span class="value" id="volLastClose">-</span></div>
+  </div>
+
+  <!-- Research Signals -->
+  <div class="card">
+    <h2>Research Signals</h2>
+    <div class="metric"><span class="label">状态</span><span class="value" id="researchEnabled">-</span></div>
+    <div class="metric"><span class="label">信号数</span><span class="value" id="researchCount">0</span></div>
+    <div id="researchSignalList"></div>
+  </div>
+
+  <!-- Backtest Report -->
+  <div class="card">
+    <h2>Backtest Report</h2>
+    <div class="metric"><span class="label">状态</span><span class="value" id="backtestEnabled">-</span></div>
+    <div class="metric"><span class="label">策略</span><span class="value mono-sm" id="backtestStrategy">-</span></div>
+    <div class="metric"><span class="label">执行模型</span><span class="value mono-sm" id="backtestExecutionModel">-</span></div>
+    <div class="metric"><span class="label">数据集</span><span class="value mono-sm" id="backtestDataset">-</span></div>
+    <div class="metric"><span class="label">净盈亏</span><span class="value" id="backtestNetPnl">-</span></div>
+    <div class="metric"><span class="label">命中率</span><span class="value" id="backtestWinRate">-</span></div>
+    <div class="metric"><span class="label">成交率</span><span class="value" id="backtestFillRate">-</span></div>
+    <div class="metric"><span class="label">跳过信号</span><span class="value" id="backtestSkippedSignals">-</span></div>
+    <div class="metric"><span class="label">Profit Factor</span><span class="value" id="backtestProfitFactor">-</span></div>
+    <div id="backtestTradePreview"></div>
+  </div>
+
+  <!-- 策略分配 -->
+  <div class="card">
+    <h2>策略资金分配</h2>
+    <div id="strategyBars"></div>
+  </div>
+
+  <!-- 最近错误 -->
+  <div class="card">
+    <h2>最近错误</h2>
+    <div id="errorList"></div>
+  </div>
+
+  <!-- P&L 走势 -->
+  <div class="card wide">
+    <h2>累计盈亏走势</h2>
+    <div class="chart-container">
+      <canvas id="pnlChart"></canvas>
+    </div>
+  </div>
+
+  <!-- 最近套利机会 -->
+  <div class="card wide">
+    <h2>最近套利机会</h2>
+    <div id="oppTable"></div>
+  </div>
+
+  <!-- 最近交易 -->
+  <div class="card wide">
+    <h2>最近交易</h2>
+    <div id="tradeTable"></div>
+  </div>
+
+</div>
+
+<script>
+const API = '/api/status';
+let pnlCanvas, pnlCtx;
+
+function $(id) { return document.getElementById(id); }
+
+function formatPnl(v) {
+  const s = v >= 0 ? '+' : '';
+  return s + '$' + v.toFixed(2);
+}
+
+function pnlClass(v) {
+  return v >= 0 ? 'positive' : 'negative';
+}
+
+function fmtNum(v, d) {
+  if (v == null) return '-';
+  return Number(v).toFixed(d);
+}
+
+function fmtBps(v) {
+  if (v == null) return '-';
+  return Number(v).toFixed(1) + ' bps';
+}
+
+function renderStatus(d) {
+  const dot = $('statusDot');
+  const txt = $('statusText');
+  if (!d.is_running) {
+    dot.className = 'status-dot stopped';
+    txt.textContent = '已停止';
+  } else if (d.is_dry_run) {
+    dot.className = 'status-dot dry';
+    txt.textContent = 'DRY RUN';
+  } else {
+    dot.className = 'status-dot live';
+    txt.textContent = 'LIVE';
+  }
+  $('uptime').textContent = d.uptime_human || '-';
+  $('cycleCount').textContent = d.cycle_count;
+  $('lastUpdate').textContent = new Date().toLocaleTimeString();
+
+  const summary = d.execution_summary || {};
+  const theoretical = summary.theoretical_opportunities != null ? summary.theoretical_opportunities : d.arbs_found;
+  const liveExecs = summary.live_successes != null ? summary.live_successes : d.arbs_executed;
+  const simulatedExecs = summary.simulated_successes || 0;
+  $('arbsFound').textContent = theoretical || 0;
+  $('simulatedExecs').textContent = simulatedExecs;
+  $('arbsExecuted').textContent = liveExecs || 0;
+  $('marketsScanned').textContent = d.markets_scanned;
+  const rate = theoretical > 0 ? ((liveExecs / theoretical) * 100).toFixed(1) + '%' : '-';
+  $('execRate').textContent = rate;
+  const simProfit = Number(summary.simulated_profit_total || 0);
+  const liveProfit = Number(summary.live_profit_total || 0);
+  const simProfitEl = $('simProfit');
+  simProfitEl.textContent = formatPnl(simProfit);
+  simProfitEl.className = 'value ' + pnlClass(simProfit);
+  const liveProfitEl = $('liveProfit');
+  liveProfitEl.textContent = formatPnl(liveProfit);
+  liveProfitEl.className = 'value ' + pnlClass(liveProfit);
+
+  const r = d.risk_state || {};
+  const halted = r.is_halted || false;
+  $('riskStatus').innerHTML = halted
+    ? '<span class="badge badge-red">已暂停</span>'
+    : '<span class="badge badge-green">正常</span>';
+  $('openPositions').textContent = (r.open_positions || 0) + '/' + (r.max_positions || '-');
+  $('totalExposure').textContent = '$' + (r.total_exposure || 0).toFixed(2);
+  const pnl = r.daily_pnl || 0;
+  const pnlEl = $('dailyPnl');
+  pnlEl.textContent = formatPnl(pnl);
+  pnlEl.className = 'value ' + pnlClass(pnl);
+  $('consecutiveFails').textContent = r.consecutive_failures || 0;
+
+  renderWsStatus(d.ws_status);
+  renderUniverseStatus(d.universe_status);
+  renderBookSummary(d.book_summary);
+  renderEdge(d.edge_decision);
+  renderVolatility(d.volatility);
+  renderResearchSignals(d.research_signal_status);
+  renderBacktestReport(d.backtest_last_report);
+  renderStrategies(d.strategy_status || {});
+  renderOpportunities(d.recent_opportunities || []);
+  renderTrades(d.recent_trades || []);
+  renderErrors(d.recent_errors || []);
+  renderPnlChart(d.pnl_history || []);
+}
+
+function renderUniverseStatus(universe) {
+  if (!universe) {
+    $('universeMarkets').textContent = '0';
+    $('hotMarkets').textContent = '0';
+    $('hotEvents').textContent = '0';
+    $('selectedPools').textContent = '-';
+    $('focusKeywords').textContent = 'ALL';
+    $('universeRefresh').textContent = '-';
+    return;
+  }
+  $('universeMarkets').textContent = universe.universe_market_count || 0;
+  $('hotMarkets').textContent = universe.hot_market_pool_size || 0;
+  $('hotEvents').textContent = universe.hot_event_pool_size || 0;
+  const selectedMarkets = universe.selected_market_count != null ? universe.selected_market_count : '-';
+  const selectedEvents = universe.selected_event_count != null ? universe.selected_event_count : '-';
+  $('selectedPools').textContent = `${selectedMarkets} / ${selectedEvents}`;
+  const focus = (universe.focus_keywords || []).length ? universe.focus_keywords.join(', ') : 'ALL';
+  $('focusKeywords').textContent = focus;
+  if (universe.last_universe_refresh_ts) {
+    $('universeRefresh').textContent = new Date(universe.last_universe_refresh_ts * 1000).toLocaleTimeString();
+  } else {
+    $('universeRefresh').textContent = '-';
+  }
+}
+
+function renderWsStatus(ws) {
+  if (!ws || !ws.enabled) {
+    $('wsStatus').innerHTML = '<span class="badge badge-yellow">未启用</span>';
+    $('wsMarket').textContent = '-';
+    $('wsTokens').textContent = '0';
+    $('wsBooksScanned').textContent = '0';
+    $('wsEventsScanned').textContent = '0';
+    return;
+  }
+  if (ws.connected) {
+    $('wsStatus').innerHTML = '<span class="badge badge-green">已连接</span>';
+  } else if (ws.phase === 'initializing') {
+    $('wsStatus').innerHTML = '<span class="badge badge-yellow">初始化中</span>';
+  } else if (ws.phase === 'scan_complete') {
+    $('wsStatus').innerHTML = '<span class="badge badge-red">未连接</span>';
+  } else if (ws.phase === 'scan_error') {
+    $('wsStatus').innerHTML = '<span class="badge badge-red">扫描失败</span>';
+  } else {
+    $('wsStatus').innerHTML = '<span class="badge badge-red">未连接</span>';
+  }
+  $('wsMarket').textContent = ws.market_id ? ws.market_id.slice(0, 16) + '…' : '等待选择…';
+  $('wsTokens').textContent = ws.subscribed_tokens || 0;
+  $('wsBooksScanned').textContent = ws.scanned_orderbooks || 0;
+  $('wsEventsScanned').textContent = ws.scanned_events || 0;
+}
+
+function renderBookSummary(book) {
+  if (!book || !book.connected) {
+    $('bookYesMid').textContent = '-';
+    $('bookNoMid').textContent = '-';
+    $('bookYesSpread').textContent = '-';
+    $('bookNoSpread').textContent = '-';
+    return;
+  }
+  $('bookYesMid').textContent = fmtNum(book.yes_mid, 4);
+  $('bookNoMid').textContent = fmtNum(book.no_mid, 4);
+  $('bookYesSpread').textContent = fmtBps(book.yes_spread_bps);
+  $('bookNoSpread').textContent = fmtBps(book.no_spread_bps);
+}
+
+function renderEdge(edge) {
+  if (!edge) {
+    $('edgeDirection').innerHTML = '<span class="badge badge-yellow">无信号</span>';
+    $('edgeBps').textContent = '-';
+    $('edgeFair').textContent = '-';
+    $('edgeMarket').textContent = '-';
+    $('edgeConf').textContent = '-';
+    return;
+  }
+  const dir = edge.direction || 'NONE';
+  if (dir === 'NONE') {
+    $('edgeDirection').innerHTML = '<span class="badge badge-yellow">NONE</span>';
+  } else if (dir === 'BUY_YES') {
+    $('edgeDirection').innerHTML = '<span class="badge badge-green">BUY YES</span>';
+  } else if (dir === 'BUY_NO') {
+    $('edgeDirection').innerHTML = '<span class="badge badge-cyan">BUY NO</span>';
+  } else {
+    $('edgeDirection').innerHTML = '<span class="badge badge-blue">' + dir + '</span>';
+  }
+  $('edgeBps').textContent = fmtBps(edge.edge_bps);
+  $('edgeFair').textContent = fmtNum(edge.fair_value, 4);
+  $('edgeMarket').textContent = fmtNum(edge.market_price, 4);
+  $('edgeConf').textContent = edge.confidence != null ? (edge.confidence * 100).toFixed(1) + '%' : '-';
+}
+
+function renderVolatility(vol) {
+  if (!vol) {
+    $('volReady').innerHTML = '<span class="badge badge-yellow">无数据</span>';
+    $('volBars').textContent = '0';
+    $('volFast').textContent = '-';
+    $('volSlow').textContent = '-';
+    $('volBlend').textContent = '-';
+    $('volLastClose').textContent = '-';
+    return;
+  }
+  $('volReady').innerHTML = vol.ready
+    ? '<span class="badge badge-green">就绪</span>'
+    : '<span class="badge badge-yellow">预热中 (' + (vol.n_bars || 0) + ')</span>';
+  $('volBars').textContent = vol.n_bars || 0;
+  $('volFast').textContent = vol.sigma_fast_15m != null ? (vol.sigma_fast_15m * 10000).toFixed(1) + ' bps' : '-';
+  $('volSlow').textContent = vol.sigma_slow_15m != null ? (vol.sigma_slow_15m * 10000).toFixed(1) + ' bps' : '-';
+  $('volBlend').textContent = vol.sigma_blend_15m != null ? (vol.sigma_blend_15m * 10000).toFixed(1) + ' bps' : '-';
+  $('volLastClose').textContent = fmtNum(vol.last_close, 4);
+}
+
+function renderResearchSignals(research) {
+  if (research == null) {
+    $('researchEnabled').innerHTML = '<span class="badge badge-blue">加载中</span>';
+    $('researchCount').textContent = '-';
+    $('researchSignalList').innerHTML = '<div class="empty-state">等待首轮扫描…</div>';
+    return;
+  }
+
+  $('researchEnabled').innerHTML = research.enabled
+    ? '<span class="badge badge-green">启用</span>'
+    : '<span class="badge badge-yellow">未启用</span>';
+  $('researchCount').textContent = research.count ? research.count : 0;
+  const el = $('researchSignalList');
+  const items = research.items ? research.items : [];
+  if (!items.length) {
+    el.innerHTML = research.enabled
+      ? '<div class="empty-state">暂无研究信号</div>'
+      : '<div class="empty-state">Research Signal 未启用</div>';
+    return;
+  }
+  let html = '';
+  for (const item of items.slice(0, 3)) {
+    const stanceClass = item.stance === 'bullish'
+      ? 'badge-green'
+      : item.stance === 'bearish'
+        ? 'badge-red'
+        : 'badge-yellow';
+    const links = (((item.metadata || {}).top_links) || []).slice(0, 2)
+      .map((link, idx) => `<a href="${link}" target="_blank" rel="noopener noreferrer" class="mono-sm" style="color:var(--cyan);display:block;padding-top:2px;">src${idx + 1}</a>`)
+      .join('');
+    const sources = (item.sources || []).slice(0, 3)
+      .map(src => `<span class="badge badge-blue" style="margin-right:4px;">${src}</span>`)
+      .join('');
+    html += `<div class="metric"><span class="label">${item.topic_id.slice(0, 22)}</span>
+      <span class="badge ${stanceClass}">${item.stance || 'uncertain'}</span></div>
+      <div class="mono-sm" style="color:var(--text-dim); padding:4px 0 4px 0;">${(item.summary || '').slice(0, 120)}</div>
+      <div class="mono-sm" style="color:var(--text-dim); padding-bottom:4px;">fresh ${(item.freshness_sec || 0).toFixed(0)}s</div>
+      <div style="padding-bottom:10px;">${sources}${links}</div>`;
+  }
+  el.innerHTML = html;
+}
+
+function renderBacktestReport(report) {
+  $('backtestEnabled').innerHTML = report && report.enabled
+    ? '<span class="badge badge-green">可用</span>'
+    : '<span class="badge badge-yellow">无报告</span>';
+  $('backtestStrategy').textContent = report && report.strategy_name ? report.strategy_name : '-';
+  $('backtestExecutionModel').textContent = report && report.execution_model ? report.execution_model : '-';
+  $('backtestDataset').textContent = report && report.dataset_name ? report.dataset_name : '-';
+  const pnl = report && report.net_pnl != null ? report.net_pnl : null;
+  const pnlEl = $('backtestNetPnl');
+  pnlEl.textContent = pnl == null ? '-' : formatPnl(Number(pnl));
+  pnlEl.className = pnl == null ? 'value' : ('value ' + pnlClass(Number(pnl)));
+  $('backtestWinRate').textContent = report && report.win_rate != null
+    ? (Number(report.win_rate) * 100).toFixed(1) + '%'
+    : '-';
+  $('backtestFillRate').textContent = report && report.fill_rate != null
+    ? (Number(report.fill_rate) * 100).toFixed(1) + '%'
+    : '-';
+  $('backtestSkippedSignals').textContent = report && report.skipped_signals != null
+    ? String(report.skipped_signals)
+    : '-';
+  $('backtestProfitFactor').textContent = report && report.profit_factor_infinite
+    ? '∞'
+    : (report && report.profit_factor != null ? fmtNum(report.profit_factor, 3) : '-');
+  const previewEl = $('backtestTradePreview');
+  const rows = report && report.recent_trade_rows ? report.recent_trade_rows : [];
+  if (!rows.length) {
+    previewEl.innerHTML = '<div class="empty-state">暂无回测明细</div>';
+    return;
+  }
+  let html = '<table><tr><th>ts</th><th>edge</th><th>fill</th><th>pnl</th></tr>';
+  for (const row of rows.slice().reverse()) {
+    html += `<tr><td>${row.ts_ms || '-'}</td><td>${fmtNum(row.signal_edge, 4)}</td>
+      <td>${row.filled_size || 0}</td><td class="${pnlClass(row.realized_pnl || 0)}">${formatPnl(row.realized_pnl || 0)}</td></tr>`;
+  }
+  previewEl.innerHTML = html + '</table>';
+}
+
+function renderStrategies(s) {
+  const container = $('strategyBars');
+  if (!s || Object.keys(s).length === 0) {
+    container.innerHTML = '<div class="empty-state">等待策略数据…</div>';
+    return;
+  }
+  const tiers = [
+    { key: 'T0', name: '结构性套利', color: 'green' },
+    { key: 'T1', name: '跨平台', color: 'blue' },
+    { key: 'T2', name: '统计套利', color: 'purple' },
+    { key: 'T3', name: '做市', color: 'yellow' },
+  ];
+  let html = '';
+  for (const t of tiers) {
+    const data = s[t.key] || {};
+    const pct = data.allocation_pct || 0;
+    const used = data.current_exposure || 0;
+    const budget = data.budget || 0;
+    const fillPct = budget > 0 ? Math.min(100, (used / budget) * 100) : 0;
+    const allocationText = pct > 0 ? (pct * 100).toFixed(0) + '%' : '关闭';
+    const budgetText = budget > 0 ? '$' + Number(budget).toFixed(2) : '$0.00';
+    html += `<div class="metric"><span class="label">${t.key} ${t.name}</span>
+      <span class="value">${allocationText}</span></div>
+      <div class="mono-sm muted" style="padding:2px 0 6px 0;">预算 ${budgetText} / 已用 $${Number(used).toFixed(2)}</div>
+      <div class="bar-track"><div class="bar-fill ${t.color}" style="width:${fillPct}%"></div></div>`;
+  }
+  container.innerHTML = html;
+}
+
+function renderOpportunities(opps) {
+  const el = $('oppTable');
+  if (!opps.length) { el.innerHTML = '<div class="empty-state">暂无套利机会</div>'; return; }
+  let html = '<table><tr><th>时间</th><th>模式</th><th>阶段</th><th>类型</th><th>事件</th><th>成本</th><th>净利</th><th>利润率</th><th>置信度</th></tr>';
+  for (const o of opps.slice(-15).reverse()) {
+    const t = o.timestamp ? new Date(o.timestamp * 1000).toLocaleTimeString() : '-';
+    const type = renderOpportunityTypeBadge(o.arb_type);
+    const mode = renderModeBadge(o.mode || 'signal');
+    const stage = renderStageBadge(o.stage || 'signal');
+    const totalCost = o.total_cost == null ? '-' : ('$' + Number(o.total_cost).toFixed(4));
+    html += `<tr><td>${t}</td><td>${mode}</td><td>${stage}</td><td>${type}</td><td>${(o.event_title || '').slice(0, 40)}</td>
+      <td>${totalCost}</td>
+      <td class="${pnlClass(o.net_edge || 0)}">${formatPnl(o.net_edge || 0)}</td>
+      <td>${(o.edge_pct || 0).toFixed(2)}%</td>
+      <td>${((o.confidence || 0) * 100).toFixed(0)}%</td></tr>`;
+  }
+  el.innerHTML = html + '</table>';
+}
+
+function renderTrades(trades) {
+  const el = $('tradeTable');
+  if (!trades.length) { el.innerHTML = '<div class="empty-state">暂无交易记录</div>'; return; }
+  let html = '<table><tr><th>时间</th><th>模式</th><th>事件</th><th>方向</th><th>结果</th><th>价格</th><th>数量</th><th>状态</th><th>预期收益</th></tr>';
+  for (const t of trades.slice(-15).reverse()) {
+    const ts = t.timestamp ? new Date(t.timestamp * 1000).toLocaleTimeString() : '-';
+    const mode = renderModeBadge(t.mode || 'live');
+    const side = t.side === 'BUY'
+      ? '<span class="badge badge-green">BUY</span>'
+      : '<span class="badge badge-red">SELL</span>';
+    const status = t.status === 'filled'
+      ? '<span class="badge badge-green">已成交</span>'
+      : t.status === 'failed'
+        ? '<span class="badge badge-red">失败</span>'
+        : `<span class="badge badge-yellow">${t.status}</span>`;
+    const expectedProfit = t.expected_profit == null ? '-' : formatPnl(Number(t.expected_profit || 0));
+    html += `<tr><td>${ts}</td><td>${mode}</td><td>${(t.event_title || '').slice(0, 36)}</td><td>${side}</td><td>${(t.outcome || t.token_id || '').slice(0, 24)}</td>
+      <td>$${(t.price || 0).toFixed(4)}</td><td>${(t.size || 0).toFixed(2)}</td><td>${status}</td><td class="${pnlClass(Number(t.expected_profit || 0))}">${expectedProfit}</td></tr>`;
+  }
+  el.innerHTML = html + '</table>';
+}
+
+function renderModeBadge(mode) {
+  if (mode === 'theoretical') return '<span class="badge badge-blue">理论</span>';
+  if (mode === 'simulated') return '<span class="badge badge-yellow">模拟</span>';
+  if (mode === 'live') return '<span class="badge badge-green">实盘</span>';
+  return '<span class="badge badge-purple">信号</span>';
+}
+
+function renderStageBadge(stage) {
+  if (stage === 'detected') return '<span class="badge badge-blue">发现</span>';
+  if (stage === 'verified') return '<span class="badge badge-green">验证</span>';
+  return '<span class="badge badge-purple">信号</span>';
+}
+
+function renderOpportunityTypeBadge(arbType) {
+  if (arbType === 'binary') return '<span class="badge badge-blue">二元</span>';
+  if (arbType === 'multi_outcome') return '<span class="badge badge-purple">多结果</span>';
+  if (arbType === 'edge_engine') return '<span class="badge badge-cyan">Edge</span>';
+  if ((arbType || '').includes('maker')) return '<span class="badge badge-yellow">做市</span>';
+  if ((arbType || '').includes('statistical')) return '<span class="badge badge-cyan">统计</span>';
+  return '<span class="badge badge-purple">' + (arbType || '机会') + '</span>';
+}
+
+function renderErrors(errors) {
+  const el = $('errorList');
+  if (!errors.length) { el.innerHTML = '<div class="empty-state">无错误</div>'; return; }
+  let html = '';
+  for (const e of errors.slice(-5).reverse()) {
+    const ts = e.timestamp ? new Date(e.timestamp * 1000).toLocaleTimeString() : '';
+    html += `<div class="metric"><span class="label">${ts}</span><span class="value negative" style="font-size:11px">${(e.message || '').slice(0, 60)}</span></div>`;
+  }
+  el.innerHTML = html;
+}
+
+function renderPnlChart(history) {
+  if (!pnlCanvas) return;
+  const ctx = pnlCtx;
+  const W = pnlCanvas.width = pnlCanvas.offsetWidth * 2;
+  const H = pnlCanvas.height = pnlCanvas.offsetHeight * 2;
+  ctx.clearRect(0, 0, W, H);
+
+  if (history.length < 2) {
+    ctx.fillStyle = '#8892a4';
+    ctx.font = '24px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('等待数据…', W / 2, H / 2);
+    return;
+  }
+
+  const values = history.map(h => h.cumulative_pnl || 0);
+  const minV = Math.min(0, ...values);
+  const maxV = Math.max(0.01, ...values);
+  const range = maxV - minV || 0.01;
+  const padY = 20;
+
+  const toX = (i) => (i / (values.length - 1)) * W;
+  const toY = (v) => H - padY - ((v - minV) / range) * (H - padY * 2);
+
+  const zeroY = toY(0);
+  ctx.strokeStyle = '#1e2d3d';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.moveTo(0, zeroY);
+  ctx.lineTo(W, zeroY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.beginPath();
+  ctx.moveTo(toX(0), toY(values[0]));
+  for (let i = 1; i < values.length; i++) {
+    ctx.lineTo(toX(i), toY(values[i]));
+  }
+  const last = values[values.length - 1];
+  ctx.strokeStyle = last >= 0 ? '#10b981' : '#ef4444';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  ctx.lineTo(toX(values.length - 1), zeroY);
+  ctx.lineTo(toX(0), zeroY);
+  ctx.closePath();
+  ctx.fillStyle = last >= 0 ? 'rgba(16,185,129,0.08)' : 'rgba(239,68,68,0.08)';
+  ctx.fill();
+
+  ctx.fillStyle = last >= 0 ? '#10b981' : '#ef4444';
+  ctx.font = 'bold 22px monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText(formatPnl(last), W - 10, 30);
+}
+
+async function refresh() {
+  try {
+    const statusResp = await fetch(API);
+    const data = await statusResp.json();
+    renderStatus(data);
+  } catch (e) {
+    $('statusDot').className = 'status-dot stopped';
+    $('statusText').textContent = '连接断开';
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  pnlCanvas = $('pnlChart');
+  pnlCtx = pnlCanvas.getContext('2d');
+  refresh();
+  setInterval(refresh, 3000);
+});
+</script>
+</body>
+</html>
