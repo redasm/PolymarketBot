@@ -28,6 +28,10 @@ from polymarket_arb.book_store import EnhancedBookStore
 from polymarket_arb.models import OrderBookLevel, OrderBookSnapshot
 from polymarket_arb.utils_time import now_ms
 
+_INBOX_STOP = object()
+_INBOX_BACKLOG_WARN_DEPTH = 5000
+_INBOX_BACKLOG_WARN_INTERVAL_SEC = 30.0
+
 LOG = logging.getLogger(__name__)
 
 POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -334,6 +338,14 @@ class WebSocketFeed:
         # 线程安全访问活跃 ws 句柄，Dynamic Subscription 从外部线程发送时使用。
         self._ws_lock = threading.Lock()
         self._ws_handle: Any = None
+        # websockets' sync client only reads the next frame after recv()
+        # returns, so parsing on the recv thread lets the server's send buffer
+        # fill during large dumps and it drops us with 1013 "slow consumer".
+        # The recv thread only enqueues; one processor thread applies messages
+        # in arrival order.
+        self._inbox: queue.SimpleQueue = queue.SimpleQueue()
+        self._processor: Optional[threading.Thread] = None
+        self._last_backlog_warn_ts = 0.0
 
     def set_trade_callback(self, callback: Optional[Callable[[dict], None]]) -> None:
         """Replace the ``last_trade_price`` handler used by this feed."""
@@ -400,6 +412,7 @@ class WebSocketFeed:
         if self._running:
             return
         self._running = True
+        self._start_processor()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="ws-feed")
         self._thread.start()
         LOG.info("WebSocket feed 已启动，订阅 %d 个 token", len(self._subscribed_tokens))
@@ -408,6 +421,7 @@ class WebSocketFeed:
         self._running = False
         if self._thread:
             self._thread.join(timeout=5)
+        self._stop_processor()
         self._mirror.stop()
         if self._enhanced_store is not None:
             self._enhanced_store.set_connected(False)
@@ -460,7 +474,7 @@ class WebSocketFeed:
                             ws.send("PING")
                             continue
 
-                        self._handle_message(raw)
+                        self._inbox.put(raw)
 
             except ConnectionClosed as exc:
                 with self._ws_lock:
@@ -518,6 +532,39 @@ class WebSocketFeed:
         time.sleep(sleep_for)
         self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
 
+    def _start_processor(self) -> None:
+        if self._processor is not None and self._processor.is_alive():
+            return
+        self._processor = threading.Thread(target=self._process_loop, daemon=True, name="ws-feed-proc")
+        self._processor.start()
+
+    def _stop_processor(self, timeout: float = 5.0) -> None:
+        if self._processor is None:
+            return
+        self._inbox.put(_INBOX_STOP)
+        self._processor.join(timeout=timeout)
+        self._processor = None
+
+    def _process_loop(self) -> None:
+        while True:
+            raw = self._inbox.get()
+            if raw is _INBOX_STOP:
+                return
+            try:
+                self._handle_message(raw)
+            except Exception:
+                LOG.exception("处理 WebSocket 消息失败，已跳过该条")
+            self._maybe_warn_backlog()
+
+    def _maybe_warn_backlog(self) -> None:
+        now = time.time()
+        if now - self._last_backlog_warn_ts < _INBOX_BACKLOG_WARN_INTERVAL_SEC:
+            return
+        depth = self._inbox.qsize()
+        if depth >= _INBOX_BACKLOG_WARN_DEPTH:
+            self._last_backlog_warn_ts = now
+            LOG.warning("WebSocket 消息处理积压 %d 条，镜像更新滞后于推送", depth)
+
     def _handle_message(self, raw: str | bytes) -> None:
         """解析 WebSocket 消息并更新镜像 + EnhancedBookStore."""
         if isinstance(raw, bytes):
@@ -532,11 +579,12 @@ class WebSocketFeed:
         if isinstance(msg, list):
             for item in msg:
                 if isinstance(item, dict):
-                    self._handle_message(json.dumps(item))
+                    self._handle_parsed(item)
             return
-        if not isinstance(msg, dict):
-            return
+        if isinstance(msg, dict):
+            self._handle_parsed(msg)
 
+    def _handle_parsed(self, msg: dict[str, Any]) -> None:
         msg_type = msg.get("event_type") or msg.get("type") or ""
 
         if msg_type == "book":

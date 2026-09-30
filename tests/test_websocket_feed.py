@@ -612,3 +612,66 @@ def test_stop_can_progress_even_when_callback_queue_is_full(monkeypatch):
 
     assert mirror._callback_worker_running is False
     assert join_called["value"] is True
+
+
+def test_processor_applies_queued_messages_in_order_without_blocking_producer(monkeypatch):
+    import threading as _threading
+    import time as _time
+
+    feed = WebSocketFeed(mirror=OrderBookMirror())
+    seen: list[str] = []
+    done = _threading.Event()
+
+    def _slow_handle(raw):
+        _time.sleep(0.02)
+        seen.append(raw)
+        if raw == "m9":
+            done.set()
+
+    monkeypatch.setattr(feed, "_handle_message", _slow_handle)
+    feed._start_processor()
+    try:
+        started = _time.monotonic()
+        for i in range(10):
+            feed._inbox.put(f"m{i}")
+        enqueue_elapsed = _time.monotonic() - started
+
+        assert done.wait(timeout=5)
+        assert seen == [f"m{i}" for i in range(10)]
+        assert enqueue_elapsed < 0.02 * 10 / 2
+    finally:
+        feed._stop_processor()
+    assert feed._processor is None
+
+
+def test_processor_survives_handler_exception(monkeypatch):
+    import threading as _threading
+
+    feed = WebSocketFeed(mirror=OrderBookMirror())
+    handled: list[str] = []
+    done = _threading.Event()
+
+    def _handle(raw):
+        if raw == "bad":
+            raise RuntimeError("boom")
+        handled.append(raw)
+        done.set()
+
+    monkeypatch.setattr(feed, "_handle_message", _handle)
+    feed._start_processor()
+    try:
+        feed._inbox.put("bad")
+        feed._inbox.put("good")
+        assert done.wait(timeout=5)
+        assert handled == ["good"]
+    finally:
+        feed._stop_processor()
+
+
+def test_run_loop_enqueues_instead_of_handling_inline():
+    import inspect
+    from polymarket_arb import websocket_feed
+
+    src = inspect.getsource(websocket_feed.WebSocketFeed._run_loop)
+    assert "self._inbox.put(raw)" in src
+    assert "self._handle_message(raw)" not in src
