@@ -266,6 +266,29 @@ def select_ws_targets(
     return binary[:max_count]
 
 
+def select_ws_event_legs(
+    candidate_events: list[Any],
+    *,
+    exclude_condition_ids: set[str] | None = None,
+) -> list[MarketInfo]:
+    """Active legs of the selected multi-outcome events, for WS mirroring.
+
+    The scan and strategy phases read every leg's book each cycle; legs not on
+    WS fall back to REST one call per token, which dominates cycle time.
+    """
+    seen = set(exclude_condition_ids or ())
+    legs: list[MarketInfo] = []
+    for event in candidate_events:
+        for market in getattr(event, "markets", []) or []:
+            if market.closed or not market.active or not market.tokens:
+                continue
+            if market.condition_id in seen:
+                continue
+            seen.add(market.condition_id)
+            legs.append(market)
+    return legs
+
+
 def prime_candidate_orderbooks(
     *,
     candidate_markets: list[MarketInfo],

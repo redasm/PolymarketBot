@@ -142,6 +142,7 @@ from polymarket_arb.main_helpers.scan_focus import (
     prime_candidate_orderbooks as _prime_candidate_orderbooks,
     select_event_candidates as _select_event_candidates,
     select_scan_candidates as _select_scan_candidates,
+    select_ws_event_legs as _select_ws_event_legs,
     select_ws_targets as _select_ws_targets,
 )
 from polymarket_arb.market_scanner import MarketScanner
@@ -1013,6 +1014,10 @@ def main(dotenv_path: str | None = None) -> None:
                         config.ws_max_markets,
                         updown_boost=updown_boost,
                         weather_boost=weather_boost,
+                    )
+                    targets = targets + _select_ws_event_legs(
+                        event_candidates,
+                        exclude_condition_ids={m.condition_id for m in targets},
                     )
                     if targets:
                         new_ids = sorted(t.token_id for m in targets for t in m.tokens)

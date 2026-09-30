@@ -20,6 +20,7 @@ from polymarket_arb.main_helpers.scan_focus import (
     merge_focus_event_markets,
     select_event_candidates,
     select_scan_candidates,
+    select_ws_event_legs,
     select_ws_targets,
 )
 from polymarket_arb.models import MarketInfo, TokenInfo
@@ -286,3 +287,17 @@ def test_select_ws_targets_prioritizes_updown_when_boosted():
     assert select_ws_targets([updown, big], 1, updown_boost=0.0)[0].condition_id == "c2"
     # Boost -> UPDOWN secures the slot.
     assert select_ws_targets([updown, big], 1, updown_boost=5.0)[0].slug == "btc-updown-15m-1"
+
+
+def test_select_ws_event_legs_skips_closed_inactive_and_excluded():
+    event_a = SimpleNamespace(markets=[
+        _make_market(cid="leg1"),
+        _make_market(cid="leg2", closed=True),
+        _make_market(cid="leg3", active=False),
+        _make_market(cid="dup"),
+    ])
+    event_b = SimpleNamespace(markets=[_make_market(cid="leg1"), _make_market(cid="leg4")])
+
+    legs = select_ws_event_legs([event_a, event_b], exclude_condition_ids={"dup"})
+
+    assert [m.condition_id for m in legs] == ["leg1", "leg4"]
