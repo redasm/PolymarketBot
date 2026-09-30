@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import sys
 
+import pytest
+
 from polymarket_arb.models import BacktestReport
 from research.backtest.datasets import build_binary_snapshots_from_ticks
 from research.backtest.features import summarize_binary_microstructure
@@ -462,6 +464,39 @@ def test_build_binary_snapshots_from_ticks_rejects_multi_condition_without_filte
     assert raised is True
 
 
+def _make_cli_dataset(tmp_path: Path) -> Path:
+    dataset_dir = tmp_path / "backtest-data" / "default-dataset"
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    (dataset_dir / "market_snapshots.jsonl").write_text("", encoding="utf-8")
+    return tmp_path / "backtest-data"
+
+
+def test_backtest_cli_rejects_missing_dataset(tmp_path: Path, monkeypatch):
+    from research.backtest import run as backtest_run
+
+    monkeypatch.setattr(
+        backtest_run.ArbConfig,
+        "from_env",
+        lambda dotenv_path=None, require_wallet=False: type(
+            "Cfg",
+            (),
+            {
+                "backtest_default_dataset": "default",
+                "backtest_reports_dir": str(tmp_path / "out"),
+                "backtest_data_dir": str(tmp_path / "empty"),
+                "polymarket_taker_fee_rate": 0.02,
+                "backtest_slippage_bps": 5.0,
+            },
+        )(),
+    )
+    monkeypatch.setattr(sys, "argv", ["run.py"])
+
+    with pytest.raises(SystemExit) as exc:
+        backtest_run.main()
+
+    assert exc.value.code == 2
+
+
 def test_backtest_cli_prefers_explicit_output_dir(tmp_path: Path, monkeypatch):
     from research.backtest import run as backtest_run
 
@@ -491,7 +526,7 @@ def test_backtest_cli_prefers_explicit_output_dir(tmp_path: Path, monkeypatch):
             {
                 "backtest_default_dataset": "default-dataset",
                 "backtest_reports_dir": "config-output-dir",
-                "backtest_data_dir": "data/backtest",
+                "backtest_data_dir": str(_make_cli_dataset(tmp_path)),
                 "polymarket_taker_fee_rate": 0.02,
                 "backtest_slippage_bps": 5.0,
             },
@@ -531,7 +566,7 @@ def test_backtest_cli_maps_quant_strategy_choice(tmp_path: Path, monkeypatch):
             {
                 "backtest_default_dataset": "default-dataset",
                 "backtest_reports_dir": "config-output-dir",
-                "backtest_data_dir": "data/backtest",
+                "backtest_data_dir": str(_make_cli_dataset(tmp_path)),
                 "polymarket_taker_fee_rate": 0.02,
                 "backtest_slippage_bps": 5.0,
             },

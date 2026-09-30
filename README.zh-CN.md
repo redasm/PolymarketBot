@@ -62,7 +62,7 @@ dry run 不需要钱包。真实下单需要两道独立确认（`ARB_DRY_RUN=fa
 
 ```bash
 python run_research.py --limit 20 --show-markets   # 单独跑研究层
-python -m research.backtest.run --dataset default  # 离线回放
+python -m research.backtest.run --dataset default  # 离线回放（需先录制数据集，见 doc/zh/backtesting.md）
 pytest                                             # 测试
 ```
 

@@ -133,7 +133,7 @@ def test_from_env_loads_new_edge_and_cooldown_config(tmp_path, monkeypatch):
     assert cfg.live_allow_zero_taker_fee is False
     assert cfg.live_max_order_size_usdc == 10.0
     assert cfg.live_max_total_exposure_usdc == 100.0
-    assert cfg.maker_strategy_enabled is True
+    assert cfg.maker_strategy_enabled is False
     assert cfg.clob_client_version == "auto"
     assert cfg.edge_confidence_full_bps == 650.0
     assert cfg.edge_confidence_imbalance_weight == 0.2
@@ -180,7 +180,7 @@ def test_from_env_loads_quant_strategy_json_config(tmp_path, monkeypatch):
     assert cfg.event_baselines_file == "data/quant_inputs/event_baselines.json"
     assert cfg.wallet_alpha_profiles_file == "data/quant_inputs/wallet_profiles.json"
     assert cfg.wallet_alpha_observations_file == "data/quant_inputs/wallet_observations.json"
-    assert cfg.wallet_alpha_shadow_validation_enabled is True
+    assert cfg.wallet_alpha_shadow_validation_enabled is False
 
 
 def _clear_wallet_env(monkeypatch):

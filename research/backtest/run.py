@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from polymarket_arb.config import ArbConfig
+from research.backtest.data.schemas import build_dataset_paths
 from research.backtest.execution_model.base import (
     DepthVWAPExecutionModel,
     ExecutionModelConfig,
@@ -101,6 +102,13 @@ def main() -> None:
 
     config = ArbConfig.from_env(args.dotenv_path, require_wallet=False)
     dataset = args.dataset or config.backtest_default_dataset
+    paths = build_dataset_paths(config.backtest_data_dir, dataset)
+    if not (paths.market_snapshots.exists() or paths.orderbook_events.exists()):
+        parser.error(
+            f"dataset '{dataset}' not found: expected {paths.market_snapshots} or "
+            f"{paths.orderbook_events}. Record ticks and build a dataset first — "
+            "see doc/en/backtesting.md."
+        )
     output_dir = args.output_dir or config.backtest_reports_dir
     runner = BacktestRunner(config.backtest_data_dir)
     strategy_name = STRATEGY_NAME_MAP[args.strategy]

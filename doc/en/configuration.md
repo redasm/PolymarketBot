@@ -226,7 +226,7 @@ This strategy tested negative once forecasts were made lead-honest. Keep it off.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MAKER_STRATEGY_ENABLED` | `true` | Enable T3. Turn this **off** for a first small-capital live run — post-only/GTC behaviour adds variables you do not want while validating engineering. |
+| `MAKER_STRATEGY_ENABLED` | `false` | Enable T3. Off by default: T3 lost on 53 of 53 closed shadow positions (see [research-findings](research-findings.md)). Keep it off for any live run — post-only/GTC behaviour also adds variables you do not want while validating engineering. |
 | `MAKER_MAX_HOLD_SEC` | `21600` | Force-close timeout. |
 | `MAKER_STOP_LOSS_BPS` / `MAKER_TAKE_PROFIT_BPS` | `300` / `200` | Exit thresholds. |
 | `MAKER_EXIT_EVAL_INTERVAL_SEC` | `30` | Exit evaluation cadence. |
@@ -308,7 +308,7 @@ a restart to change; prefer the file form.
 | Variable | Default | Meaning |
 |---|---|---|
 | `WALLET_ALPHA_CANDIDATE_SHADOW_ENABLED` | `false` | Allow unvalidated wallets to produce shadow signals. Shadow/dry-run only. |
-| `WALLET_ALPHA_SHADOW_VALIDATION_ENABLED` | `true` | In-process shadow-only validation lane for candidate wallets during live runs. Never places real orders. |
+| `WALLET_ALPHA_SHADOW_VALIDATION_ENABLED` | `false` | In-process shadow-only validation lane for candidate wallets during live runs. Never places real orders. Off by default: copy trading returned −28.6% ROI followed to settlement. |
 | `WALLET_ALPHA_SHADOW_MAX_SIGNALS_PER_CYCLE` | `5` | Candidate budget per cycle. |
 | `WALLET_ALPHA_SHADOW_MAX_EXEC_MS_PER_CYCLE` | `250` | Time budget per cycle. |
 

@@ -895,7 +895,7 @@ class ArbConfig:
             # still lower this via env.
             live_max_orderbook_snapshot_age_sec=_env_float("LIVE_MAX_ORDERBOOK_SNAPSHOT_AGE_SEC", 5.0),
             live_min_ws_hit_ratio=_env_float("LIVE_MIN_WS_HIT_RATIO", 0.25),
-            maker_strategy_enabled=_env_bool("MAKER_STRATEGY_ENABLED", True),
+            maker_strategy_enabled=_env_bool("MAKER_STRATEGY_ENABLED", False),
             min_liquidity=_env_float("ARB_MIN_LIQUIDITY", 1000.0),
             min_volume_24h=_env_float("ARB_MIN_VOLUME_24H", 500.0),
             # REST cache TTL. With a large market universe most tokens
@@ -1189,7 +1189,7 @@ class ArbConfig:
             wallet_alpha_profiles_file=_env("WALLET_ALPHA_PROFILES_FILE", ""),
             wallet_alpha_observations_file=_env("WALLET_ALPHA_OBSERVATIONS_FILE", ""),
             wallet_alpha_candidate_shadow_enabled=_env_bool("WALLET_ALPHA_CANDIDATE_SHADOW_ENABLED", False),
-            wallet_alpha_shadow_validation_enabled=_env_bool("WALLET_ALPHA_SHADOW_VALIDATION_ENABLED", True),
+            wallet_alpha_shadow_validation_enabled=_env_bool("WALLET_ALPHA_SHADOW_VALIDATION_ENABLED", False),
             wallet_alpha_shadow_max_signals_per_cycle=_env_int(
                 "WALLET_ALPHA_SHADOW_MAX_SIGNALS_PER_CYCLE",
                 5,

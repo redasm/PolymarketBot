@@ -78,7 +78,7 @@ process will submit a real order.
 
 ```bash
 python run_research.py --limit 20 --show-markets   # research layer alone
-python -m research.backtest.run --dataset default  # offline replay
+python -m research.backtest.run --dataset default  # offline replay (needs a recorded dataset, see doc/en/backtesting.md)
 pytest                                             # test suite
 ```
 

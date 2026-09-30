@@ -216,7 +216,7 @@ UPDOWN 按 Polymarket 自己的价格源结算，不是 Binance。两者的 basi
 
 | 变量 | 默认 | 含义 |
 |---|---|---|
-| `MAKER_STRATEGY_ENABLED` | `true` | 启用 T3。首次小额实盘建议**关掉** —— post-only/GTC 行为会在验证工程链路时引入多余变量。 |
+| `MAKER_STRATEGY_ENABLED` | `false` | 启用 T3。默认关闭：影子数据 53/53 平仓全亏（见 [research-findings](research-findings.md)）。任何实盘都应保持关闭 —— post-only/GTC 行为也会在验证工程链路时引入多余变量。 |
 | `MAKER_MAX_HOLD_SEC` | `21600` | 超时强平。 |
 | `MAKER_STOP_LOSS_BPS` / `MAKER_TAKE_PROFIT_BPS` | `300` / `200` | 退出阈值。 |
 | `MAKER_EXIT_EVAL_INTERVAL_SEC` | `30` | 退出评估周期。 |
@@ -293,7 +293,7 @@ UPDOWN 按 Polymarket 自己的价格源结算，不是 Binance。两者的 basi
 | 变量 | 默认 | 含义 |
 |---|---|---|
 | `WALLET_ALPHA_CANDIDATE_SHADOW_ENABLED` | `false` | 允许未验证钱包产生影子信号。仅 shadow/dry-run。 |
-| `WALLET_ALPHA_SHADOW_VALIDATION_ENABLED` | `true` | live 进程内的候选钱包 shadow-only 验证通道，不会真下单。 |
+| `WALLET_ALPHA_SHADOW_VALIDATION_ENABLED` | `false` | live 进程内的候选钱包 shadow-only 验证通道，不会真下单。默认关闭：跟单跟到结算为 −28.6% ROI。 |
 | `WALLET_ALPHA_SHADOW_MAX_SIGNALS_PER_CYCLE` | `5` | 每周期候选预算。 |
 | `WALLET_ALPHA_SHADOW_MAX_EXEC_MS_PER_CYCLE` | `250` | 每周期时间预算。 |
 
