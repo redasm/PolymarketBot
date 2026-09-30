@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 
 LOG = logging.getLogger(__name__)
 
+_NO_WALLET_PLACEHOLDER = "research-mode"
+
 
 def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
@@ -798,6 +800,12 @@ class ArbConfig:
             raise ValueError("WALLET_ALPHA_SHADOW_MAX_SIGNALS_PER_CYCLE 不能为负数")
         if self.wallet_alpha_shadow_max_exec_ms_per_cycle < 0:
             raise ValueError("WALLET_ALPHA_SHADOW_MAX_EXEC_MS_PER_CYCLE 不能为负数")
+        if (
+            self.portfolio_sync_enabled
+            and not self.portfolio_sync_user_address
+            and self.funder_address == _NO_WALLET_PLACEHOLDER
+        ):
+            raise ValueError("PORTFOLIO_SYNC_ENABLED=true 需要设置 POLYMARKET_FUNDER 或 PORTFOLIO_SYNC_USER_ADDRESS")
         if not self.dry_run:
             if not self.live_trading_ack:
                 raise ValueError("实盘前必须设置 LIVE_TRADING_ACK=true")
@@ -815,9 +823,12 @@ class ArbConfig:
         cls,
         dotenv_path: str | Path | None = None,
         *,
-        require_wallet: bool = True,
+        require_wallet: bool | None = None,
     ) -> ArbConfig:
-        """从 .env 文件和环境变量构建配置."""
+        """从 .env 文件和环境变量构建配置.
+
+        require_wallet=None 表示仅在 ARB_DRY_RUN=false（实盘）时要求钱包。
+        """
         if str(dotenv_path or "") == "__ENV_ONLY__":
             pass
         elif dotenv_path:
@@ -825,6 +836,8 @@ class ArbConfig:
         else:
             load_dotenv(override=True)
 
+        if require_wallet is None:
+            require_wallet = not _env_bool("ARB_DRY_RUN", True)
         private_key = _env("PRIVATE_KEY") or _env("POLYMARKET_PRIVATE_KEY")
         funder = _env("POLYMARKET_FUNDER") or _env("POLYMARKET_DEPOSIT_WALLET")
         if require_wallet:
@@ -833,8 +846,8 @@ class ArbConfig:
             if not funder:
                 raise ValueError("必须设置 POLYMARKET_FUNDER")
         else:
-            private_key = private_key or "research-mode"
-            funder = funder or "research-mode"
+            private_key = private_key or _NO_WALLET_PLACEHOLDER
+            funder = funder or _NO_WALLET_PLACEHOLDER
 
         cfg = cls(
             private_key=private_key,
@@ -1120,7 +1133,7 @@ class ArbConfig:
             # without forcing every cycle's snapshots through REST. The
             # canary template still overrides to 10. Going from 3 → 20
             # closes the gap that pushed live WS hit-ratio below 50%.
-            ws_max_markets=_env_int("WS_MAX_MARKETS", 20),
+            ws_max_markets=_env_int("WS_MAX_MARKETS", 80),
             ws_refresh_cycles=_env_int("WS_REFRESH_CYCLES", 200),
             ws_vol_feed_interval_sec=_env_float("WS_VOL_FEED_INTERVAL_SEC", 60.0),
             ai_provider=_env("AI_PROVIDER", "openai"),

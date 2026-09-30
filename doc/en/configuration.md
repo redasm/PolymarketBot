@@ -321,14 +321,16 @@ Note that this whole strategy line tested at −28.6% ROI; see
 | Variable | Default | Meaning |
 |---|---|---|
 | `WS_ENABLED` | `true` | Use WebSocket book push instead of pure REST polling. |
-| `WS_MAX_MARKETS` | `30` | Markets tracked concurrently (two tokens each). |
+| `WS_MAX_MARKETS` | `80` | Markets tracked concurrently (two tokens each). Keep it at least `ARB_HOT_MARKET_POOL_SIZE`. |
 | `WS_REFRESH_CYCLES` | `200` | Scan cycles between re-selections of the tracked set. |
 | `WS_VOL_FEED_INTERVAL_SEC` | `60` | Mid-price feed interval into `VolEstimator`. |
 | `USER_WS_ENABLED` | `true` | User channel: own fills push straight into risk and exit management instead of waiting for the next REST poll. Needs L2 credentials; falls back to polling if unavailable. |
 | `USER_WS_QUEUE_SIZE` / `USER_WS_MAX_EVENTS_PER_CYCLE` | `2000` / `500` | User-channel queue limits. |
 
 Raising `WS_MAX_MARKETS` without also raising `ARB_HOT_MARKET_POOL_SIZE` wastes
-subscription slots. Polymarket removed its 100-token subscription cap in May
+subscription slots. The reverse is worse: every hot-pool market not on WS is
+fetched over REST every cycle, which turns a seconds-long scan cycle into
+minutes (the bot logs a warning at startup when `WS_MAX_MARKETS` is smaller). Polymarket removed its 100-token subscription cap in May
 2025; the real constraint was client-side — the `websockets` library defaults to
 `max_size=1MB`, and the server's `initial_dump=true` full-book dump exceeds that
 with many tokens, causing the client to close with code 1009 (`MESSAGE_TOO_BIG`)
@@ -457,7 +459,7 @@ ARB_HOT_MARKET_POOL_SIZE=150
 ARB_HOT_EVENT_POOL_SIZE=50
 ARB_MIN_LIQUIDITY=500
 ARB_MIN_VOLUME_24H=300
-WS_MAX_MARKETS=15
+WS_MAX_MARKETS=150
 
 T2_MIN_DEVIATION=0.01               # shadow only — see below
 T2_MAX_SPREAD_BPS=1000

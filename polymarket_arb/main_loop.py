@@ -2124,3 +2124,7 @@ def main(dotenv_path: str | None = None) -> None:
 # extracted to `polymarket_arb.main_helpers.{dashboard_serializers,
 # cycle_runners}` and re-imported above under their underscore aliases
 # so the call graph here stays unchanged.
+
+
+if __name__ == "__main__":
+    main()

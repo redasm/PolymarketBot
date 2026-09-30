@@ -87,6 +87,12 @@ def log_startup_summary(config: ArbConfig, run_id: str) -> None:
         config.portfolio_sync_enabled,
         config.portfolio_sync_interval_sec,
     )
+    if config.ws_enabled and config.ws_max_markets < config.hot_market_pool_size:
+        LOG.warning(
+            "WS_MAX_MARKETS=%d < ARB_HOT_MARKET_POOL_SIZE=%d：未被 WS 覆盖的热池市场每周期都走 REST，扫描周期会显著变慢",
+            config.ws_max_markets,
+            config.hot_market_pool_size,
+        )
     LOG.info(
         "策略: maker=%s | 研究: research=%s feeds_file=%s | LLM配置: provider=%s model=%s",
         config.maker_strategy_enabled,

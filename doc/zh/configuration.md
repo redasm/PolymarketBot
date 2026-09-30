@@ -305,13 +305,15 @@ UPDOWN 按 Polymarket 自己的价格源结算，不是 Binance。两者的 basi
 | 变量 | 默认 | 含义 |
 |---|---|---|
 | `WS_ENABLED` | `true` | 用 WebSocket 推送替代纯 REST 轮询。 |
-| `WS_MAX_MARKETS` | `30` | 同时追踪的市场数（每个两个 token）。 |
+| `WS_MAX_MARKETS` | `80` | 同时追踪的市场数（每个两个 token）。应不小于 `ARB_HOT_MARKET_POOL_SIZE`。 |
 | `WS_REFRESH_CYCLES` | `200` | 每隔多少扫描周期重新选择追踪集合。 |
 | `WS_VOL_FEED_INTERVAL_SEC` | `60` | mid price 喂入 `VolEstimator` 的间隔。 |
 | `USER_WS_ENABLED` | `true` | user 频道：自己的成交直接回写风控与退出管理器，不等下一轮 REST 轮询。需要 L2 凭证，取不到则回退轮询。 |
 | `USER_WS_QUEUE_SIZE` / `USER_WS_MAX_EVENTS_PER_CYCLE` | `2000` / `500` | user 频道队列限制。 |
 
-调高 `WS_MAX_MARKETS` 而不同步调高 `ARB_HOT_MARKET_POOL_SIZE` 会浪费订阅槽位。
+调高 `WS_MAX_MARKETS` 而不同步调高 `ARB_HOT_MARKET_POOL_SIZE` 会浪费订阅槽位。反过来更糟：
+热池里没被 WS 覆盖的市场每个周期都要走 REST，扫描周期会从秒级拖到数分钟（`WS_MAX_MARKETS`
+偏小时启动日志会给出警告）。
 Polymarket 已于 2025-05 移除 100 token 订阅上限；真正的瓶颈在客户端 —— `websockets` 库默认
 `max_size=1MB`，而服务端 `initial_dump=true` 会一次性 dump 全簿，token 多时单包超过 1MB，
 客户端主动以 1009（`MESSAGE_TOO_BIG`）关闭并陷入重连死循环。`websocket_feed.py` 已设
@@ -437,7 +439,7 @@ ARB_HOT_MARKET_POOL_SIZE=150
 ARB_HOT_EVENT_POOL_SIZE=50
 ARB_MIN_LIQUIDITY=500
 ARB_MIN_VOLUME_24H=300
-WS_MAX_MARKETS=15
+WS_MAX_MARKETS=150
 
 T2_MIN_DEVIATION=0.01               # 仅影子期，见下
 T2_MAX_SPREAD_BPS=1000

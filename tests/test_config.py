@@ -183,14 +183,46 @@ def test_from_env_loads_quant_strategy_json_config(tmp_path, monkeypatch):
     assert cfg.wallet_alpha_shadow_validation_enabled is True
 
 
+def _clear_wallet_env(monkeypatch):
+    for key in ("PRIVATE_KEY", "POLYMARKET_PRIVATE_KEY", "POLYMARKET_FUNDER", "POLYMARKET_DEPOSIT_WALLET",
+                "PORTFOLIO_SYNC_ENABLED", "PORTFOLIO_SYNC_USER_ADDRESS", "ARB_DRY_RUN", "LIVE_TRADING_ACK"):
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_from_env_dry_run_does_not_require_wallet(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env.dry-run-no-wallet"
+    env_path.write_text("ARB_DRY_RUN=true\n", encoding="utf-8")
+    _clear_wallet_env(monkeypatch)
+
+    cfg = ArbConfig.from_env(env_path)
+
+    assert cfg.dry_run is True
+
+
 def test_from_env_requires_wallet_when_requested(tmp_path, monkeypatch):
     env_path = tmp_path / ".env.missing-wallet"
     env_path.write_text("ARB_DRY_RUN=true\n", encoding="utf-8")
-    monkeypatch.delenv("PRIVATE_KEY", raising=False)
-    monkeypatch.delenv("POLYMARKET_PRIVATE_KEY", raising=False)
-    monkeypatch.delenv("POLYMARKET_FUNDER", raising=False)
+    _clear_wallet_env(monkeypatch)
 
     with pytest.raises(ValueError, match="PRIVATE_KEY"):
+        ArbConfig.from_env(env_path, require_wallet=True)
+
+
+def test_from_env_live_requires_wallet(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env.live-no-wallet"
+    env_path.write_text("ARB_DRY_RUN=false\nLIVE_TRADING_ACK=true\n", encoding="utf-8")
+    _clear_wallet_env(monkeypatch)
+
+    with pytest.raises(ValueError, match="PRIVATE_KEY"):
+        ArbConfig.from_env(env_path)
+
+
+def test_from_env_portfolio_sync_without_wallet_is_rejected(tmp_path, monkeypatch):
+    env_path = tmp_path / ".env.sync-no-wallet"
+    env_path.write_text("ARB_DRY_RUN=true\nPORTFOLIO_SYNC_ENABLED=true\n", encoding="utf-8")
+    _clear_wallet_env(monkeypatch)
+
+    with pytest.raises(ValueError, match="PORTFOLIO_SYNC_ENABLED"):
         ArbConfig.from_env(env_path)
 
 

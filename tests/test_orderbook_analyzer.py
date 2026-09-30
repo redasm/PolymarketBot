@@ -384,14 +384,31 @@ def test_batch_get_snapshots_fetches_rest_fallbacks_concurrently():
 
 
 def test_batch_get_snapshots_with_delay_stays_serial():
-    client = _Client()
+    import threading
+
+    class _ConcurrencyClient(_Client):
+        def __init__(self):
+            super().__init__()
+            self._lock = threading.Lock()
+            self.in_flight = 0
+            self.max_in_flight = 0
+
+        def get_order_book(self, token_id):
+            with self._lock:
+                self.in_flight += 1
+                self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            time.sleep(0.02)
+            with self._lock:
+                self.in_flight -= 1
+            return super().get_order_book(token_id)
+
+    client = _ConcurrencyClient()
     analyzer = OrderBookAnalyzer(client, snapshot_ttl_sec=60.0, batch_concurrency=8)
 
-    started = time.monotonic()
-    snapshots = analyzer.batch_get_snapshots(["a", "b", "c"], delay=0.05)
+    snapshots = analyzer.batch_get_snapshots(["a", "b", "c"], delay=0.01)
 
     assert set(snapshots) == {"a", "b", "c"}
-    assert time.monotonic() - started >= 0.1
+    assert client.max_in_flight == 1
 
 
 def test_feed_health_token_scope_ignores_unrelated_stale_mirror():
