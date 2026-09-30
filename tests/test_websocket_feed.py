@@ -675,3 +675,61 @@ def test_run_loop_enqueues_instead_of_handling_inline():
     src = inspect.getsource(websocket_feed.WebSocketFeed._run_loop)
     assert "self._inbox.put(raw)" in src
     assert "self._handle_message(raw)" not in src
+
+
+def test_mirror_discard_removes_books_and_pending_deltas():
+    mirror = OrderBookMirror()
+    mirror.apply_snapshot("a", [{"price": "0.4", "size": "1"}], [{"price": "0.6", "size": "1"}])
+    mirror.apply_delta("b", "buy", 0.3, 5.0)
+
+    mirror.discard(["a", "b"])
+
+    assert mirror.get("a") is None
+    assert "b" not in mirror._pending_deltas
+
+
+def test_remove_tokens_discards_from_mirror():
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror)
+    feed.subscribe(["a"])
+    mirror.apply_snapshot("a", [{"price": "0.4", "size": "1"}], [{"price": "0.6", "size": "1"}])
+
+    feed.remove_tokens(["a"])
+
+    assert mirror.get("a") is None
+
+
+def test_processor_applies_connected_marker_in_order():
+    import threading as _threading
+    import time as _time
+    from polymarket_arb import websocket_feed
+
+    mirror = OrderBookMirror()
+    feed = WebSocketFeed(mirror=mirror)
+    feed._start_processor()
+    try:
+        ts = _time.time()
+        feed._inbox.put(websocket_feed._ConnectedMarker(ts))
+        deadline = _time.time() + 5
+        while not mirror.is_trusted(ts, _time.time(), 20.0) and _time.time() < deadline:
+            _time.sleep(0.01)
+        assert mirror.is_trusted(ts, _time.time(), 20.0)
+        assert not mirror.is_trusted(ts - 1.0, _time.time(), 20.0)
+    finally:
+        feed._stop_processor()
+
+
+def test_stop_and_disconnect_paths_mark_mirror_disconnected():
+    import inspect
+    import time as _time
+    from polymarket_arb import websocket_feed
+
+    src = inspect.getsource(websocket_feed.WebSocketFeed._run_loop)
+    assert src.count("self._mirror.mark_disconnected()") == 2
+
+    mirror = OrderBookMirror()
+    mirror.mark_connected(0.0)
+    mirror.mark_applied(_time.time())
+    feed = WebSocketFeed(mirror=mirror)
+    feed.stop()
+    assert not mirror.is_trusted(1.0, _time.time(), 20.0)

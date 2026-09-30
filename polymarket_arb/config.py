@@ -101,6 +101,7 @@ class ArbConfig:
     orderbook_retry_delay_sec: float
     orderbook_missing_cooldown_sec: float
     orderbook_batch_concurrency: int
+    orderbook_ws_liveness_sec: float
     cross_platform_pairs_json: str
     polymarket_taker_fee_rate: float
     kalshi_taker_fee_rate: float
@@ -591,6 +592,8 @@ class ArbConfig:
             raise ValueError("ORDERBOOK_MISSING_COOLDOWN_SEC 不能为负数")
         if self.orderbook_batch_concurrency < 1:
             raise ValueError("ORDERBOOK_BATCH_CONCURRENCY 必须至少为 1")
+        if self.orderbook_ws_liveness_sec <= 0:
+            raise ValueError("ORDERBOOK_WS_LIVENESS_SEC 必须大于 0")
         if self.max_multi_outcome_legs < 2:
             raise ValueError("ARB_MAX_MULTI_OUTCOME_LEGS 必须至少为 2")
         if self.max_open_positions <= 0:
@@ -915,6 +918,13 @@ class ArbConfig:
             # on a cold WS mirror this meant hundreds of sequential HTTP
             # round trips per cycle. Fetch concurrently instead.
             orderbook_batch_concurrency=_env_int("ORDERBOOK_BATCH_CONCURRENCY", 16),
+            # Polymarket pushes only on change, so a quiet WS book is still
+            # current while the feed is connected and applying messages (a
+            # PING/PONG every 8s keeps a quiet connection live). Books older
+            # than ORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC are used as long as the
+            # feed processed a message within this window. feed_health's live
+            # gate still uses per-book age.
+            orderbook_ws_liveness_sec=_env_float("ORDERBOOK_WS_LIVENESS_SEC", 20.0),
             cross_platform_pairs_json=_env("CROSS_PLATFORM_PAIRS_JSON", ""),
             # Polymarket's current binary taker baseline is 0.5%. Keep the
             # fallback aligned with `.env.example`; a 5% fallback silently

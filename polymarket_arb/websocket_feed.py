@@ -29,6 +29,14 @@ from polymarket_arb.models import OrderBookLevel, OrderBookSnapshot
 from polymarket_arb.utils_time import now_ms
 
 _INBOX_STOP = object()
+
+
+class _ConnectedMarker:
+    __slots__ = ("ts",)
+
+    def __init__(self, ts: float) -> None:
+        self.ts = ts
+
 _INBOX_BACKLOG_WARN_DEPTH = 5000
 _INBOX_BACKLOG_WARN_INTERVAL_SEC = 30.0
 
@@ -105,6 +113,40 @@ class OrderBookMirror:
         # here and replayed once the snapshot lands. Without this we silently
         # drop the early increments after every reconnect.
         self._pending_deltas: dict[str, list[tuple[str, float, float]]] = {}
+        # Connection liveness. Polymarket only pushes on change, so a quiet
+        # book's own timestamp says nothing about staleness; while the feed is
+        # connected and still applying messages, every book refreshed since
+        # the current connection began is current.
+        self._connected = False
+        self._connected_since = 0.0
+        self._last_applied_ts = 0.0
+
+    def mark_connected(self, ts: float) -> None:
+        with self._lock:
+            self._connected = True
+            self._connected_since = ts
+
+    def mark_disconnected(self) -> None:
+        with self._lock:
+            self._connected = False
+
+    def mark_applied(self, ts: float) -> None:
+        with self._lock:
+            self._last_applied_ts = ts
+
+    def is_trusted(self, snap_ts: float, now: float, liveness_sec: float) -> bool:
+        with self._lock:
+            return (
+                self._connected
+                and now - self._last_applied_ts <= liveness_sec
+                and snap_ts >= self._connected_since
+            )
+
+    def discard(self, token_ids: Iterable[str]) -> None:
+        with self._lock:
+            for token_id in token_ids:
+                self._books.pop(token_id, None)
+                self._pending_deltas.pop(token_id, None)
 
     def register_callback(self, cb: Callable[[str, OrderBookSnapshot], None]) -> None:
         should_start = False
@@ -387,6 +429,7 @@ class WebSocketFeed:
         if not gone:
             return True
         self._subscribed_tokens.difference_update(gone)
+        self._mirror.discard(gone)
         return self._send_dynamic_subscription("unsubscribe", gone)
 
     def _send_dynamic_subscription(self, operation: str, tokens: set[str]) -> bool:
@@ -419,6 +462,7 @@ class WebSocketFeed:
 
     def stop(self) -> None:
         self._running = False
+        self._mirror.mark_disconnected()
         if self._thread:
             self._thread.join(timeout=5)
         self._stop_processor()
@@ -463,6 +507,7 @@ class WebSocketFeed:
                         })
                         ws.send(sub_msg)
                         LOG.info("WebSocket 订阅已发送，token=%d", len(self._subscribed_tokens))
+                    self._inbox.put(_ConnectedMarker(time.time()))
 
                     while self._running:
                         # 官方 wss-overview 要求 "Send PING every 10 seconds"；
@@ -479,6 +524,7 @@ class WebSocketFeed:
             except ConnectionClosed as exc:
                 with self._ws_lock:
                     self._ws_handle = None
+                self._mirror.mark_disconnected()
                 if not self._running:
                     break
                 if self._enhanced_store is not None:
@@ -516,6 +562,7 @@ class WebSocketFeed:
             except Exception as exc:
                 with self._ws_lock:
                     self._ws_handle = None
+                self._mirror.mark_disconnected()
                 if not self._running:
                     break
                 if self._enhanced_store is not None:
@@ -550,10 +597,15 @@ class WebSocketFeed:
             raw = self._inbox.get()
             if raw is _INBOX_STOP:
                 return
+            if isinstance(raw, _ConnectedMarker):
+                self._mirror.mark_connected(raw.ts)
+                self._mirror.mark_applied(time.time())
+                continue
             try:
                 self._handle_message(raw)
             except Exception:
                 LOG.exception("处理 WebSocket 消息失败，已跳过该条")
+            self._mirror.mark_applied(time.time())
             self._maybe_warn_backlog()
 
     def _maybe_warn_backlog(self) -> None:

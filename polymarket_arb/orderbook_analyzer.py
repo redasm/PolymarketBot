@@ -79,6 +79,7 @@ class OrderBookAnalyzer:
         missing_orderbook_cooldown_sec: float = 300.0,
         feed_health_cache_ttl_sec: float = 0.2,
         batch_concurrency: int = 16,
+        ws_liveness_sec: float = 20.0,
     ):
         self._client = clob_client
         self._live_mirror = live_mirror
@@ -88,6 +89,7 @@ class OrderBookAnalyzer:
         self._retry_delay_sec = max(0.0, float(retry_delay_sec))
         self._missing_orderbook_cooldown_sec = max(0.0, float(missing_orderbook_cooldown_sec))
         self._batch_concurrency = max(1, int(batch_concurrency))
+        self._ws_liveness_sec = max(0.0, float(ws_liveness_sec))
         self._snapshot_cache: dict[str, OrderBookSnapshot] = {}
         self._snapshot_cache_source: dict[str, str] = {}
         self._missing_orderbook_until: dict[str, float] = {}
@@ -329,7 +331,12 @@ class OrderBookAnalyzer:
         if snap is None:
             return None
         snap_ts = float(getattr(snap, "timestamp", 0.0) or 0.0)
-        if self._ws_snapshot_max_age_sec > 0 and snap_ts > 0 and (now - snap_ts) > self._ws_snapshot_max_age_sec:
+        if (
+            self._ws_snapshot_max_age_sec > 0
+            and snap_ts > 0
+            and (now - snap_ts) > self._ws_snapshot_max_age_sec
+            and not self._mirror_trusts(snap_ts, now)
+        ):
             return None
         # Hot-path micro-opt: scan_cycle calls get_snapshot ≥2× per
         # binary market every cycle. The WS mirror typically returns
@@ -348,6 +355,16 @@ class OrderBookAnalyzer:
             self._set_cached_snapshot(token_id, snap, source="ws")
         self._record_stat("ws_hit")
         return snap
+
+    def _mirror_trusts(self, snap_ts: float, now: float) -> bool:
+        is_trusted = getattr(self._live_mirror, "is_trusted", None)
+        if is_trusted is None or self._ws_liveness_sec <= 0:
+            return False
+        try:
+            return bool(is_trusted(snap_ts, now, self._ws_liveness_sec))
+        except Exception as e:
+            LOG.debug("读取 WS 镜像存活状态失败: %s", e)
+            return False
 
     def _set_cached_snapshot(self, token_id: str, snapshot: OrderBookSnapshot, *, source: str) -> None:
         self._snapshot_cache[token_id] = snapshot

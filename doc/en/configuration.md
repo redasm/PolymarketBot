@@ -341,7 +341,8 @@ and reconnect forever. `websocket_feed.py` sets `max_size=16MB`.
 | Variable | Default | Meaning |
 |---|---|---|
 | `ORDERBOOK_SNAPSHOT_TTL_SEC` | `0.5` | REST snapshot cache TTL. Keep between 0.2 and 0.8 — smaller returns to heavy REST load, larger makes the scanned book stale. |
-| `ORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC` | `10` | Age past which a WS snapshot is abandoned for REST. |
+| `ORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC` | `10` | Age past which a WS snapshot is abandoned for REST — unless the feed is live (next row). |
+| `ORDERBOOK_WS_LIVENESS_SEC` | `20` | Polymarket pushes only on change, so a quiet book is still current while the feed is connected. A mirror book refreshed during the current connection is used regardless of age as long as the feed processed any message (heartbeats included) within this window. Disconnects fall back to the age rule. The live `feed_health` gate still uses per-book age. |
 | `ORDERBOOK_RETRY_COUNT` / `ORDERBOOK_RETRY_DELAY_SEC` | `2` / `0.15` | REST retry policy. |
 | `ORDERBOOK_MISSING_COOLDOWN_SEC` | `300` | Cooldown for a token after CLOB explicitly returns "No orderbook exists". |
 

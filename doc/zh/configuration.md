@@ -324,7 +324,8 @@ Polymarket 已于 2025-05 移除 100 token 订阅上限；真正的瓶颈在客�
 | 变量 | 默认 | 含义 |
 |---|---|---|
 | `ORDERBOOK_SNAPSHOT_TTL_SEC` | `0.5` | REST 快照缓存 TTL。保持在 0.2–0.8：太小回到高频 REST 压力，太大让扫描看到的盘口变旧。 |
-| `ORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC` | `10` | 超过该年龄放弃 WS 快照改走 REST。 |
+| `ORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC` | `10` | 超过该年龄放弃 WS 快照改走 REST —— WS 连接存活时除外（见下一行）。 |
+| `ORDERBOOK_WS_LIVENESS_SEC` | `20` | Polymarket 只在盘口变化时推送，连接正常时安静盘口仍是最新的。只要 WS 在该窗口内处理过任何消息（含心跳），本次连接内刷新过的镜像盘口不论多久没变都直接使用；断线时回到按年龄判断。实盘 `feed_health` 门禁仍按单本盘口年龄判断。 |
 | `ORDERBOOK_RETRY_COUNT` / `ORDERBOOK_RETRY_DELAY_SEC` | `2` / `0.15` | REST 重试策略。 |
 | `ORDERBOOK_MISSING_COOLDOWN_SEC` | `300` | CLOB 明确返回 "No orderbook exists" 后对该 token 的冷却时长。 |
 

@@ -577,3 +577,53 @@ def test_feed_health_cache_expires_after_ttl():
     time.sleep(0.08)
     analyzer.feed_health(max_snapshot_age_sec=5.0, min_ws_hit_ratio=0.0)
     assert mirror.get_all_calls == 2
+
+
+def _quiet_mirror_setup(*, connected=True, applied_ago=1.0, connected_ago=60.0, snap_age=30.0):
+    from polymarket_arb.websocket_feed import OrderBookMirror
+
+    now = time.time()
+    mirror = OrderBookMirror()
+    mirror.apply_snapshot("quiet", [{"price": "0.40", "size": "10"}], [{"price": "0.42", "size": "12"}])
+    snap = mirror.get("quiet")
+    snap.timestamp = now - snap_age
+    if connected:
+        mirror.mark_connected(now - connected_ago)
+    mirror.mark_applied(now - applied_ago)
+    return mirror, snap
+
+
+def test_quiet_ws_book_is_used_while_feed_is_live():
+    mirror, snap = _quiet_mirror_setup()
+    client = _Client()
+    analyzer = OrderBookAnalyzer(client, live_mirror=mirror, ws_snapshot_max_age_sec=10.0, ws_liveness_sec=20.0)
+
+    assert analyzer.get_snapshot("quiet") is snap
+    assert client.calls == 0
+
+
+def test_quiet_ws_book_falls_back_to_rest_when_disconnected():
+    mirror, _ = _quiet_mirror_setup(connected=False)
+    client = _Client()
+    analyzer = OrderBookAnalyzer(client, live_mirror=mirror, ws_snapshot_max_age_sec=10.0, ws_liveness_sec=20.0)
+
+    assert analyzer.get_snapshot("quiet") is not None
+    assert client.calls == 1
+
+
+def test_quiet_ws_book_falls_back_to_rest_when_feed_stopped_applying():
+    mirror, _ = _quiet_mirror_setup(applied_ago=30.0)
+    client = _Client()
+    analyzer = OrderBookAnalyzer(client, live_mirror=mirror, ws_snapshot_max_age_sec=10.0, ws_liveness_sec=20.0)
+
+    analyzer.get_snapshot("quiet")
+    assert client.calls == 1
+
+
+def test_ws_book_from_previous_connection_is_not_trusted():
+    mirror, _ = _quiet_mirror_setup(connected_ago=5.0, snap_age=30.0)
+    client = _Client()
+    analyzer = OrderBookAnalyzer(client, live_mirror=mirror, ws_snapshot_max_age_sec=10.0, ws_liveness_sec=20.0)
+
+    analyzer.get_snapshot("quiet")
+    assert client.calls == 1
