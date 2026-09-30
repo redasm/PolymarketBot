@@ -142,6 +142,7 @@ def make_test_config(**overrides) -> ArbConfig:
         orderbook_retry_count=2,
         orderbook_retry_delay_sec=0.15,
         orderbook_missing_cooldown_sec=300.0,
+        orderbook_batch_concurrency=16,
         cross_platform_pairs_json="",
         polymarket_taker_fee_rate=0.02,
         kalshi_taker_fee_rate=0.003,

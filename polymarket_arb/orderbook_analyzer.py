@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from polymarket_arb.models import OrderBookLevel, OrderBookSnapshot
@@ -77,6 +78,7 @@ class OrderBookAnalyzer:
         retry_delay_sec: float = 0.15,
         missing_orderbook_cooldown_sec: float = 300.0,
         feed_health_cache_ttl_sec: float = 0.2,
+        batch_concurrency: int = 16,
     ):
         self._client = clob_client
         self._live_mirror = live_mirror
@@ -85,6 +87,7 @@ class OrderBookAnalyzer:
         self._retry_count = max(0, int(retry_count))
         self._retry_delay_sec = max(0.0, float(retry_delay_sec))
         self._missing_orderbook_cooldown_sec = max(0.0, float(missing_orderbook_cooldown_sec))
+        self._batch_concurrency = max(1, int(batch_concurrency))
         self._snapshot_cache: dict[str, OrderBookSnapshot] = {}
         self._snapshot_cache_source: dict[str, str] = {}
         self._missing_orderbook_until: dict[str, float] = {}
@@ -474,6 +477,23 @@ class OrderBookAnalyzer:
             else:
                 missing.append(tid)
         if not allow_rest_fallback:
+            return result
+
+        if delay <= 0 and len(missing) > 1 and self._batch_concurrency > 1:
+            # Cold-start / low-WS-coverage cycles can leave hundreds of
+            # tokens with no live or cached snapshot, each needing its own
+            # REST round trip. Fetching them one at a time here turns a
+            # ~5s scan cycle into minutes (each token's individual
+            # get_snapshot() writes to a distinct cache/cooldown dict key,
+            # so concurrent calls don't need extra locking beyond the
+            # existing _stats_lock).
+            with ThreadPoolExecutor(max_workers=min(self._batch_concurrency, len(missing))) as pool:
+                for tid, snap in zip(missing, pool.map(
+                    lambda t: self.get_snapshot(t, allow_rest_fallback=True, count_request=False),
+                    missing,
+                )):
+                    if snap is not None:
+                        result[tid] = snap
             return result
 
         for idx, tid in enumerate(missing):

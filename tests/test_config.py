@@ -28,6 +28,7 @@ from tests.conftest import make_test_config, write_test_env
         ("orderbook_ws_snapshot_max_age_sec", -0.1, "ORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC"),
         ("orderbook_retry_delay_sec", -0.1, "ORDERBOOK_RETRY_DELAY_SEC"),
         ("orderbook_missing_cooldown_sec", -1.0, "ORDERBOOK_MISSING_COOLDOWN_SEC"),
+        ("orderbook_batch_concurrency", 0, "ORDERBOOK_BATCH_CONCURRENCY"),
         ("t2_min_deviation", -0.1, "T2_MIN_DEVIATION"),
         ("t2_max_spread_bps", -1.0, "T2_MAX_SPREAD_BPS"),
         ("t2_min_top_depth", -1.0, "T2_MIN_TOP_DEPTH"),

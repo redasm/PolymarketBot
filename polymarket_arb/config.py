@@ -98,6 +98,7 @@ class ArbConfig:
     orderbook_retry_count: int
     orderbook_retry_delay_sec: float
     orderbook_missing_cooldown_sec: float
+    orderbook_batch_concurrency: int
     cross_platform_pairs_json: str
     polymarket_taker_fee_rate: float
     kalshi_taker_fee_rate: float
@@ -586,6 +587,8 @@ class ArbConfig:
             raise ValueError("ORDERBOOK_RETRY_DELAY_SEC 不能为负数")
         if self.orderbook_missing_cooldown_sec < 0:
             raise ValueError("ORDERBOOK_MISSING_COOLDOWN_SEC 不能为负数")
+        if self.orderbook_batch_concurrency < 1:
+            raise ValueError("ORDERBOOK_BATCH_CONCURRENCY 必须至少为 1")
         if self.max_multi_outcome_legs < 2:
             raise ValueError("ARB_MAX_MULTI_OUTCOME_LEGS 必须至少为 2")
         if self.max_open_positions <= 0:
@@ -882,15 +885,23 @@ class ArbConfig:
             maker_strategy_enabled=_env_bool("MAKER_STRATEGY_ENABLED", True),
             min_liquidity=_env_float("ARB_MIN_LIQUIDITY", 1000.0),
             min_volume_24h=_env_float("ARB_MIN_VOLUME_24H", 500.0),
-            # REST cache TTL. 0.5s was so tight that sub-cycle re-reads
-            # always hit REST again (cycles run ~1.5s wall). 2.5s keeps a
-            # snapshot warm for the full cycle while still refreshing
-            # every scan, dropping rest_fallback share significantly.
-            orderbook_snapshot_ttl_sec=_env_float("ORDERBOOK_SNAPSHOT_TTL_SEC", 2.5),
+            # REST cache TTL. With a large market universe most tokens
+            # never land in the WS mirror, so every get_snapshot() call for
+            # them is a REST round trip; 2.5s was still shorter than a
+            # single real scan cycle (observed ~800s+ under a ~600-market
+            # universe with only ~100 WS-covered tokens), so no snapshot
+            # fetched anywhere in a cycle was ever reused. 5s matches
+            # LIVE_MAX_ORDERBOOK_SNAPSHOT_AGE_SEC, so no staleness beyond
+            # what live already tolerates; T0 reads the WS mirror first.
+            orderbook_snapshot_ttl_sec=_env_float("ORDERBOOK_SNAPSHOT_TTL_SEC", 5.0),
             orderbook_ws_snapshot_max_age_sec=_env_float("ORDERBOOK_WS_SNAPSHOT_MAX_AGE_SEC", 10.0),
             orderbook_retry_count=_env_int("ORDERBOOK_RETRY_COUNT", 2),
             orderbook_retry_delay_sec=_env_float("ORDERBOOK_RETRY_DELAY_SEC", 0.15),
             orderbook_missing_cooldown_sec=_env_float("ORDERBOOK_MISSING_COOLDOWN_SEC", 300.0),
+            # REST fallback for batch_get_snapshots was strictly serial —
+            # on a cold WS mirror this meant hundreds of sequential HTTP
+            # round trips per cycle. Fetch concurrently instead.
+            orderbook_batch_concurrency=_env_int("ORDERBOOK_BATCH_CONCURRENCY", 16),
             cross_platform_pairs_json=_env("CROSS_PLATFORM_PAIRS_JSON", ""),
             # Polymarket's current binary taker baseline is 0.5%. Keep the
             # fallback aligned with `.env.example`; a 5% fallback silently

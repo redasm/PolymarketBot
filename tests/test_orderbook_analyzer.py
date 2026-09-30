@@ -361,6 +361,39 @@ def test_batch_get_snapshots_counts_logical_requests_once_per_token():
     assert stats["rest_fallback"] == 1
 
 
+def test_batch_get_snapshots_fetches_rest_fallbacks_concurrently():
+    class _SlowClient(_Client):
+        def get_order_book(self, token_id):
+            time.sleep(0.2)
+            return super().get_order_book(token_id)
+
+    client = _SlowClient()
+    analyzer = OrderBookAnalyzer(client, snapshot_ttl_sec=60.0, batch_concurrency=8)
+    token_ids = [f"tok-{i}" for i in range(8)]
+
+    started = time.monotonic()
+    snapshots = analyzer.batch_get_snapshots(token_ids)
+    elapsed = time.monotonic() - started
+
+    assert set(snapshots) == set(token_ids)
+    assert client.calls == 8
+    assert elapsed < 0.2 * 8 / 2
+    stats = analyzer.snapshot_stats()
+    assert stats["rest_fallback"] == 8
+    assert stats["rest_success"] == 8
+
+
+def test_batch_get_snapshots_with_delay_stays_serial():
+    client = _Client()
+    analyzer = OrderBookAnalyzer(client, snapshot_ttl_sec=60.0, batch_concurrency=8)
+
+    started = time.monotonic()
+    snapshots = analyzer.batch_get_snapshots(["a", "b", "c"], delay=0.05)
+
+    assert set(snapshots) == {"a", "b", "c"}
+    assert time.monotonic() - started >= 0.1
+
+
 def test_feed_health_token_scope_ignores_unrelated_stale_mirror():
     """P0-2: a stale mirror token outside the scope must not fail health."""
     now = time.time()

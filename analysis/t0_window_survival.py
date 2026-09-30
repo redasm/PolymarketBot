@@ -11,6 +11,7 @@ import collections
 import argparse
 import json
 import statistics
+import sys
 from pathlib import Path
 
 FEE = 0.005

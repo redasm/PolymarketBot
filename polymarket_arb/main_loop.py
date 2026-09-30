@@ -416,6 +416,7 @@ def main(dotenv_path: str | None = None) -> None:
         retry_count=config.orderbook_retry_count,
         retry_delay_sec=config.orderbook_retry_delay_sec,
         missing_orderbook_cooldown_sec=config.orderbook_missing_cooldown_sec,
+        batch_concurrency=config.orderbook_batch_concurrency,
     )
     detector = ArbitrageDetector(config, ob_analyzer)
     executor = ExecutionEngine(config, trading_client or ro_client)
