@@ -12,7 +12,7 @@ resting ask would have been hit.
 
 Usage:
     python analysis/fetch_public_trades.py \
-        --ticks E:/PolymarketData/6.20-6.26/data/ticks/2026-06-23.ndjson \
+        --ticks <DATA_ROOT>/6.20-6.26/data/ticks/2026-06-23.ndjson \
         --out <dir>/trades_2026-06-23.ndjson
 """
 from __future__ import annotations

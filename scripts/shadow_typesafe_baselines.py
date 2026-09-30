@@ -12,7 +12,7 @@
     python scripts/shadow_typesafe_baselines.py backfill
 
     # 历史回放（已结算市场的历史快照，标签已知）：先建快照再打标
-    python analysis/build_typesafe_replay_snapshots.py --ticks-dir "E:/PolymarketData/*/data/ticks"
+    python analysis/build_typesafe_replay_snapshots.py --ticks-dir "<DATA_ROOT>/*/data/ticks"
     python scripts/shadow_typesafe_baselines.py replay --variant both
 
 输出：

@@ -21,7 +21,8 @@ infrastructure to actually measure whether any of it works.
 > results**, not as a profitable trading system. Live trading with it has been
 > stopped.
 >
-> Full numbers, methods and reproduction scripts:
+> Full numbers, methods and the analysis scripts (raw tick/telemetry data is not
+> published — the scripts take a `--data-dir` and re-run on data you record yourself):
 > **[doc/en/research-findings.md](doc/en/research-findings.md)**
 
 ## Why publish it anyway
@@ -82,6 +83,10 @@ python -m research.backtest.run --dataset default  # offline replay (needs a rec
 pytest                                             # test suite
 ```
 
+`run_bot_with_copytrading.py` is deprecated: it drives the copy-trading lane,
+which was falsified (−28.6% ROI to settlement). It is kept for research
+reproduction only.
+
 ## Documentation
 
 All documentation lives in [`doc/`](doc/), in English and Chinese.
@@ -114,9 +119,9 @@ Roughly 71k lines of Python with a 1,190-test suite.
 
 ## Requirements
 
-Python 3.10+ (3.11 or newer recommended). `py-clob-client` is version-pinned
-because `ExecutionEngine` reaches into a module-private HTTP client attribute;
-see [doc/en/operations.md](doc/en/operations.md#install).
+Python 3.10+ (3.11 or newer recommended). `py-clob-client-v2` is range-pinned
+because the client factory patches a module-private HTTP client attribute; see
+[doc/en/operations.md](doc/en/operations.md#install).
 
 ## Contributing
 

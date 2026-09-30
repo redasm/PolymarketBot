@@ -9,8 +9,8 @@
 用法::
 
     python analysis/build_typesafe_replay_snapshots.py \
-        --ticks-dir "E:/PolymarketData/*/data/ticks" \
-        --hf-snapshots "E:/PolymarketData/6.6-6.12/hf_crypto_resolved/market_snapshots.jsonl"
+        --ticks-dir "<DATA_ROOT>/*/data/ticks" \
+        --hf-snapshots "<DATA_ROOT>/6.6-6.12/hf_crypto_resolved/market_snapshots.jsonl"
 
 输出 ``data/typesafe_replay/replay_snapshots.jsonl``（刻意不放 data/telemetry：那里有
 DataJanitor 的 14 天淘汰 + 2GB 上限，回测数据要长期保留）。
@@ -428,7 +428,7 @@ def build_rows_from_hf(
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build historical snapshots for the TypeSafe Jev replay backtest")
     ap.add_argument("--ticks-dir", action="append", default=[],
-                    help="tick 目录或 glob（可多次传），例：E:/PolymarketData/*/data/ticks")
+                    help="tick 目录或 glob（可多次传），例：<DATA_ROOT>/*/data/ticks")
     ap.add_argument("--hf-snapshots", default=None,
                     help="hf_crypto_resolved/market_snapshots.jsonl，可选")
     ap.add_argument("--output", default=DEFAULT_OUTPUT)

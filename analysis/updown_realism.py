@@ -16,7 +16,7 @@ things break that:
        reachable, else settle at the last observed bid.
 
 Usage:
-    python analysis/updown_realism.py --data-dir E:/PolymarketData/6.20-6.26/data
+    python analysis/updown_realism.py --data-dir <DATA_ROOT>/6.20-6.26/data
 """
 from __future__ import annotations
 

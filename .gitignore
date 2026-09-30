@@ -21,6 +21,7 @@ build/
 .idea/
 .vscode/
 .claude/settings.local.json
+CLAUDE.local.md
 
 # --- Runtime state and logs ---------------------------------------------------
 custom_pricing_rules.json

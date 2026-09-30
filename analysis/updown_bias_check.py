@@ -2,10 +2,14 @@
 UPDOWN look-ahead bias analysis
 Joins strategy_signals (has updown context) with positions_lifecycle (has pnl/hold_sec)
 """
-import json, os, statistics
+import argparse, json, os, statistics
 
-TELE = r"E:\PolymarketData\6.2-6.5\data\telemetry"
-DATES = ["2026-06-02", "2026-06-03", "2026-06-04", "2026-06-05"]
+_parser = argparse.ArgumentParser(description=__doc__)
+_parser.add_argument("--telemetry-dir", required=True, help="directory with <date>.strategy_signals.ndjson and <date>.positions_lifecycle.ndjson")
+_parser.add_argument("--dates", nargs="+", default=["2026-06-02", "2026-06-03", "2026-06-04", "2026-06-05"])
+_args = _parser.parse_args()
+TELE = _args.telemetry_dir
+DATES = _args.dates
 
 # ── 1. Load strategy_signals with updown context ─────────────────────────────
 signals = {}  # signal_id -> record

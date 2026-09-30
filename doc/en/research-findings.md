@@ -347,7 +347,7 @@ news?", not "was there *relevant* news". Several markets in the audit hit the
 person-name query pulled in an entire city's local news. Always read a manual
 sample.
 
-Three measurement bugs found while running that audit, each of which would have
+Four measurement bugs found while running that audit, each of which would have
 inverted the conclusion on its own:
 
 | Bug | Consequence | Fix |

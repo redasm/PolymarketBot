@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""入口：机器人主循环 + 跟单(wallet_alpha)数据 worker，不含任何 LLM worker.
+"""【已废弃】入口：机器人主循环 + 跟单(wallet_alpha)数据 worker，不含任何 LLM worker.
+
+DEPRECATED: 跟单策略已被证伪（跟到结算 −28.6% ROI，见 doc/en/research-findings.md）。
+保留本入口仅供研究复现，不要用它跑实盘。
 
 为什么单独一个入口：
 跟单策略(wallet_alpha)的三个数据 worker —— wallet-scanner / wallet-markout /
@@ -34,7 +37,14 @@ from scripts.run_automated_quant_pipeline import (
 )
 
 
+_DEPRECATION_NOTICE = (
+    "DEPRECATED: wallet copy trading was falsified (-28.6% ROI followed to settlement, "
+    "see doc/en/research-findings.md). This entry point is kept for research reproduction only."
+)
+
+
 def main() -> int:
+    print(_DEPRECATION_NOTICE, file=sys.stderr)
     parser = argparse.ArgumentParser(
         description="Run one bot plus wallet copy-trading data workers (NO LLM workers)",
     )

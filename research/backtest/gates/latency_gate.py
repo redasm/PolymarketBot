@@ -38,7 +38,7 @@ Exit code is non-zero when retention at ``--fail-delay`` drops below
 Usage
 -----
     python -m research.backtest.gates.latency_gate \\
-        --data-dir E:/PolymarketData/6.20-6.26/data \\
+        --data-dir <DATA_ROOT>/6.20-6.26/data \\
         --window-minutes 15 \\
         --delays 0.5,1,2,5 \\
         --fail-delay 1.0 --min-retention 0.5

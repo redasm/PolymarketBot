@@ -1,0 +1,3 @@
+# Legacy V1 CLOB client (optional). Polymarket hard-cut to CLOB V2 on 2026-04-28;
+# the bot only falls back to this when py-clob-client-v2 is not installed.
+py-clob-client==0.34.6

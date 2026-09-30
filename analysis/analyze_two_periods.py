@@ -1,7 +1,9 @@
 """One-off: aggregate cycle_metrics + trades + skip_reasons across the two PolymarketData periods."""
-import json, glob, os, collections
+import argparse, json, glob, os, collections
 
-ROOT = r"E:\PolymarketData"
+_parser = argparse.ArgumentParser(description=__doc__)
+_parser.add_argument("--root", required=True, help="data root containing the 5.23-5-25/ and 5.25-5-29/ period directories")
+ROOT = _parser.parse_args().root
 PERIODS = {
     "OLD (5.23-5.25, T3 on)": os.path.join(ROOT, "5.23-5-25", "data", "telemetry"),
     "NEW (5.25-5.29, T3 off)": os.path.join(ROOT, "5.25-5-29", "data", "telemetry"),

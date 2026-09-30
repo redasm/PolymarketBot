@@ -12,7 +12,7 @@ entry deviation is recovered by joining `strategy_signals` on
 
 Usage:
     python analysis/updown_threshold_sweep.py \
-        --data-dir E:/PolymarketData/6.20-6.26/data --cache <pickle from updown_realism>
+        --data-dir <DATA_ROOT>/6.20-6.26/data --cache <pickle from updown_realism>
 """
 from __future__ import annotations
 

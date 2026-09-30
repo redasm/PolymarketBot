@@ -31,15 +31,16 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 dependencies = [
-    "py-clob-client==0.34.6",
-    # Pinned upper bound: ExecutionEngine relies on `_force_py_clob_http1` to
+    # Pinned upper bound: client_factory relies on `_force_py_clob_http1` to
     # toggle the module-private `_http_client` attribute. New majors of the
     # client may rename or relocate that hook (see contract test in
     # `tests/test_client_factory.py`); upgrade only after re-validating.
     "py-clob-client-v2>=1.0.0,<2.0.0",
     "python-dotenv>=1.0.0",
     "requests>=2.31.0",
-    "websockets>=12.0",
+    # Upper bound: the sync client API used by websocket_feed is unchanged through
+    # 17.x per the upstream changelog; re-check before allowing 18.
+    "websockets>=12.0,<18",
     "aiohttp>=3.9.0",
     "fastapi>=0.115.0",
     "uvicorn>=0.32.0",
@@ -52,6 +53,11 @@ Issues = "https://github.com/redasm/PolymarketBot/issues"
 Documentation = "https://github.com/redasm/PolymarketBot/tree/master/doc"
 
 [project.optional-dependencies]
+# Legacy V1 CLOB client. Polymarket hard-cut to CLOB V2 on 2026-04-28; only
+# reached when py-clob-client-v2 is not installed.
+legacy-v1 = [
+    "py-clob-client==0.34.6",
+]
 ai = [
     "openai>=1.30.0",
     "anthropic>=0.30.0",

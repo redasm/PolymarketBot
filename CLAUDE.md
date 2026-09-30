@@ -123,18 +123,17 @@ corresponds to a bug that actually happened. Full text in
 - **Run ID and restart**: every log line and telemetry row carries
   `run_id=run-<pid>-<UTC start>`. Code edits do not take effect until restart;
   if `run_id` is unchanged, the process is on the old code.
-- **`py-clob-client` is version-pinned** because `ExecutionEngine` reaches into
-  the module-private `_http_client` via `_force_py_clob_http1`. Any upgrade
-  needs `tests/test_client_factory.py` re-validated.
+- **`py-clob-client-v2` is range-pinned (`<2.0`)** because
+  `client_factory._force_py_clob_http1` replaces the SDK's module-private
+  `_http_client`. Any upgrade needs `tests/test_client_factory.py` re-validated.
+  Live orders go through the V2 client (`ExecutionEngine._submit_order_v2`); the
+  V1 `py-clob-client` is an optional legacy extra (`pip install .[legacy-v1]`)
+  and only reached if V2 is not installed.
 
 ## Working with Claude
 
-### Language and tone
-
-- **Reply in Chinese.** Code, identifiers and log strings stay English;
-  explanations and reports are Chinese.
-- 不要开场白（"好的我来分析…"）。直接给结论，证据放后。分析报告用 markdown 表格而非散文。
-- 不确定时直说"我不确定 X"或"需要看 Y 才能下结论"。**量化领域瞎猜的代价很高，宁可让用户多答一问。**
+Personal preferences (reply language, tone, analysis routine) belong in a
+gitignored `CLAUDE.local.md`, not here.
 
 ### Never read full logs raw
 
@@ -171,23 +170,16 @@ This is not a demo. Every change assumes:
 
 ### Default behaviors to AVOID
 
-- 不要主动建议加依赖。新增 package 必须先论证标准库 / 已有依赖为什么不够用。
-- 修 bug 时只动相关代码。**不要顺手重构无关模块。**
-- 没看过实际数据分布就不要给阈值建议。先 summary，再调参。
-- 不要假设市场状态。除非用户提供实时数据，不要写出"现在 BTC 在 $XX"这类断言。
-- 不要在 dashboard 绑定 `0.0.0.0`（loopback only）。
-- 不要把任何策略描述成"已验证可盈利"。全部四层已被实证证伪。
-
-### Standard analysis flow
-
-用户说"看一下 X 时段 / X 策略的表现"时，默认按此走：
-
-1. **明确范围** — 时间窗 / 策略 tier / market / token；模糊就反问，**不要瞎猜**。
-2. **跑 summary** — PnL 曲线、`skip_reason_counts` 分布、`book_stats` 比例、错误码统计。
-3. **找异常点** — PnL 突变、skip 突增、`rest_fallback` 占比飙升、延迟尖峰。
-4. **深挖样本** — 只针对异常窗口拉具体日志（带 `trace_id` / `run_id` 串联）。
-5. **归因** — 区分**市场原因**（行情结构变化、流动性下降）vs **系统原因**（bug、延迟、限流、订阅丢失）。
-6. **给建议** — 参数问题：给具体调整方向 + 预期影响 + 风险；bug：直接定位到 `file_path:line_number`。
+- Don't propose new dependencies unprompted. A new package needs a case for
+  why the standard library and existing dependencies are not enough.
+- When fixing a bug, touch only the relevant code. **No drive-by refactors.**
+- Don't suggest thresholds without first looking at the actual data
+  distribution. Summary first, then tune.
+- Don't assume market state. Never assert live prices ("BTC is at $XX") unless
+  the user supplied current data.
+- Never bind the dashboard to `0.0.0.0` (loopback only).
+- Never describe any strategy as validated or profitable. All four tiers were
+  empirically falsified.
 
 ## Testing
 

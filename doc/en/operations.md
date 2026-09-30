@@ -19,12 +19,16 @@ Requirements are split so you can install only what you need:
 | `requirements-base.txt` | Runtime: CLOB clients, websockets, aiohttp, FastAPI |
 | `requirements-ai.txt` | LLM providers (`openai`, `anthropic`, `httpx`) |
 | `requirements-dev.txt` | Test tooling (`pytest`) |
+| `requirements-legacy-v1.txt` | Optional legacy V1 CLOB client (fallback only) |
 | `requirements.txt` | Umbrella: base + AI |
 
-`py-clob-client` is version-pinned (`==0.34.6`, plus `py-clob-client-v2>=1.0.0,<2.0.0`)
-because `ExecutionEngine` reaches into the module-private `_http_client` via
-`_force_py_clob_http1`. Any client upgrade requires re-validating
-`tests/test_client_factory.py`.
+`py-clob-client-v2` is range-pinned (`>=1.0.0,<2.0.0`) because
+`client_factory._force_py_clob_http1` replaces the SDK's module-private
+`_http_client`. Any client upgrade requires re-validating
+`tests/test_client_factory.py`. The V1 `py-clob-client` is no longer installed by
+default — Polymarket hard-cut to CLOB V2 on 2026-04-28 — and lives in
+`requirements-legacy-v1.txt` (or `pip install .[legacy-v1]`) for the fallback
+path only.
 
 ## Configure
 

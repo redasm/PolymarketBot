@@ -17,7 +17,7 @@ separate filter stage below so the drop-off is visible:
   the real rate are reported, so a "dead even at zero fee" result is unambiguous.
 
 Usage:
-    python analysis/t0_tick_scan.py --ticks-dir E:/PolymarketData/6.20-6.26/data/ticks
+    python analysis/t0_tick_scan.py --ticks-dir <DATA_ROOT>/6.20-6.26/data/ticks
 """
 from __future__ import annotations
 

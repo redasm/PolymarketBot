@@ -19,11 +19,13 @@ pip install -r requirements.txt  # base + AI
 | `requirements-base.txt` | 运行时：CLOB 客户端、websockets、aiohttp、FastAPI |
 | `requirements-ai.txt` | LLM provider（`openai`、`anthropic`、`httpx`） |
 | `requirements-dev.txt` | 测试工具（`pytest`） |
+| `requirements-legacy-v1.txt` | 可选的旧版 V1 CLOB 客户端（仅兜底用） |
 | `requirements.txt` | 总入口：base + AI |
 
-`py-clob-client` 是版本锁定的（`==0.34.6`，以及 `py-clob-client-v2>=1.0.0,<2.0.0`），因为
-`ExecutionEngine` 通过 `_force_py_clob_http1` 触碰了模块私有的 `_http_client`。任何客户端升级都
-必须重新验证 `tests/test_client_factory.py`。
+`py-clob-client-v2` 限定了版本范围（`>=1.0.0,<2.0.0`），因为 `client_factory._force_py_clob_http1`
+会替换 SDK 模块私有的 `_http_client`。任何客户端升级都必须重新验证 `tests/test_client_factory.py`。
+V1 的 `py-clob-client` 默认不再安装（Polymarket 已于 2026-04-28 硬切到 CLOB V2），仅用于兜底路径，
+需要时见 `requirements-legacy-v1.txt`（或 `pip install .[legacy-v1]`）。
 
 ## 配置
 

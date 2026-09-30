@@ -15,7 +15,7 @@
 >
 > 它作为**研究基础设施与负面结果记录**发布，不是一个能赚钱的交易系统。用它做的实盘已停止。
 >
-> 完整数字、方法和复现脚本：
+> 完整数字、方法和分析脚本（原始 tick/telemetry 数据未公开，脚本通过 `--data-dir` 等参数在你自己录制的数据上复跑）：
 > **[doc/zh/research-findings.md](doc/zh/research-findings.md)**
 
 ## 那为什么还要开源
@@ -66,6 +66,9 @@ python -m research.backtest.run --dataset default  # 离线回放（需先录制
 pytest                                             # 测试
 ```
 
+`run_bot_with_copytrading.py` 已废弃：它驱动的是跟单策略，而该策略已被证伪（跟到结算 −28.6% ROI），
+仅保留供研究复现。
+
 ## 文档
 
 全部文档在 [`doc/`](doc/) 下，中英双语。
@@ -98,7 +101,7 @@ doc/                 文档，en + zh
 
 ## 环境要求
 
-Python 3.10+（推荐 3.11 以上）。`py-clob-client` 是版本锁定的，因为 `ExecutionEngine` 触碰了
+Python 3.10+（推荐 3.11 以上）。`py-clob-client-v2` 限定了版本范围，因为客户端工厂会替换
 模块私有的 HTTP 客户端属性，见
 [doc/zh/operations.md](doc/zh/operations.md#安装)。
 
